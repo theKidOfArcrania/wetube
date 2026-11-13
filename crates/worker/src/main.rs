@@ -21,6 +21,18 @@ struct Cli {
 enum Command {
     /// Print media-tool capabilities without accessing any ISO or database.
     Doctor,
+    /// Inspect one completed ISO copy without conversion, publication, or deletion.
+    InspectDvd {
+        #[arg(long)]
+        iso: PathBuf,
+        #[arg(long, value_parser = clap::value_parser!(u8).range(1..=99))]
+        title: u8,
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=9))]
+        angle: u8,
+        /// Confirm the copy has finished; this does not prove exclusion of SMB writers.
+        #[arg(long, required = true)]
+        copy_complete: bool,
+    },
     /// Process durable diagnostic jobs. No conversion or input deletion exists.
     Run {
         #[arg(long)]
@@ -40,6 +52,18 @@ async fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&report)?);
             if report.tools.iter().any(|tool| !tool.available) {
                 std::process::exit(1);
+            }
+        }
+        Command::InspectDvd {
+            iso,
+            title,
+            angle,
+            copy_complete: _,
+        } => {
+            let inspection = wetube_worker::probe::inspect_dvd(&iso, title, angle);
+            tokio::select! {
+                report = inspection => println!("{}", serde_json::to_string_pretty(&report?)?),
+                _ = shutdown() => anyhow::bail!("DVD inspection interrupted; input retained"),
             }
         }
         Command::Run { once } => {

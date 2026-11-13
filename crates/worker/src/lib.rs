@@ -1,62 +1,32 @@
 use anyhow::{Context, Result};
 use sqlx::SqlitePool;
 use std::{process::Stdio, time::Duration};
-use tokio::{io::AsyncReadExt, process::Command};
+use tokio::process::Command;
 use wetube_backend::now;
 use wetube_core::{DiagnosticReport, ToolCheck};
 
+pub mod probe;
+mod process;
+
 const OUTPUT_LIMIT: usize = 64 * 1024;
 
-async fn limited_output(reader: impl tokio::io::AsyncRead + Unpin) -> std::io::Result<Vec<u8>> {
-    let mut output = Vec::new();
-    reader
-        .take((OUTPUT_LIMIT + 1) as u64)
-        .read_to_end(&mut output)
-        .await?;
-    if output.len() > OUTPUT_LIMIT {
-        return Err(std::io::Error::other("tool output exceeded 64 KiB"));
-    }
-    Ok(output)
-}
-
 async fn tool_output(program: &str, args: &[&str]) -> Result<String> {
-    let mut child = Command::new(program)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0)
-        .kill_on_drop(true)
-        .spawn()
-        .with_context(|| format!("{program} is not available"))?;
-    let id = child.id().context("missing child process ID")?;
-    let stdout = child.stdout.take().unwrap();
-    let stderr = child.stderr.take().unwrap();
-    let outcome = tokio::time::timeout(Duration::from_secs(10), async {
-        tokio::try_join!(limited_output(stdout), limited_output(stderr), child.wait())
-    })
-    .await;
-    match outcome {
-        Ok(Ok((stdout, stderr, status))) => {
-            anyhow::ensure!(status.success(), "{program} returned a failure status");
-            Ok(format!(
-                "{}\n{}",
-                String::from_utf8_lossy(&stdout),
-                String::from_utf8_lossy(&stderr)
-            ))
-        }
-        error => {
-            // This process group was created solely for this invocation.
-            unsafe { libc::kill(-(id as i32), libc::SIGKILL) };
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-            match error {
-                Err(_) => anyhow::bail!("{program} timed out after ten seconds"),
-                Ok(Err(error)) => Err(error).context("read diagnostic tool output"),
-                Ok(Ok(_)) => unreachable!(),
-            }
-        }
-    }
+    let output = process::run(
+        Command::new(program).args(args).stdin(Stdio::null()),
+        Duration::from_secs(10),
+        OUTPUT_LIMIT,
+    )
+    .await
+    .with_context(|| format!("{program} diagnostic failed"))?;
+    anyhow::ensure!(
+        output.status.success(),
+        "{program} returned a failure status"
+    );
+    Ok(format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    ))
 }
 
 pub fn has_dvdvideo_help(output: &str) -> bool {
@@ -86,7 +56,7 @@ pub async fn diagnose() -> DiagnosticReport {
                     .find(|line| !line.is_empty())
                     .unwrap_or("Available")
                     .into(),
-                Err(error) => error.to_string(),
+                Err(error) => format!("{error:#}"),
             },
         });
     }
@@ -196,12 +166,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn output_is_bounded_and_missing_tools_are_reported() {
-        assert!(
-            limited_output(&vec![0; OUTPUT_LIMIT + 1][..])
-                .await
-                .is_err()
-        );
+    async fn missing_tools_are_reported() {
         assert!(tool_output("/nonexistent-wetube-tool", &[]).await.is_err());
     }
 

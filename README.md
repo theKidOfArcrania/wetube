@@ -11,9 +11,11 @@ This is a runnable foundation, not a DVD player yet:
 - Leptos/WASM login, library search, and administrator diagnostic results.
 - Persistent, restart-recoverable diagnostic jobs and a single-owner worker.
 - Read-only checks for FFmpeg, ffprobe, DVD-Video support, and English Tesseract data.
+- Local, read-only inspection of an explicitly selected DVD ISO title and angle.
 
 The library starts empty. ISO importing, conversion, playback, captions, TMDB,
-backups, and trash are not implemented. No ISO is opened, modified, or deleted.
+backups, and trash are not implemented. Only the local `inspect-dvd` command
+opens an explicitly selected ISO; it never modifies or deletes the input.
 Automatic ISO deletion remains disabled pending the design's safety gates.
 Docker packaging is intentionally deferred.
 
@@ -77,6 +79,37 @@ target/debug/wetube-server reset-password --username viewer
 Stop the server and worker before account maintenance; maintenance commands
 and workers share an exclusive lock. Resetting a password revokes that account's
 sessions. Do not remove the lock file to bypass a running process.
+
+## Inspect a DVD copy
+
+On Linux, point this local operator command at a finished, disposable ISO copy,
+not the original archive. It needs no database or running server:
+
+```sh
+target/debug/wetube-worker inspect-dvd --iso /path/to/copy.iso --title 1 --angle 1 --copy-complete
+```
+
+`--title` is required (1-99); `--angle` defaults to 1 (1-9). Inspect other title
+numbers explicitly when comparing candidates. The command does not enumerate
+all titles or decide which is the main movie.
+
+The JSON report retains ffprobe's video, audio, subtitle, format, and chapter
+metadata, including any reported language, channel layout, and field order.
+Chapter timing is approximate: full-disc preindexing is disabled. Stream
+metadata alone is not proof of correct deinterlacing, decoding, or caption OCR.
+
+Input is a non-empty regular `.iso` file, opened read-only with final-component
+symlinks rejected. The child receives a pinned, seekable file descriptor.
+Device/inode, size, and nanosecond modification/change times are checked after
+inspection; a changed or replaced source fails without emitting a usable report.
+The subprocess is limited to 120 seconds and 1 MiB per output stream; Ctrl-C
+terminates it. Unreadable/invalid DVDs produce an error and retain the input.
+An excessive-output failure or timeout may require a separate manual analysis.
+
+`--copy-complete` is an operator acknowledgement, not an SMB writer-exclusion
+guarantee. This inspection does not stage/hash an import, bypass encryption,
+publish media, or authorize cleanup. Representative real DVDs are still needed
+to prove feasibility before implementing conversion.
 
 ## Configuration
 
