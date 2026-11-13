@@ -1,0 +1,135 @@
+use serde::{Deserialize, Serialize};
+
+pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const SCHEMA_VERSION: i64 = 1;
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Role {
+    Admin,
+    Viewer,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct User {
+    pub id: String,
+    pub username: String,
+    pub role: Role,
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct LoginRequest {
+    pub username: String,
+    pub password: String,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+pub struct Session {
+    pub user: User,
+    pub csrf_token: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ApiError {
+    pub error: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct Movie {
+    pub id: String,
+    pub title: String,
+    pub year: Option<i32>,
+    pub description: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct Library {
+    pub movies: Vec<Movie>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SystemStatus {
+    pub version: String,
+    pub worker_last_seen: Option<i64>,
+    pub conversion_enabled: bool,
+    pub iso_deletion_enabled: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ToolCheck {
+    pub name: String,
+    pub available: bool,
+    pub detail: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct DiagnosticReport {
+    pub tools: Vec<ToolCheck>,
+    pub dvdvideo_available: bool,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JobState {
+    Queued,
+    Running,
+    Succeeded,
+    Failed,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct DiagnosticJob {
+    pub id: String,
+    pub state: JobState,
+    pub created_at: i64,
+    pub report: Option<DiagnosticReport>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, thiserror::Error, Eq, PartialEq)]
+#[error("{0}")]
+pub struct ValidationError(pub &'static str);
+
+pub fn normalize_username(username: &str) -> Result<String, ValidationError> {
+    let username = username.trim();
+    if username.is_empty()
+        || username.len() > 64
+        || !username
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+    {
+        return Err(ValidationError(
+            "Use 1-64 letters, digits, periods, underscores, or hyphens for the username.",
+        ));
+    }
+    Ok(username.to_ascii_lowercase())
+}
+
+pub fn validate_password(password: &str) -> Result<(), ValidationError> {
+    if password.chars().count() < 12 || password.len() > 1024 {
+        return Err(ValidationError(
+            "Passwords must contain at least 12 characters and at most 1024 bytes.",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn usernames_are_canonical_and_cannot_contain_paths() {
+        assert_eq!(normalize_username(" Alice ").unwrap(), "alice");
+        for invalid in ["", "../alice", "a/b", "alice@example.com", "a b"] {
+            assert!(normalize_username(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn password_limits_do_not_trim_or_truncate_secrets() {
+        assert!(validate_password("short").is_err());
+        assert!(validate_password("a sufficiently long password").is_ok());
+        assert!(validate_password(&"a".repeat(1025)).is_err());
+    }
+}
