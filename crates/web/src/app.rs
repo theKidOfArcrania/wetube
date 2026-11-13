@@ -6,7 +6,8 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use wetube_core::{
-    ApiError, DiagnosticJob, JobState, Library, LoginRequest, Movie, Role, Session, SystemStatus,
+    ApiError, DiagnosticJob, IncomingFiles, JobState, Library, LoginRequest, Movie, ProbeJob,
+    ProbeRequest, ProbeState, Role, Session, SystemStatus,
 };
 
 async fn decode<T: DeserializeOwned>(response: Response) -> Result<T, String> {
@@ -286,6 +287,200 @@ fn LibraryPage(current: Session, session: RwSignal<Option<Session>>) -> impl Int
                         }
                     }/>
             </section>
+            <ImportsPanel csrf=csrf/>
         })}
+    }
+}
+
+#[component]
+fn ImportsPanel(csrf: StoredValue<String>) -> impl IntoView {
+    let incoming = RwSignal::new(None::<IncomingFiles>);
+    let jobs = RwSignal::new(Vec::<ProbeJob>::new());
+    let selected = RwSignal::new(String::new());
+    let title = RwSignal::new(String::new());
+    let angle = RwSignal::new("1".to_owned());
+    let copy_complete = RwSignal::new(false);
+    let refreshing = RwSignal::new(false);
+    let requesting = RwSignal::new(false);
+    let error = RwSignal::new(None::<String>);
+    let mounted = Arc::new(AtomicBool::new(true));
+    let cleanup = mounted.clone();
+    on_cleanup(move || cleanup.store(false, Ordering::Relaxed));
+
+    let refresh = move || {
+        if refreshing.get_untracked() {
+            return;
+        }
+        refreshing.set(true);
+        selected.set(String::new());
+        copy_complete.set(false);
+        error.set(None);
+        spawn_local(async move {
+            let result = get::<IncomingFiles>("/api/v1/admin/incoming").await;
+            if refreshing.try_update(|busy| *busy = false).is_none() {
+                return;
+            }
+            match result {
+                Ok(files) => incoming.set(Some(files)),
+                Err(message) => error.set(Some(message)),
+            }
+        });
+    };
+    refresh();
+    spawn_local(async move {
+        while mounted.load(Ordering::Relaxed) {
+            let result = get::<Vec<ProbeJob>>("/api/v1/admin/probes").await;
+            if !mounted.load(Ordering::Relaxed) {
+                break;
+            }
+            match result {
+                Ok(history) => jobs.set(history),
+                Err(message) => error.set(Some(message)),
+            }
+            gloo_timers::future::TimeoutFuture::new(5000).await;
+        }
+    });
+
+    let submit = move |event: web_sys::SubmitEvent| {
+        event.prevent_default();
+        if requesting.get_untracked() || refreshing.get_untracked() {
+            return;
+        }
+        let file = incoming.get_untracked().and_then(|list| {
+            list.files
+                .into_iter()
+                .find(|file| file.name == selected.get_untracked())
+        });
+        let (Some(file), Ok(title), Ok(angle)) = (
+            file,
+            title.get_untracked().parse::<u8>(),
+            angle.get_untracked().parse::<u8>(),
+        ) else {
+            error.set(Some("Select an ISO and a valid title/angle first.".into()));
+            return;
+        };
+        let request = ProbeRequest {
+            name: file.name,
+            identity: file.identity,
+            title,
+            angle,
+            copy_complete: copy_complete.get_untracked(),
+        };
+        let token = csrf.get_value();
+        requesting.set(true);
+        error.set(None);
+        spawn_local(async move {
+            let result = async {
+                let response = Request::post("/api/v1/admin/probes")
+                    .header("x-csrf-token", &token)
+                    .json(&request)
+                    .map_err(|error| error.to_string())?
+                    .send()
+                    .await
+                    .map_err(|error| error.to_string())?;
+                decode::<ProbeJob>(response).await
+            }
+            .await;
+            if requesting.try_update(|busy| *busy = false).is_none() {
+                return;
+            }
+            copy_complete.set(false);
+            match result {
+                Ok(job) => jobs.update(|jobs| {
+                    jobs.retain(|existing| existing.id != job.id);
+                    jobs.insert(0, job);
+                }),
+                Err(message) => error.set(Some(message)),
+            }
+        });
+    };
+
+    view! {
+        <section class="panel">
+            <div class="toolbar">
+                <h2>"Inspect an incoming DVD copy"</h2>
+                <button class="secondary" on:click=move |_| refresh()
+                    disabled=move || refreshing.get() || requesting.get()>
+                    "Refresh incoming files"
+                </button>
+            </div>
+            <p class="notice">
+                "Inspection only: the worker keeps a private, checksum-verified copy.
+                 Nothing is converted, published, or deleted. Title selection is manual."
+            </p>
+            {move || incoming.get().map(|list| if !list.configured {
+                view! { <p class="subtle">"Incoming inspection is disabled. Configure the incoming root on the server and incoming/private scratch roots on the worker."</p> }.into_any()
+            } else if list.files.is_empty() {
+                view! { <p class="subtle">"No readable, non-empty ISO files in the incoming root. Finish copying, then refresh."</p> }.into_any()
+            } else {
+                view! { <p class="subtle">"Use finished copies only, never the original archive. Both processes must use the same incoming directory; jobs wait if the worker has no staging configuration."</p> }.into_any()
+            })}
+            <form on:submit=submit>
+                <label for="incoming-iso">"Completed ISO copy"</label>
+                <select id="incoming-iso" required
+                    prop:value=move || selected.get()
+                    on:change=move |event| {
+                        selected.set(event_target_value(&event));
+                        copy_complete.set(false);
+                    }
+                    disabled=move || refreshing.get() || requesting.get()>
+                    <option value="">"Select an ISO..."</option>
+                    <For each=move || incoming.get().map(|list| list.files).unwrap_or_default()
+                        key=|file| (file.name.clone(), file.identity.clone())
+                        children=|file| {
+                            let label = format!("{} ({:.2} GiB)", file.name, file.size_bytes as f64 / 1_073_741_824.0);
+                            view! { <option value=file.name>{label}</option> }
+                        }/>
+                </select>
+                <div class="probe-options">
+                    <div>
+                        <label for="dvd-title">"DVD title (1-99)"</label>
+                        <input id="dvd-title" type="number" min="1" max="99" required bind:value=title/>
+                    </div>
+                    <div>
+                        <label for="dvd-angle">"Angle (1-9)"</label>
+                        <input id="dvd-angle" type="number" min="1" max="9" required bind:value=angle/>
+                    </div>
+                </div>
+                <label class="confirmation">
+                    <input type="checkbox" required prop:checked=move || copy_complete.get()
+                        on:change=move |event| copy_complete.set(event_target_checked(&event))/>
+                    "I confirm this copy is finished and its SMB writers are closed."
+                </label>
+                <p class="subtle">"Acknowledgement is not proof of writer exclusion and never authorizes source deletion."</p>
+                <button type="submit" disabled=move || requesting.get() || refreshing.get()
+                    || !copy_complete.get() || selected.get().is_empty()
+                    || jobs.get().iter().any(|job| matches!(job.state, ProbeState::Queued | ProbeState::Staging | ProbeState::Probing))>
+                    {move || if requesting.get() { "Queueing..." } else { "Stage and inspect selected title" }}
+                </button>
+            </form>
+            {move || error.get().map(|message| view! { <p role="alert" class="error">{message}</p> })}
+            <h2>"Inspection history"</h2>
+            <For each=move || jobs.get() key=|job| (job.id.clone(), job.state)
+                children=|job| {
+                    let label = match job.state {
+                        ProbeState::Queued => "Queued",
+                        ProbeState::Staging => "Copying and verifying private input",
+                        ProbeState::Probing => "Inspecting the selected title",
+                        ProbeState::NeedsReview => "Needs review - not published",
+                        ProbeState::Failed => "Failed - inputs retained",
+                    };
+                    view! {
+                        <article class="job">
+                            <strong>{job.name}" - "{label}</strong>
+                            <p class="subtle">"Title "{job.title}", angle "{job.angle}</p>
+                            {job.attempt_id.map(|attempt| view! { <p class="attempt">"Attempt: "{attempt}</p> })}
+                            {job.error.map(|message| view! { <p class="error">{message}</p> })}
+                            {job.report.map(|report| view! {
+                                <details>
+                                    <summary>"Staging / inspection report"</summary>
+                                    <pre>{format!("{report:#}")}</pre>
+                                </details>
+                            })}
+                        </article>
+                    }
+                }/>
+            <p class="subtle">"All attempts, including failed/interrupted ones, count against scratch limits and require operator review. No automatic cleanup is enabled."</p>
+        </section>
     }
 }

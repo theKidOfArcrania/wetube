@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -83,6 +83,51 @@ pub struct DiagnosticJob {
     pub state: JobState,
     pub created_at: i64,
     pub report: Option<DiagnosticReport>,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct IncomingFile {
+    pub name: String,
+    pub size_bytes: u64,
+    pub identity: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct IncomingFiles {
+    pub configured: bool,
+    pub files: Vec<IncomingFile>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ProbeRequest {
+    pub name: String,
+    pub identity: String,
+    pub title: u8,
+    pub angle: u8,
+    pub copy_complete: bool,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProbeState {
+    Queued,
+    Staging,
+    Probing,
+    NeedsReview,
+    Failed,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ProbeJob {
+    pub id: String,
+    pub name: String,
+    pub title: u8,
+    pub angle: u8,
+    pub state: ProbeState,
+    pub created_at: i64,
+    pub attempt_id: Option<String>,
+    pub report: Option<serde_json::Value>,
     pub error: Option<String>,
 }
 

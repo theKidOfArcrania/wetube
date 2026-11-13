@@ -16,10 +16,10 @@ use subtle::ConstantTimeEq;
 use tokio::sync::Semaphore;
 use tower_http::services::ServeDir;
 use uuid::Uuid;
-use wetube_backend::{accounts, db, now};
+use wetube_backend::{accounts, db, incoming::IncomingRoot, now, probe_jobs};
 use wetube_core::{
-    APP_VERSION, ApiError, DiagnosticJob, JobState, Library, LoginRequest, Movie, Role, Session,
-    SystemStatus,
+    APP_VERSION, ApiError, DiagnosticJob, IncomingFiles, JobState, Library, LoginRequest, Movie,
+    ProbeJob, ProbeRequest, Role, Session, SystemStatus,
 };
 
 const COOKIE_NAME: &str = "wetube_session";
@@ -34,9 +34,19 @@ struct AppState {
     dummy_hash: Arc<String>,
     login_window: Arc<Mutex<(Instant, usize)>>,
     password_slots: Arc<Semaphore>,
+    incoming: Option<Arc<IncomingRoot>>,
 }
 
 pub async fn router(pool: SqlitePool, origin: &str, static_dir: &Path) -> anyhow::Result<Router> {
+    router_with_incoming(pool, origin, static_dir, None).await
+}
+
+pub async fn router_with_incoming(
+    pool: SqlitePool,
+    origin: &str,
+    static_dir: &Path,
+    incoming: Option<IncomingRoot>,
+) -> anyhow::Result<Router> {
     db::check_version(&pool).await?;
     let url = url::Url::parse(origin)?;
     anyhow::ensure!(
@@ -62,6 +72,7 @@ pub async fn router(pool: SqlitePool, origin: &str, static_dir: &Path) -> anyhow
         dummy_hash: Arc::new(dummy_hash),
         login_window: Arc::new(Mutex::new((Instant::now(), 0))),
         password_slots: Arc::new(Semaphore::new(2)),
+        incoming: incoming.map(Arc::new),
     };
 
     let api = Router::new()
@@ -72,6 +83,8 @@ pub async fn router(pool: SqlitePool, origin: &str, static_dir: &Path) -> anyhow
         .route("/status", get(status))
         .route("/jobs", get(jobs))
         .route("/jobs/diagnostics", post(queue_diagnostics))
+        .route("/admin/incoming", get(incoming_files))
+        .route("/admin/probes", get(probes).post(queue_probe))
         .fallback(|| async { HttpError(StatusCode::NOT_FOUND, "Unknown API route".into()) });
 
     Ok(Router::new()
@@ -431,4 +444,86 @@ async fn jobs(
 async fn ready(State(state): State<AppState>) -> Result<&'static str, HttpError> {
     db::check_version(&state.pool).await.map_err(internal)?;
     Ok("ready")
+}
+
+async fn incoming_files(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<IncomingFiles>, HttpError> {
+    admin(&state, &headers).await?;
+    let Some(root) = state.incoming else {
+        return Ok(Json(IncomingFiles {
+            configured: false,
+            files: Vec::new(),
+        }));
+    };
+    let files = tokio::task::spawn_blocking(move || root.list())
+        .await
+        .map_err(internal)?
+        .map_err(internal)?;
+    Ok(Json(IncomingFiles {
+        configured: true,
+        files,
+    }))
+}
+
+async fn probes(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<ProbeJob>>, HttpError> {
+    admin(&state, &headers).await?;
+    Ok(Json(probe_jobs::list(&state.pool).await.map_err(internal)?))
+}
+
+async fn queue_probe(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<ProbeRequest>,
+) -> Result<(StatusCode, Json<ProbeJob>), HttpError> {
+    let current = admin(&state, &headers).await?;
+    check_csrf(&current, &headers)?;
+    if !request.copy_complete
+        || !(1..=99).contains(&request.title)
+        || !(1..=9).contains(&request.angle)
+    {
+        return Err(HttpError(
+            StatusCode::BAD_REQUEST,
+            "Confirm copy completion and select a valid title/angle".into(),
+        ));
+    }
+    wetube_backend::incoming::validate_name(&request.name)
+        .map_err(|error| HttpError(StatusCode::BAD_REQUEST, error.to_string()))?;
+    let root = state.incoming.clone().ok_or_else(|| {
+        HttpError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Incoming directory is not configured".into(),
+        )
+    })?;
+    let name = request.name.clone();
+    let identity =
+        tokio::task::spawn_blocking(move || root.open_file(&name).map(|(_, file)| file.identity))
+            .await
+            .map_err(internal)?
+            .map_err(|_| {
+                HttpError(
+                    StatusCode::CONFLICT,
+                    "Input is unavailable; refresh the incoming list".into(),
+                )
+            })?;
+    if identity != request.identity {
+        return Err(HttpError(
+            StatusCode::CONFLICT,
+            "Input changed; refresh and reconfirm completion".into(),
+        ));
+    }
+    let job = probe_jobs::enqueue(&state.pool, &current.user.id, &request)
+        .await
+        .map_err(internal)?
+        .ok_or_else(|| {
+            HttpError(
+                StatusCode::CONFLICT,
+                "A DVD inspection is already queued or running".into(),
+            )
+        })?;
+    Ok((StatusCode::ACCEPTED, Json(job)))
 }

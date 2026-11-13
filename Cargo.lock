@@ -3167,6 +3167,7 @@ name = "wetube-core"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "serde_json",
  "thiserror 2.0.21",
 ]
 
@@ -3215,13 +3216,17 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "fs2",
+ "hex",
  "libc",
  "serde_json",
+ "sha2",
  "sqlx",
  "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
  "wetube-backend",
  "wetube-core",
 ]

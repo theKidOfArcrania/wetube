@@ -1,7 +1,10 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use std::{path::PathBuf, time::Duration};
-use wetube_backend::{db, lock::MaintenanceLock};
+use std::{path::PathBuf, sync::Arc, time::Duration};
+use wetube_backend::{
+    db,
+    lock::{MaintenanceLock, ServiceLock},
+};
 
 #[derive(Parser)]
 #[command(version, about = "WeTube non-destructive diagnostic worker")]
@@ -33,10 +36,18 @@ enum Command {
         #[arg(long, required = true)]
         copy_complete: bool,
     },
-    /// Process durable diagnostic jobs. No conversion or input deletion exists.
+    /// Process durable diagnostic and staged inspection jobs. No conversion or deletion.
     Run {
         #[arg(long)]
         once: bool,
+        #[arg(long, env = "WETUBE_INCOMING_DIR", requires = "scratch_dir")]
+        incoming_dir: Option<PathBuf>,
+        #[arg(long, env = "WETUBE_SCRATCH_DIR", requires = "incoming_dir")]
+        scratch_dir: Option<PathBuf>,
+        #[arg(long, env = "WETUBE_MAX_ISO_BYTES", default_value_t = 16 * 1024 * 1024 * 1024u64)]
+        max_iso_bytes: u64,
+        #[arg(long, env = "WETUBE_MAX_SCRATCH_BYTES", default_value_t = 32 * 1024 * 1024 * 1024u64)]
+        max_scratch_bytes: u64,
     },
 }
 
@@ -66,22 +77,65 @@ async fn main() -> Result<()> {
                 _ = shutdown() => anyhow::bail!("DVD inspection interrupted; input retained"),
             }
         }
-        Command::Run { once } => {
+        Command::Run {
+            once,
+            incoming_dir,
+            scratch_dir,
+            max_iso_bytes,
+            max_scratch_bytes,
+        } => {
+            let _services = ServiceLock::acquire(&cli.state_dir, false)?;
             let _lock = MaintenanceLock::acquire(&cli.state_dir)?;
             let pool = db::connect(&cli.state_dir).await?;
             db::check_version(&pool).await?;
+            let imports = match (incoming_dir, scratch_dir) {
+                (Some(incoming), Some(scratch)) => {
+                    Some(Arc::new(wetube_worker::imports::ImportConfig::open(
+                        &incoming,
+                        &scratch,
+                        max_iso_bytes,
+                        max_scratch_bytes,
+                    )?))
+                }
+                (None, None) => None,
+                _ => anyhow::bail!("incoming and scratch directories must be configured together"),
+            };
             wetube_worker::recover(&pool).await?;
-            if once {
-                wetube_worker::tick(&pool).await?;
-            } else {
-                let mut interval = tokio::time::interval(Duration::from_secs(2));
-                let shutdown = shutdown();
-                tokio::pin!(shutdown);
+            wetube_worker::imports::recover(&pool).await?;
+            let mut interval = tokio::time::interval(Duration::from_secs(2));
+            let shutdown = shutdown();
+            tokio::pin!(shutdown);
+            let mut stopping = false;
+            loop {
+                tokio::select! {
+                    _ = &mut shutdown => break,
+                    _ = interval.tick() => {}
+                }
+                let work = async {
+                    wetube_worker::tick(&pool).await?;
+                    if let Some(config) = &imports {
+                        wetube_worker::imports::tick(&pool, config.clone()).await?;
+                    }
+                    anyhow::Ok(())
+                };
+                tokio::pin!(work);
+                let mut heartbeat = tokio::time::interval(Duration::from_secs(2));
                 loop {
                     tokio::select! {
-                        _ = &mut shutdown => break,
-                        _ = interval.tick() => { wetube_worker::tick(&pool).await?; }
+                        result = &mut work => { result?; break; },
+                        _ = &mut shutdown, if !stopping => {
+                            stopping = true;
+                            tracing::info!("finishing current work before releasing worker ownership");
+                        },
+                        _ = heartbeat.tick() => {
+                            if let Err(error) = wetube_worker::heartbeat(&pool).await {
+                                tracing::warn!(%error, "unable to update worker heartbeat");
+                            }
+                        }
                     }
+                }
+                if once || stopping {
+                    break;
                 }
             }
             pool.close().await;

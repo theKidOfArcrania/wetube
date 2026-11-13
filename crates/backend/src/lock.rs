@@ -8,6 +8,32 @@ pub struct MaintenanceLock {
     _file: File,
 }
 
+pub struct ServiceLock {
+    _file: File,
+}
+
+impl ServiceLock {
+    pub fn acquire(state_dir: &Path, maintenance: bool) -> Result<Self> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(state_dir.join("services.lock"))
+            .context("open service lock; initialize the state directory first")?;
+        if maintenance {
+            fs2::FileExt::try_lock_exclusive(&file)
+                .context("stop the HTTP server and worker before state maintenance")?;
+        } else {
+            fs2::FileExt::try_lock_shared(&file)
+                .context("state maintenance is running; cannot start a service")?;
+        }
+        Ok(Self { _file: file })
+    }
+}
+
 impl MaintenanceLock {
     pub fn acquire(state_dir: &Path) -> Result<Self> {
         let file = OpenOptions::new()
@@ -46,6 +72,22 @@ mod tests {
         assert!(MaintenanceLock::acquire(dir.path()).is_err());
         drop(first);
         assert!(MaintenanceLock::acquire(dir.path()).is_ok());
+    }
+
+    #[test]
+    fn services_coexist_but_exclude_maintenance_for_their_entire_lifetime() {
+        let _guard = LOCK_TESTS.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let server = ServiceLock::acquire(dir.path(), false).unwrap();
+        let worker = ServiceLock::acquire(dir.path(), false).unwrap();
+        assert!(ServiceLock::acquire(dir.path(), true).is_err());
+        drop(server);
+        assert!(ServiceLock::acquire(dir.path(), true).is_err());
+        drop(worker);
+        let maintenance = ServiceLock::acquire(dir.path(), true).unwrap();
+        assert!(ServiceLock::acquire(dir.path(), false).is_err());
+        drop(maintenance);
+        assert!(ServiceLock::acquire(dir.path(), false).is_ok());
     }
 
     #[test]

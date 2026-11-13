@@ -5,6 +5,7 @@ use tokio::process::Command;
 use wetube_backend::now;
 use wetube_core::{DiagnosticReport, ToolCheck};
 
+pub mod imports;
 pub mod probe;
 mod process;
 
@@ -135,7 +136,7 @@ pub async fn tick(pool: &SqlitePool) -> Result<bool> {
     Ok(true)
 }
 
-async fn heartbeat(pool: &SqlitePool) -> Result<()> {
+pub async fn heartbeat(pool: &SqlitePool) -> Result<()> {
     sqlx::query(
         "INSERT INTO worker_status (singleton, last_seen) VALUES (1, ?)
          ON CONFLICT(singleton) DO UPDATE SET last_seen = excluded.last_seen",

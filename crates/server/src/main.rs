@@ -6,7 +6,10 @@ use std::{
     os::unix::fs::DirBuilderExt,
     path::PathBuf,
 };
-use wetube_backend::{accounts, db, lock::MaintenanceLock};
+use wetube_backend::{
+    accounts, db,
+    lock::{MaintenanceLock, ServiceLock},
+};
 use wetube_core::Role;
 
 #[derive(Parser)]
@@ -25,7 +28,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Initialize local state. Stop the worker before maintenance commands.
+    /// Initialize or upgrade local state. Stop both services first.
     Init,
     /// Create an account without passing a password on the command line.
     AddUser {
@@ -50,6 +53,8 @@ enum Command {
         origin: String,
         #[arg(long, env = "WETUBE_STATIC_DIR", default_value = "dist")]
         static_dir: PathBuf,
+        #[arg(long, env = "WETUBE_INCOMING_DIR")]
+        incoming_dir: Option<PathBuf>,
     },
 }
 
@@ -82,6 +87,7 @@ async fn main() -> Result<()> {
                 .recursive(true)
                 .mode(0o700)
                 .create(&cli.state_dir)?;
+            let _services = ServiceLock::acquire(&cli.state_dir, true)?;
             let _lock = MaintenanceLock::acquire(&cli.state_dir)?;
             db::initialize(&cli.state_dir).await?;
             println!("Initialized WeTube state.");
@@ -91,6 +97,7 @@ async fn main() -> Result<()> {
             admin,
             password_stdin,
         } => {
+            let _services = ServiceLock::acquire(&cli.state_dir, true)?;
             let _lock = MaintenanceLock::acquire(&cli.state_dir)?;
             let pool = db::connect(&cli.state_dir).await?;
             db::check_version(&pool).await?;
@@ -107,6 +114,7 @@ async fn main() -> Result<()> {
             username,
             password_stdin,
         } => {
+            let _services = ServiceLock::acquire(&cli.state_dir, true)?;
             let _lock = MaintenanceLock::acquire(&cli.state_dir)?;
             let pool = db::connect(&cli.state_dir).await?;
             db::check_version(&pool).await?;
@@ -117,13 +125,20 @@ async fn main() -> Result<()> {
             bind,
             origin,
             static_dir,
+            incoming_dir,
         } => {
+            let _services = ServiceLock::acquire(&cli.state_dir, false)?;
             anyhow::ensure!(
                 static_dir.join("index.html").is_file(),
                 "frontend is not built; run trunk build --release in crates/web first"
             );
             let pool = db::connect(&cli.state_dir).await?;
-            let app = wetube_server::router(pool, &origin, &static_dir).await?;
+            let incoming = incoming_dir
+                .as_deref()
+                .map(wetube_backend::incoming::IncomingRoot::open)
+                .transpose()?;
+            let app =
+                wetube_server::router_with_incoming(pool, &origin, &static_dir, incoming).await?;
             let listener = tokio::net::TcpListener::bind(bind)
                 .await
                 .context("bind HTTP listener")?;

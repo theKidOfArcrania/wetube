@@ -7,7 +7,7 @@ use axum::{
 use sqlx::SqlitePool;
 use tower::ServiceExt;
 use wetube_backend::{accounts, db};
-use wetube_core::{DiagnosticJob, Role, Session};
+use wetube_core::{DiagnosticJob, IncomingFiles, ProbeJob, Role, Session};
 
 const ORIGIN: &str = "http://wetube.test";
 const PASSWORD: &str = "a household test password";
@@ -16,6 +16,159 @@ struct Fixture {
     _directory: tempfile::TempDir,
     pool: SqlitePool,
     app: Router,
+}
+
+#[tokio::test]
+async fn incoming_probes_require_admin_confirmation_and_exclude_concurrent_jobs() {
+    let mut fixture = Fixture::new().await;
+    let (cookie, session) = fixture.login("admin").await;
+    let disabled = fixture
+        .send("GET", "/api/v1/admin/incoming", "", Some(&cookie), None)
+        .await;
+    let disabled: IncomingFiles =
+        serde_json::from_slice(&to_bytes(disabled.into_body(), 16 * 1024).await.unwrap()).unwrap();
+    assert!(!disabled.configured);
+    let incoming = tempfile::tempdir().unwrap();
+    std::fs::write(incoming.path().join("movie.iso"), b"a completed copy").unwrap();
+    let root = wetube_backend::incoming::IncomingRoot::open(incoming.path()).unwrap();
+    let file = root.list().unwrap().remove(0);
+    let mut request = serde_json::json!({
+        "name": file.name, "identity": file.identity, "title": 1, "angle": 1, "copy_complete": true
+    });
+    assert_eq!(
+        fixture
+            .send(
+                "POST",
+                "/api/v1/admin/probes",
+                &request.to_string(),
+                Some(&cookie),
+                Some(&session.csrf_token)
+            )
+            .await
+            .status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    fixture.app = wetube_server::router_with_incoming(
+        fixture.pool.clone(),
+        ORIGIN,
+        fixture._directory.path(),
+        Some(root),
+    )
+    .await
+    .unwrap();
+    let (viewer, viewer_session) = fixture.login("viewer").await;
+    for path in ["/api/v1/admin/incoming", "/api/v1/admin/probes"] {
+        assert_eq!(
+            fixture.send("GET", path, "", None, None).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            fixture
+                .send("GET", path, "", Some(&viewer), None)
+                .await
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+    let listing = fixture
+        .send("GET", "/api/v1/admin/incoming", "", Some(&cookie), None)
+        .await;
+    let listing: IncomingFiles =
+        serde_json::from_slice(&to_bytes(listing.into_body(), 16 * 1024).await.unwrap()).unwrap();
+    assert!(listing.configured);
+    assert_eq!(listing.files.len(), 1);
+    assert_eq!(listing.files[0].name, file.name);
+    assert_eq!(listing.files[0].identity, file.identity);
+    assert_eq!(
+        fixture
+            .send(
+                "POST",
+                "/api/v1/admin/probes",
+                &request.to_string(),
+                Some(&viewer),
+                Some(&viewer_session.csrf_token)
+            )
+            .await
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        fixture
+            .send(
+                "POST",
+                "/api/v1/admin/probes",
+                &request.to_string(),
+                Some(&cookie),
+                None
+            )
+            .await
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    for (field, invalid) in [
+        ("copy_complete", serde_json::json!(false)),
+        ("title", serde_json::json!(0)),
+        ("angle", serde_json::json!(10)),
+        ("name", serde_json::json!("../movie.iso")),
+    ] {
+        let mut bad = request.clone();
+        bad[field] = invalid;
+        assert_eq!(
+            fixture
+                .send(
+                    "POST",
+                    "/api/v1/admin/probes",
+                    &bad.to_string(),
+                    Some(&cookie),
+                    Some(&session.csrf_token)
+                )
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+    request["identity"] = serde_json::json!("stale identity");
+    assert_eq!(
+        fixture
+            .send(
+                "POST",
+                "/api/v1/admin/probes",
+                &request.to_string(),
+                Some(&cookie),
+                Some(&session.csrf_token)
+            )
+            .await
+            .status(),
+        StatusCode::CONFLICT
+    );
+    request["identity"] = serde_json::json!(listing.files[0].identity);
+    let body = request.to_string();
+    let (first, second) = tokio::join!(
+        fixture.send(
+            "POST",
+            "/api/v1/admin/probes",
+            &body,
+            Some(&cookie),
+            Some(&session.csrf_token)
+        ),
+        fixture.send(
+            "POST",
+            "/api/v1/admin/probes",
+            &body,
+            Some(&cookie),
+            Some(&session.csrf_token)
+        ),
+    );
+    let mut statuses = [first.status(), second.status()];
+    statuses.sort();
+    assert_eq!(statuses, [StatusCode::ACCEPTED, StatusCode::CONFLICT]);
+    let history = fixture
+        .send("GET", "/api/v1/admin/probes", "", Some(&cookie), None)
+        .await;
+    let history: Vec<ProbeJob> =
+        serde_json::from_slice(&to_bytes(history.into_body(), 16 * 1024).await.unwrap()).unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].name, "movie.iso");
 }
 
 impl Fixture {
