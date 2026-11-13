@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -45,6 +45,22 @@ pub struct Movie {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Library {
     pub movies: Vec<Movie>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct MovieDetails {
+    pub movie: Movie,
+    pub duration_seconds: f64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct PlaybackProgress {
+    pub position_seconds: f64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct UpdatePlaybackProgress {
+    pub position_seconds: f64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

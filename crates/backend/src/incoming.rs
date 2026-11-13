@@ -43,6 +43,13 @@ pub fn validate_name(name: &str) -> Result<()> {
 }
 
 impl IncomingRoot {
+    pub fn path(&self) -> Result<PathBuf> {
+        Ok(std::fs::canonicalize(format!(
+            "/proc/self/fd/{}",
+            self.directory.as_raw_fd()
+        ))?)
+    }
+
     pub fn open(path: &Path) -> Result<Self> {
         let directory = OpenOptions::new()
             .read(true)

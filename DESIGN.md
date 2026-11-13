@@ -4,7 +4,23 @@ Status: Design draft approved by adversarial Claude Opus 5.5 review.
 User approval and empirical/deployment gates remain pending. Requirements below
 record agreed choices; proposals and deferred items are not deployment approvals.
 
-No application code will be written until this design is reviewed and approved.
+This design was reviewed before application implementation.
+
+### Current local website test milestone
+
+The local preview supports login, library search, authenticated progressive
+MP4 playback/seeking, per-user resume, and the existing administrator diagnostic
+and staged-inspection workflow. An operator explicitly admits a successful
+experimental MP4 through a separate CLI, supplying its digest; the actual
+copied media is independently decoded and checked before catalogue eligibility.
+The standalone experimental importer itself still does not publish.
+
+This deliberately narrow adapter enables real-browser website E2E on the local
+development host. It is not production conversion orchestration or approval of
+the complete publication, subtitle-asset, backup, browser-matrix, or four-stream
+protocols below. Automatic conversion, OCR, and incoming-source deletion remain
+disabled. Real-disc and TrueNAS acceptance remain separate from synthetic
+browser-test acceptance.
 
 ## 1. Goals and scope
 

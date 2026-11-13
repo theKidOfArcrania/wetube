@@ -7,6 +7,7 @@ use wetube_core::{DiagnosticReport, ToolCheck};
 
 pub mod experimental;
 pub mod imports;
+pub mod preview;
 pub mod probe;
 mod process;
 

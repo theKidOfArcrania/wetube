@@ -1,0 +1,13 @@
+{
+  "name": "wetube-browser-e2e",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "playwright test",
+    "test:preview": "playwright test --config preview.config.ts",
+    "install-browser": "playwright install chromium"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.56.0"
+  }
+}

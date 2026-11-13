@@ -55,6 +55,33 @@ enum Command {
         static_dir: PathBuf,
         #[arg(long, env = "WETUBE_INCOMING_DIR")]
         incoming_dir: Option<PathBuf>,
+        #[arg(long, env = "WETUBE_MEDIA_DIR")]
+        media_dir: Option<PathBuf>,
+    },
+    /// Admit an operator-confirmed experimental MP4 for LOCAL preview; stop services first.
+    AdmitPreview {
+        #[arg(long)]
+        report: PathBuf,
+        #[arg(long, env = "WETUBE_MEDIA_DIR")]
+        media_dir: PathBuf,
+        #[arg(long)]
+        title: String,
+        #[arg(long)]
+        year: Option<i32>,
+        #[arg(long, default_value = "")]
+        description: String,
+        /// Operator-confirmed digest; experimental reports do not contain payload hashes.
+        #[arg(long)]
+        movie_sha256: String,
+        #[arg(long, default_value_t = 8 * 1024 * 1024 * 1024u64)]
+        max_bytes: u64,
+        #[arg(long, default_value_t = 14400)]
+        timeout_secs: u64,
+        /// Additional incoming root to enforce separation, if configured.
+        #[arg(long, env = "WETUBE_INCOMING_DIR")]
+        incoming_dir: Option<PathBuf>,
+        #[arg(long, env = "WETUBE_STATIC_DIR", default_value = "dist")]
+        static_dir: PathBuf,
     },
 }
 
@@ -126,6 +153,7 @@ async fn main() -> Result<()> {
             origin,
             static_dir,
             incoming_dir,
+            media_dir,
         } => {
             let _services = ServiceLock::acquire(&cli.state_dir, false)?;
             anyhow::ensure!(
@@ -137,8 +165,12 @@ async fn main() -> Result<()> {
                 .as_deref()
                 .map(wetube_backend::incoming::IncomingRoot::open)
                 .transpose()?;
-            let app =
-                wetube_server::router_with_incoming(pool, &origin, &static_dir, incoming).await?;
+            let media = media_dir
+                .as_deref()
+                .map(wetube_backend::preview::PreviewRoot::open)
+                .transpose()?;
+            let app = wetube_server::router_with_media(pool, &origin, &static_dir, incoming, media)
+                .await?;
             let listener = tokio::net::TcpListener::bind(bind)
                 .await
                 .context("bind HTTP listener")?;
@@ -146,6 +178,46 @@ async fn main() -> Result<()> {
             axum::serve(listener, app)
                 .with_graceful_shutdown(shutdown())
                 .await?;
+        }
+        Command::AdmitPreview {
+            report,
+            media_dir,
+            title,
+            year,
+            description,
+            movie_sha256,
+            max_bytes,
+            timeout_secs,
+            incoming_dir,
+            static_dir,
+        } => {
+            let _services = ServiceLock::acquire(&cli.state_dir, true)?;
+            let _lock = MaintenanceLock::acquire(&cli.state_dir)?;
+            let pool = db::connect(&cli.state_dir).await?;
+            db::check_version(&pool).await?;
+            let root = wetube_backend::preview::PreviewRoot::open(&media_dir)?;
+            root.require_separate(&cli.state_dir)?;
+            if static_dir.exists() {
+                root.require_separate(&static_dir)?;
+            }
+            if let Some(incoming) = incoming_dir {
+                root.require_separate(&incoming)?;
+            }
+            let admission = wetube_server::admission::admit(
+                &pool,
+                &root,
+                wetube_server::admission::Admission {
+                    report: &report,
+                    title: &title,
+                    year,
+                    description: &description,
+                    movie_sha256: &movie_sha256,
+                    max_bytes,
+                    timeout: std::time::Duration::from_secs(timeout_secs),
+                },
+            )
+            .await?;
+            println!("{}", serde_json::to_string(&admission)?);
         }
     }
     Ok(())

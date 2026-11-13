@@ -174,19 +174,19 @@ including blocking copy I/O; allow time for staging and inspection to finish.
 The worker heartbeat continues during active jobs. Force-killed jobs retain
 their inputs; children retain the ownership lock until they exit.
 
-## Upgrade the foundation state
+## Upgrade pre-preview state
 
 Stop both services before running `wetube-server init` with this release.
-Initialization upgrades schema 1 to 2 only after a consistent `VACUUM INTO`
+Initialization upgrades schema 1 or 2 to schema 3 only after a consistent `VACUUM INTO`
 snapshot is written and synced in a private `pre-upgrade-UUID` directory under
 the state root. Newer/unknown versions fail closed. Repeating initialization
 does not create another snapshot once the upgrade succeeds.
 
-This is a narrow pre-upgrade safeguard for the foundation schema, which has no
-subtitle assets. It is not the design's complete daily, off-device,
+This is a narrow pre-upgrade safeguard for the pre-preview schemas, which have no
+published asset registry. It is not the design's complete daily, off-device,
 asset-aware backup/restore system. Keep these snapshots until an operator has
 verified recovery; there is no automatic retention or restore command. To
-rehearse a schema-1 snapshot, copy it into a separate private state directory
+rehearse a schema-1 or schema-2 snapshot, copy it into a separate private state directory
 with services stopped and use the matching old release, not the live database.
 Do not roll an old binary forward onto the upgraded live state.
 
@@ -332,6 +332,62 @@ staged attempt while any resumed report/output is under review: resumed attempts
 do not contain a second input.iso. A failure before attempt-directory allocation
 may return an error without a new report. Repeating resume rehashes the original
 retained ISO again, not a partial encoded artifact.
+
+## Local website preview and browser E2E
+
+The local preview connects the website to explicitly admitted, independently
+revalidated experimental MP4s. It supports account login, library search,
+authenticated playback/seeking, per-user saved position, and logout. This does
+not enable the production conversion queue, subtitle OCR, or source deletion.
+Run the standalone importer separately; failed or incomplete imports cannot
+be admitted.
+
+With services stopped, initialize local app state, create an account, and admit
+a successful experiment into a separate media directory:
+
+```sh
+target/debug/wetube-server --state-dir /local/wetube-state init
+target/debug/wetube-server --state-dir /local/wetube-state add-user --username admin --admin
+sha256sum /scratch/ATTEMPT/movie.mp4
+target/debug/wetube-server --state-dir /local/wetube-state admit-preview \
+  --report /scratch/ATTEMPT/report.json --media-dir /local/wetube-media \
+  --movie-sha256 SHA256_FROM_THE_PREVIOUS_COMMAND --title "Movie title"
+target/debug/wetube-server --state-dir /local/wetube-state serve \
+  --bind 127.0.0.1:8080 --origin http://localhost:8080 \
+  --static-dir dist --media-dir /local/wetube-media
+```
+
+Create the dedicated media directory first; keep it separate from app state,
+incoming, and HTTP static files. The explicit digest binds admission to the
+operator-selected payload, and the copied MP4 is independently decoded and
+validated. Admission leaves the original experiment and ISO untouched.
+This is an experimental local playback adapter, not the complete production
+publication/backup/subtitle-asset protocol.
+
+The Chromium browser suite builds the real server and frontend, creates an
+eight-second synthetic H.264/AAC fixture and isolated accounts, admits the
+fixture through the CLI, and tests actual browser playback, saved resume,
+end/back navigation, save-failure feedback, and admin diagnostic/inspection
+flows through a real worker using an isolated invalid ISO.
+It never touches the real NAS import or starts Docker:
+
+```sh
+cd tests/e2e
+npm ci --ignore-scripts
+npm run install-browser
+npm test
+```
+
+The suite uses safe-exec to generate its bounded fixture report and sha256sum
+to stream payload hashes without Rhai blob-size limits; native test
+runtime APIs handle subprocesses, random credentials, owner-only temporary
+directories, and cleanup. The ordinary run removes its own temporary state.
+`npm run test:preview` instead retains a small preview state/media/incoming directory and
+prints its location and a private credentials-file path, without printing the
+password. Its test server and worker still stop at the end; use the retained
+paths with `serve` and `wetube-worker run` to leave a local website running.
+Traces may contain
+ephemeral test credentials and are ignored by Git.
 
 ## Development
 

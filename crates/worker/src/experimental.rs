@@ -8,7 +8,7 @@ use std::{
     io::{Read, Seek, Write},
     os::{
         fd::AsRawFd,
-        unix::fs::{DirBuilderExt, OpenOptionsExt},
+        unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
     },
     path::{Path, PathBuf},
     process::Stdio,
@@ -372,6 +372,19 @@ async fn probe_output(
     serde_json::from_slice(&bytes).context("invalid output probe JSON")
 }
 
+fn metadata_snapshot(metadata: &std::fs::Metadata) -> String {
+    format!(
+        "dev={} inode={} bytes={} mtime={}.{:09} ctime={}.{:09}",
+        metadata.dev(),
+        metadata.ino(),
+        metadata.len(),
+        metadata.mtime(),
+        metadata.mtime_nsec(),
+        metadata.ctime(),
+        metadata.ctime_nsec(),
+    )
+}
+
 async fn media_pipeline(
     options: &Options,
     directory: &Path,
@@ -382,7 +395,8 @@ async fn media_pipeline(
 ) -> Result<Value> {
     let timeout = Duration::from_secs(options.tool_timeout_secs);
     file.rewind()?;
-    let before = identity(&file.metadata()?);
+    let before_metadata = file.metadata()?;
+    let before = identity(&before_metadata);
     let mut decode = ffmpeg();
     if dvd {
         dvd_input(&mut decode, options, file)?;
@@ -421,9 +435,12 @@ async fn media_pipeline(
     .await?;
     let (source_frames, source_seconds) = progress(&source_progress)?;
     same_duration(source_seconds, duration(source)?)?;
+    let after_decode = file.metadata()?;
     ensure!(
-        identity(&file.metadata()?) == before,
-        "staged input changed during full decode"
+        identity(&after_decode) == before,
+        "staged input changed during full decode (before: {}; after: {})",
+        metadata_snapshot(&before_metadata),
+        metadata_snapshot(&after_decode),
     );
 
     let movie_path = directory.join("movie.mp4");
@@ -512,9 +529,12 @@ async fn media_pipeline(
         ]);
     }
     tool("encode", &mut encode, timeout, cancel, directory).await?;
+    let after_encode = file.metadata()?;
     ensure!(
-        identity(&file.metadata()?) == before,
-        "staged input changed during encoding"
+        identity(&after_encode) == before,
+        "staged input changed during encoding (before: {}; after: {})",
+        metadata_snapshot(&before_metadata),
+        metadata_snapshot(&after_encode),
     );
     movie.sync_all()?;
     if let Some(tracks) = &tracks {

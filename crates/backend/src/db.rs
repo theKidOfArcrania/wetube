@@ -43,9 +43,10 @@ pub async fn initialize(state_dir: &Path) -> Result<()> {
             "incompatible state; migration is not authorized for this release"
         );
         if version.0 < SCHEMA_VERSION {
-            // This upgrade is from the foundation schema, before any subtitle assets exist.
+            // Schemas 1/2 precede any published asset registry. This is not a general
+            // asset-aware upgrade authorization for subsequent releases.
             anyhow::ensure!(
-                version.0 == 1,
+                matches!(version.0, 1 | 2),
                 "unsupported upgrade; requires a complete asset-aware backup"
             );
             let backup = state_dir.join(format!("pre-upgrade-{}", uuid::Uuid::new_v4()));
@@ -169,5 +170,69 @@ mod tests {
             assert_eq!(id, "retained");
         }
         backup.close().await;
+    }
+
+    #[tokio::test]
+    async fn preview_upgrade_snapshots_schema_two_and_preserves_ready_catalogue() {
+        let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let migrations = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        std::fs::write(
+            migrations.path().join("0001_foundation.sql"),
+            include_str!("../migrations/0001_foundation.sql"),
+        )
+        .unwrap();
+        std::fs::write(
+            migrations.path().join("0002_probe_jobs.sql"),
+            include_str!("../migrations/0002_probe_jobs.sql"),
+        )
+        .unwrap();
+        let pool = open(dir.path(), true).await.unwrap();
+        sqlx::migrate::Migrator::new(migrations.path())
+            .await
+            .unwrap()
+            .run(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO movies (id,title,status) VALUES ('seed','Retained seed','ready')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+        initialize(dir.path()).await.unwrap();
+        let pool = connect(dir.path()).await.unwrap();
+        let title: String = sqlx::query_scalar("SELECT title FROM movies WHERE status='ready'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(title, "Retained seed");
+        let backup = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("pre-upgrade-")
+            })
+            .unwrap();
+        let snapshot = SqlitePoolOptions::new()
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(backup.join("wetube.sqlite3"))
+                    .read_only(true),
+            )
+            .await
+            .unwrap();
+        let version: i64 = sqlx::query_scalar("SELECT schema_version FROM app_metadata")
+            .fetch_one(&snapshot)
+            .await
+            .unwrap();
+        assert_eq!(version, 2);
+        let preview_tables: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE name='preview_media'")
+                .fetch_one(&snapshot)
+                .await
+                .unwrap();
+        assert_eq!(preview_tables, 0);
     }
 }

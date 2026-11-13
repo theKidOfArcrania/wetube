@@ -1,6 +1,7 @@
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Request, State},
+    body::Body,
+    extract::{DefaultBodyLimit, Path as RoutePath, Request, State},
     http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -13,17 +14,24 @@ use std::{
     time::{Duration, Instant},
 };
 use subtle::ConstantTimeEq;
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::sync::Semaphore;
+use tokio_util::io::ReaderStream;
 use tower_http::services::ServeDir;
 use uuid::Uuid;
+use wetube_backend::preview::PreviewRoot;
 use wetube_backend::{accounts, db, incoming::IncomingRoot, now, probe_jobs};
 use wetube_core::{
     APP_VERSION, ApiError, DiagnosticJob, IncomingFiles, JobState, Library, LoginRequest, Movie,
-    ProbeJob, ProbeRequest, Role, Session, SystemStatus,
+    MovieDetails, PlaybackProgress, ProbeJob, ProbeRequest, Role, Session, SystemStatus,
+    UpdatePlaybackProgress,
 };
+
+pub mod admission;
 
 const COOKIE_NAME: &str = "wetube_session";
 const SESSION_SECONDS: i64 = 7 * 24 * 60 * 60;
+const PLAYBACK_END_TOLERANCE_SECONDS: f64 = 0.25;
 
 #[derive(Clone)]
 struct AppState {
@@ -35,6 +43,7 @@ struct AppState {
     login_window: Arc<Mutex<(Instant, usize)>>,
     password_slots: Arc<Semaphore>,
     incoming: Option<Arc<IncomingRoot>>,
+    media: Option<Arc<PreviewRoot>>,
 }
 
 pub async fn router(pool: SqlitePool, origin: &str, static_dir: &Path) -> anyhow::Result<Router> {
@@ -47,7 +56,34 @@ pub async fn router_with_incoming(
     static_dir: &Path,
     incoming: Option<IncomingRoot>,
 ) -> anyhow::Result<Router> {
+    router_with_media(pool, origin, static_dir, incoming, None).await
+}
+
+pub async fn router_with_media(
+    pool: SqlitePool,
+    origin: &str,
+    static_dir: &Path,
+    incoming: Option<IncomingRoot>,
+    media: Option<PreviewRoot>,
+) -> anyhow::Result<Router> {
     db::check_version(&pool).await?;
+    if let Some(media) = &media {
+        media.require_separate(static_dir)?;
+        let databases = sqlx::query("PRAGMA database_list").fetch_all(&pool).await?;
+        for database in databases {
+            let file: String = database.get("file");
+            if !file.is_empty() {
+                media.require_separate(
+                    Path::new(&file)
+                        .parent()
+                        .ok_or_else(|| anyhow::anyhow!("invalid database path"))?,
+                )?;
+            }
+        }
+        if let Some(incoming) = &incoming {
+            media.require_separate(&incoming.path()?)?;
+        }
+    }
     let url = url::Url::parse(origin)?;
     anyhow::ensure!(
         matches!(url.scheme(), "http" | "https")
@@ -73,6 +109,7 @@ pub async fn router_with_incoming(
         login_window: Arc::new(Mutex::new((Instant::now(), 0))),
         password_slots: Arc::new(Semaphore::new(2)),
         incoming: incoming.map(Arc::new),
+        media: media.map(Arc::new),
     };
 
     let api = Router::new()
@@ -80,6 +117,12 @@ pub async fn router_with_incoming(
         .route("/auth/logout", post(logout))
         .route("/auth/me", get(me))
         .route("/movies", get(movies))
+        .route("/movies/{id}", get(movie_details))
+        .route("/movies/{id}/video", get(video).head(video))
+        .route(
+            "/movies/{id}/progress",
+            get(get_progress).put(update_progress),
+        )
         .route("/status", get(status))
         .route("/jobs", get(jobs))
         .route("/jobs/diagnostics", post(queue_diagnostics))
@@ -348,6 +391,210 @@ async fn movies(
             })
             .collect(),
     }))
+}
+
+struct ReadyPreview {
+    details: MovieDetails,
+    package: String,
+    size: u64,
+    file_identity: String,
+}
+
+async fn preview(state: &AppState, id: &str) -> Result<ReadyPreview, HttpError> {
+    let row = sqlx::query(
+        "SELECT m.id,m.title,m.year,m.description,p.package_id,p.size_bytes,p.duration_seconds,p.file_identity
+         FROM movies m JOIN preview_media p ON p.movie_id=m.id WHERE m.id=? AND m.status='ready'",
+    ).bind(id).fetch_optional(&state.pool).await.map_err(internal)?
+        .ok_or_else(|| HttpError(StatusCode::NOT_FOUND, "Movie is not available for local preview".into()))?;
+    Ok(ReadyPreview {
+        details: MovieDetails {
+            movie: Movie {
+                id: row.get("id"),
+                title: row.get("title"),
+                year: row.get("year"),
+                description: row.get("description"),
+            },
+            duration_seconds: row.get("duration_seconds"),
+        },
+        package: row.get("package_id"),
+        size: row.get::<i64, _>("size_bytes") as u64,
+        file_identity: row.get("file_identity"),
+    })
+}
+
+async fn movie_details(
+    State(state): State<AppState>,
+    RoutePath(id): RoutePath<String>,
+    headers: HeaderMap,
+) -> Result<Json<MovieDetails>, HttpError> {
+    session(&state, &headers).await?;
+    Ok(Json(preview(&state, &id).await?.details))
+}
+
+async fn get_progress(
+    State(state): State<AppState>,
+    RoutePath(id): RoutePath<String>,
+    headers: HeaderMap,
+) -> Result<Json<PlaybackProgress>, HttpError> {
+    let current = session(&state, &headers).await?;
+    preview(&state, &id).await?;
+    let position_seconds = sqlx::query_scalar(
+        "SELECT position_seconds FROM playback_progress WHERE user_id=? AND movie_id=?",
+    )
+    .bind(current.user.id)
+    .bind(id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(internal)?
+    .unwrap_or(0.0);
+    Ok(Json(PlaybackProgress { position_seconds }))
+}
+
+async fn update_progress(
+    State(state): State<AppState>,
+    RoutePath(id): RoutePath<String>,
+    headers: HeaderMap,
+    Json(request): Json<UpdatePlaybackProgress>,
+) -> Result<Json<PlaybackProgress>, HttpError> {
+    let current = session(&state, &headers).await?;
+    check_csrf(&current, &headers)?;
+    let movie = preview(&state, &id).await?;
+    if !request.position_seconds.is_finite()
+        || request.position_seconds < 0.0
+        || request.position_seconds
+            > movie.details.duration_seconds + PLAYBACK_END_TOLERANCE_SECONDS
+    {
+        return Err(HttpError(
+            StatusCode::BAD_REQUEST,
+            "Position must be within the movie duration".into(),
+        ));
+    }
+    let position_seconds = request.position_seconds.min(movie.details.duration_seconds);
+    let result = sqlx::query(
+        "INSERT INTO playback_progress (user_id,movie_id,position_seconds,updated_at)
+         SELECT ?,id,?,? FROM movies WHERE id=? AND status='ready'
+         ON CONFLICT(user_id,movie_id) DO UPDATE SET position_seconds=excluded.position_seconds,updated_at=excluded.updated_at",
+    ).bind(current.user.id).bind(position_seconds).bind(now()).bind(id)
+        .execute(&state.pool).await.map_err(internal)?;
+    if result.rows_affected() != 1 {
+        return Err(HttpError(
+            StatusCode::NOT_FOUND,
+            "Movie is not available".into(),
+        ));
+    }
+    Ok(Json(PlaybackProgress { position_seconds }))
+}
+
+// Reject malformed or multiple ranges rather than attempting unbounded multipart responses.
+fn byte_range(headers: &HeaderMap, size: u64) -> Result<Option<(u64, u64)>, ()> {
+    let mut values = headers.get_all(header::RANGE).iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(());
+    }
+    let text = value.to_str().map_err(|_| ())?;
+    if text.len() > 128 {
+        return Err(());
+    }
+    let text = text.strip_prefix("bytes=").ok_or(())?;
+    let (start, end) = text.split_once('-').ok_or(())?;
+    let number = |text: &str| -> Result<u64, ()> {
+        if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(());
+        }
+        text.parse().map_err(|_| ())
+    };
+    if size == 0 {
+        return Err(());
+    }
+    let (start, end) = if start.is_empty() {
+        let count = number(end)?;
+        if count == 0 {
+            return Err(());
+        }
+        (size.saturating_sub(count), size - 1)
+    } else {
+        let start = number(start)?;
+        let end = if end.is_empty() {
+            size - 1
+        } else {
+            number(end)?.min(size - 1)
+        };
+        if start >= size || end < start {
+            return Err(());
+        }
+        (start, end)
+    };
+    Ok(Some((start, end)))
+}
+
+async fn video(
+    State(state): State<AppState>,
+    RoutePath(id): RoutePath<String>,
+    method: Method,
+    headers: HeaderMap,
+) -> Result<Response, HttpError> {
+    session(&state, &headers).await?;
+    let movie = preview(&state, &id).await?;
+    let root = state.media.ok_or_else(|| {
+        HttpError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Local preview media is not configured".into(),
+        )
+    })?;
+    let file = root.open_movie(&movie.package).map_err(|error| {
+        tracing::warn!(%error, "preview file unavailable");
+        HttpError(StatusCode::NOT_FOUND, "Movie media is unavailable".into())
+    })?;
+    if wetube_backend::incoming::identity(&file.metadata().map_err(internal)?)
+        != movie.file_identity
+    {
+        return Err(HttpError(
+            StatusCode::NOT_FOUND,
+            "Movie media has changed; re-admission is required".into(),
+        ));
+    }
+    let range = match byte_range(&headers, movie.size) {
+        Ok(range) => range,
+        Err(()) => {
+            return Response::builder()
+                .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                .header(header::CONTENT_RANGE, format!("bytes */{}", movie.size))
+                .header(header::ACCEPT_RANGES, "bytes")
+                .header(header::CONTENT_LENGTH, "0")
+                .body(Body::empty())
+                .map_err(internal);
+        }
+    };
+    let (start, end) = range.unwrap_or((0, movie.size - 1));
+    let length = end - start + 1;
+    let mut response = Response::builder()
+        .status(if range.is_some() {
+            StatusCode::PARTIAL_CONTENT
+        } else {
+            StatusCode::OK
+        })
+        .header(header::CONTENT_TYPE, "video/mp4")
+        .header(header::ACCEPT_RANGES, "bytes")
+        .header(header::CONTENT_LENGTH, length.to_string());
+    if range.is_some() {
+        response = response.header(
+            header::CONTENT_RANGE,
+            format!("bytes {start}-{end}/{}", movie.size),
+        );
+    }
+    let body = if method == Method::HEAD {
+        Body::empty()
+    } else {
+        let mut file = tokio::fs::File::from_std(file);
+        file.seek(std::io::SeekFrom::Start(start))
+            .await
+            .map_err(internal)?;
+        Body::from_stream(ReaderStream::with_capacity(file.take(length), 64 * 1024))
+    };
+    response.body(body).map_err(internal)
 }
 
 async fn status(

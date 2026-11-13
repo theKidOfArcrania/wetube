@@ -5,9 +5,11 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
+use std::{cell::RefCell, rc::Rc};
 use wetube_core::{
-    ApiError, DiagnosticJob, IncomingFiles, JobState, Library, LoginRequest, Movie, ProbeJob,
-    ProbeRequest, ProbeState, Role, Session, SystemStatus,
+    ApiError, DiagnosticJob, IncomingFiles, JobState, Library, LoginRequest, Movie, MovieDetails,
+    PlaybackProgress, ProbeJob, ProbeRequest, ProbeState, Role, Session, SystemStatus,
+    UpdatePlaybackProgress,
 };
 
 async fn decode<T: DeserializeOwned>(response: Response) -> Result<T, String> {
@@ -123,6 +125,10 @@ fn LibraryPage(current: Session, session: RwSignal<Option<Session>>) -> impl Int
     let username = current.user.username.clone();
     let csrf = StoredValue::new(current.csrf_token);
     let movies = RwSignal::new(Vec::<Movie>::new());
+    let selected = RwSignal::new(None::<Movie>);
+    let loading = RwSignal::new(true);
+    let signing_out = RwSignal::new(false);
+    let playback_notice = RwSignal::new(None::<String>);
     let status = RwSignal::new(None::<SystemStatus>);
     let jobs = RwSignal::new(Vec::<DiagnosticJob>::new());
     let error = RwSignal::new(None::<String>);
@@ -145,9 +151,13 @@ fn LibraryPage(current: Session, session: RwSignal<Option<Session>>) -> impl Int
                 break;
             }
             match library {
-                Ok(library) => movies.set(library.movies),
+                Ok(library) => {
+                    movies.set(library.movies);
+                    error.set(None);
+                }
                 Err(message) => error.set(Some(message)),
             }
+            loading.set(false);
             if let Ok(system) = system {
                 status.set(Some(system));
             }
@@ -159,6 +169,12 @@ fn LibraryPage(current: Session, session: RwSignal<Option<Session>>) -> impl Int
     });
 
     let sign_out = move |_| {
+        if signing_out.get_untracked() {
+            return;
+        }
+        signing_out.set(true);
+        selected.set(None);
+        playback_notice.set(None);
         let token = csrf.get_value();
         spawn_local(async move {
             match Request::post("/api/v1/auth/logout")
@@ -168,6 +184,7 @@ fn LibraryPage(current: Session, session: RwSignal<Option<Session>>) -> impl Int
             {
                 Ok(response) if matches!(response.status(), 204 | 401) => session.set(None),
                 _ => {
+                    let _ = signing_out.try_update(|busy| *busy = false);
                     let _ = error.try_update(|error| {
                         *error = Some("Unable to sign out. Please retry.".into())
                     });
@@ -204,20 +221,29 @@ fn LibraryPage(current: Session, session: RwSignal<Option<Session>>) -> impl Int
     view! {
         <div class="toolbar">
             <span class="subtle">"Signed in as " {username}</span>
-            <button class="secondary" on:click=sign_out>"Sign out"</button>
+            <button class="secondary" on:click=sign_out disabled=move || signing_out.get()>"Sign out"</button>
         </div>
         <p class="eyebrow">"The beginning of your collection"</p>
         <h1>"Movie night starts here."</h1>
         <p class="notice">
-            "Foundation preview: DVD conversion, playback, and ISO deletion are not enabled.
-             Your original files are never modified."
+            "Local experimental website preview: operator-admitted H.264/AAC movies can play.
+             Production DVD conversion and ISO deletion remain off. Your original files are never modified.
+             Audio-track selection and OCR captions are future work."
         </p>
+        {move || selected.get().map(|movie| view! {
+            <MoviePlayer movie=movie csrf=csrf selected=selected playback_notice=playback_notice/>
+        })}
+        <Show when=move || selected.get().is_none()>
+        {move || playback_notice.get().map(|message| view! { <p role="alert" class="error">{message}</p> })}
         <div class="toolbar">
             <h2>"Your library"</h2>
             <input aria-label="Search your library" placeholder="Search titles and descriptions"
                 type="search" bind:value=query/>
         </div>
         {move || {
+            if loading.get() {
+                return view! { <p role="status" class="subtle">"Loading your library..."</p> }.into_any();
+            }
             let needle = query.get().to_lowercase();
             let filtered = movies.get().into_iter()
                 .filter(|movie| format!("{} {}", movie.title, movie.description).to_lowercase().contains(&needle))
@@ -227,24 +253,37 @@ fn LibraryPage(current: Session, session: RwSignal<Option<Session>>) -> impl Int
                     <section class="empty">
                         <h2>{if needle.is_empty() { "A home for your DVD collection" } else { "No matching movies" }}</h2>
                         <p class="subtle">
-                            "No prepared movies yet. Import and playback will follow the media feasibility work."
+                            {if needle.is_empty() {
+                                "No movies have been admitted for this local preview. An operator must validate and admit experimental media before it appears here."
+                            } else {
+                                "Try a different title or description."
+                            }}
                         </p>
                     </section>
                 }.into_any()
             } else {
                 view! {
                     <div class="grid">
-                        {filtered.into_iter().map(|movie| view! {
+                        {filtered.into_iter().map(|movie| {
+                            let watch_label = format!("Watch {}", movie.title);
+                            let chosen = movie.clone();
+                            view! {
                             <article class="movie">
                                 <h2>{movie.title}</h2>
                                 <small>{movie.year.map(|year| year.to_string())}</small>
                                 <p>{movie.description}</p>
+                                <button on:click=move |_| {
+                                    playback_notice.set(None);
+                                    selected.set(Some(chosen.clone()));
+                                }
+                                    disabled=move || signing_out.get()>{watch_label}</button>
                             </article>
-                        }).collect_view()}
+                        }}).collect_view()}
                     </div>
                 }.into_any()
             }
         }}
+        </Show>
         {move || error.get().map(|message| view! { <p role="alert" class="error">{message}</p> })}
         {is_admin.then(|| view! {
             <section class="panel">
@@ -289,6 +328,331 @@ fn LibraryPage(current: Session, session: RwSignal<Option<Session>>) -> impl Int
             </section>
             <ImportsPanel csrf=csrf/>
         })}
+    }
+}
+
+struct ProgressWriter {
+    active: bool,
+    resume_applied: bool,
+    closing: bool,
+    saving: bool,
+    pending: Option<f64>,
+    in_flight: Option<f64>,
+    last_queued_ms: f64,
+    controller: Option<web_sys::AbortController>,
+    url: String,
+    csrf: String,
+    error: RwSignal<Option<String>>,
+    navigation_error: RwSignal<Option<String>>,
+    saved: RwSignal<Option<f64>>,
+    selected: RwSignal<Option<Movie>>,
+}
+
+fn queue_progress(writer: Rc<RefCell<ProgressWriter>>, position: f64, force: bool, close: bool) {
+    {
+        let mut state = writer.borrow_mut();
+        if !state.active || state.closing {
+            return;
+        }
+        if !position.is_finite() || position < 0.0 {
+            if close {
+                let selected = state.selected;
+                let notice = state.navigation_error;
+                drop(state);
+                let _ = notice.try_set(Some(
+                    "Could not save your resume position: the player position is unavailable."
+                        .into(),
+                ));
+                let _ = selected.try_set(None);
+            }
+            return;
+        }
+        if close && !state.resume_applied {
+            let selected = state.selected;
+            drop(state);
+            let _ = selected.try_set(None);
+            return;
+        }
+        if !state.resume_applied {
+            return;
+        }
+        let now = js_sys::Date::now();
+        if !force && now - state.last_queued_ms < 5000.0 {
+            return;
+        }
+        state.closing = close;
+        state.last_queued_ms = now;
+        if state.pending == Some(position)
+            || (state.pending.is_none() && state.in_flight == Some(position))
+        {
+            return;
+        }
+        if !state.saving && state.saved.get_untracked() == Some(position) {
+            let selected = state.selected;
+            drop(state);
+            if close {
+                let _ = selected.try_set(None);
+            }
+            return;
+        }
+        // Only one PUT may be in flight; newer events replace the queued position.
+        state.pending = Some(position);
+        if state.saving {
+            return;
+        }
+        state.saving = true;
+    }
+    spawn_local(async move {
+        loop {
+            let request = {
+                let mut state = writer.borrow_mut();
+                if !state.active {
+                    return;
+                }
+                state.pending.take().map(|position| {
+                    state.in_flight = Some(position);
+                    (
+                        position,
+                        state.url.clone(),
+                        state.csrf.clone(),
+                        state
+                            .controller
+                            .as_ref()
+                            .map(|controller| controller.signal()),
+                    )
+                })
+            };
+            let Some((position_seconds, url, csrf, signal)) = request else {
+                let mut state = writer.borrow_mut();
+                state.saving = false;
+                let close = state.closing.then_some(state.selected);
+                drop(state);
+                if let Some(selected) = close {
+                    let _ = selected.try_set(None);
+                }
+                return;
+            };
+            let result = async {
+                let response = Request::put(&url)
+                    .header("x-csrf-token", &csrf)
+                    .abort_signal(signal.as_ref())
+                    .json(&UpdatePlaybackProgress { position_seconds })
+                    .map_err(|error| error.to_string())?
+                    .send()
+                    .await
+                    .map_err(|error| error.to_string())?;
+                decode::<PlaybackProgress>(response).await
+            }
+            .await;
+            let mut state = writer.borrow_mut();
+            state.in_flight = None;
+            if !state.active {
+                return;
+            }
+            match result {
+                Ok(progress) => {
+                    let _ = state.saved.try_set(Some(progress.position_seconds));
+                    let _ = state.error.try_set(None);
+                }
+                Err(message) => {
+                    let _ = state
+                        .error
+                        .try_set(Some(format!("Could not save your position: {message}")));
+                    if state.closing {
+                        // Navigation must not depend on a successful save. The notice
+                        // belongs to the library so player cleanup cannot erase it.
+                        let selected = state.selected;
+                        let notice = state.navigation_error;
+                        state.saving = false;
+                        state.pending = None;
+                        drop(state);
+                        let _ = notice.try_set(Some(format!(
+                            "Could not save your resume position before returning to the library: {message}"
+                        )));
+                        let _ = selected.try_set(None);
+                        return;
+                    }
+                }
+            }
+        }
+    });
+}
+
+#[component]
+fn MoviePlayer(
+    movie: Movie,
+    csrf: StoredValue<String>,
+    selected: RwSignal<Option<Movie>>,
+    playback_notice: RwSignal<Option<String>>,
+) -> impl IntoView {
+    let details = RwSignal::new(None::<MovieDetails>);
+    let loading = RwSignal::new(true);
+    let load_error = RwSignal::new(None::<String>);
+    let media_error = RwSignal::new(None::<String>);
+    let save_error = RwSignal::new(None::<String>);
+    let saved = RwSignal::new(None::<f64>);
+    let resume = RwSignal::new(0.0_f64);
+    let restored = RwSignal::new(false);
+    let video = NodeRef::<leptos::html::Video>::new();
+    let id = js_sys::encode_uri_component(&movie.id)
+        .as_string()
+        .unwrap_or_default();
+    let movie_url = format!("/api/v1/movies/{id}");
+    let video_url = format!("{movie_url}/video");
+    let writer = StoredValue::new_local(Rc::new(RefCell::new(ProgressWriter {
+        active: true,
+        resume_applied: false,
+        closing: false,
+        saving: false,
+        pending: None,
+        in_flight: None,
+        last_queued_ms: js_sys::Date::now(),
+        controller: web_sys::AbortController::new().ok(),
+        url: format!("{movie_url}/progress"),
+        csrf: csrf.get_value(),
+        error: save_error,
+        navigation_error: playback_notice,
+        saved,
+        selected,
+    })));
+    on_cleanup(move || {
+        let writer = writer.get_value();
+        let mut state = writer.borrow_mut();
+        state.active = false;
+        state.pending = None;
+        if let Some(controller) = &state.controller {
+            controller.abort();
+        }
+        drop(state);
+        if let Some(element) = video.get_untracked() {
+            let _ = element.pause();
+            element.remove_attribute("src").ok();
+            element.load();
+        }
+    });
+    spawn_local(async move {
+        let state = writer.get_value();
+        let signal = state
+            .borrow()
+            .controller
+            .as_ref()
+            .map(|controller| controller.signal());
+        let result = async {
+            let Some(signal) = signal else {
+                return Err(
+                    "This browser cannot initialize cancellable playback requests.".to_owned(),
+                );
+            };
+            let response = Request::get(&movie_url)
+                .abort_signal(Some(&signal))
+                .send()
+                .await
+                .map_err(|error| error.to_string())?;
+            let details = decode::<MovieDetails>(response).await?;
+            let response = Request::get(&format!("{movie_url}/progress"))
+                .abort_signal(Some(&signal))
+                .send()
+                .await
+                .map_err(|error| error.to_string())?;
+            let progress = decode::<PlaybackProgress>(response).await?;
+            Ok((details, progress))
+        }
+        .await;
+        if !state.borrow().active {
+            return;
+        }
+        loading.set(false);
+        match result {
+            Ok((movie, progress)) => {
+                resume.set(progress.position_seconds);
+                saved.set(Some(progress.position_seconds));
+                details.set(Some(movie));
+            }
+            Err(message) => load_error.set(Some(format!("Unable to load this movie: {message}"))),
+        }
+    });
+
+    let record = move |force| {
+        let Some(state) = writer.try_get_value() else {
+            return;
+        };
+        if !state.borrow().active {
+            return;
+        }
+        if let Some(element) = video.get_untracked() {
+            queue_progress(state, element.current_time(), force, false);
+        }
+    };
+    let back = move |_| {
+        let Some(state) = writer.try_get_value() else {
+            return;
+        };
+        if let Some(element) = video.get_untracked() {
+            // Queue before pausing: the resulting pause event must not supersede a close.
+            queue_progress(state.clone(), element.current_time(), true, true);
+            if state.borrow().active {
+                let _ = element.pause();
+            }
+        } else {
+            selected.set(None);
+        }
+    };
+    let pane_label = format!("Watch {}", movie.title);
+    let player_label = format!("Movie player: {}", movie.title);
+    view! {
+        <section class="panel player-pane" aria-label=pane_label>
+            <button class="secondary" on:click=back>"Back to library"</button>
+            <h2>{movie.title}</h2>
+            <small>{movie.year.map(|year| year.to_string())}</small>
+            <p class="subtle">{movie.description}</p>
+            {move || loading.get().then(|| view! { <p role="status">"Loading movie and your saved position..."</p> })}
+            {move || load_error.get().map(|message| view! { <p role="alert" class="error">{message}</p> })}
+            <Show when=move || details.get().is_some()>
+                <video node_ref=video data-testid="movie-player" controls preload="metadata"
+                    src=video_url.clone() aria-label=player_label.clone()
+                    on:loadedmetadata=move |_| {
+                        let Some(state) = writer.try_get_value() else { return; };
+                        if !state.borrow().active || state.borrow().resume_applied {
+                            return;
+                        }
+                        if let Some(element) = video.get_untracked() {
+                            let duration = element.duration();
+                            let position = resume.get_untracked();
+                            let position = if duration.is_finite() && duration > 0.0
+                                && position.is_finite() && position > 0.0 && position < duration {
+                                position
+                            } else { 0.0 };
+                            element.set_current_time(position);
+                            state.borrow_mut().resume_applied = true;
+                            restored.set(true);
+                        }
+                    }
+                    on:timeupdate=move |_| record(false)
+                    on:pause=move |_| record(true)
+                    on:seeked=move |_| record(true)
+                    on:ended=move |_| record(true)
+                    on:error=move |_| {
+                        if writer.try_get_value().is_some_and(|state| state.borrow().active) {
+                            media_error.set(Some("The movie could not be played. Check the admitted media and browser H.264/AAC support.".into()));
+                        }
+                    }>
+                    "Your browser does not support native video playback."
+                </video>
+                <p class="subtle">
+                    {move || details.get().map(|movie| approximate_duration(Some(movie.duration_seconds)))}
+                </p>
+                <p role="status" class="subtle">
+                    {move || if restored.get() {
+                        format!("Saved position: {:.1} seconds. Pausing and seeking save your progress.",
+                            saved.get().unwrap_or(0.0))
+                    } else {
+                        "Waiting for video metadata to restore your position...".to_owned()
+                    }}
+                </p>
+            </Show>
+            {move || media_error.get().map(|message| view! { <p role="alert" class="error">{message}</p> })}
+            {move || save_error.get().map(|message| view! { <p role="alert" class="error">{message}</p> })}
+        </section>
     }
 }
 
