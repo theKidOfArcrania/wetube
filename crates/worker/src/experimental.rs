@@ -783,7 +783,7 @@ async fn run_inner(options: Options, mut cancel: watch::Receiver<bool>) -> Resul
             "staging_timeout_secs": options.staging_timeout_secs, "tool_timeout_secs": options.tool_timeout_secs },
         "warnings": ["Experimental profile, not production publication or browser acceptance.",
             "Image subtitles are retained without OCR; chapter timing is approximate.",
-            "Owner/mode checks do not prove NAS export privacy or SMB writer exclusion."]
+            "Filesystem access controls and writer exclusion must be verified separately."]
     });
     let result: Result<()> = async {
         let mut staged = staged?;

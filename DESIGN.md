@@ -286,7 +286,9 @@ Names below describe logical roles, not approved host paths.
 | Subtitle assets | Original images/timing and versioned captions under app state | Worker writes; API serves authorized reads |
 | Scratch | Bounded, disposable intermediate files | Worker only |
 
-Scratch holds the private staged ISO. Capacity planning must include
+Scratch holds the private staged ISO. Access control is configured and verified
+on the host filesystem; the service does not enforce Unix ownership or mode
+bits. Capacity planning must include
 the incoming ISO, staged ISO, intermediate files, and prepared output at once.
 The staged ISO is temporary, not another permanent archive.
 

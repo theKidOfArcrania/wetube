@@ -120,12 +120,15 @@ to prove feasibility before implementing conversion.
 ## Stage and inspect from the admin UI
 
 Use the same finished-copy incoming directory for both processes, and a
-separate worker-private scratch directory. Never configure the original archive
+separate scratch directory with filesystem-managed access controls. Never
+configure the original archive
 or an HTTP static directory as either root. The scratch parent must already
-exist; a new scratch root is created with mode 0700. Existing scratch roots must
-be owned by the worker UID with no group/other access, not be symlinks, and must
-not overlap incoming. Keep scratch outside SMB exports, including ancestor
-shares; local mode bits alone do not establish the NAS's deployed ACL behavior.
+exist; a new scratch root requests mode 0700. Existing scratch roots must not be
+symlinks or overlap incoming. The service does not enforce Unix ownership or
+mode bits: configure and verify access through the host filesystem's ACLs,
+including Windows ACLs for Windows-backed storage. For deployment, keep scratch
+outside SMB exports, including ancestor shares; local mode bits alone do not
+establish the NAS's deployed ACL behavior.
 
 ```sh
 target/debug/wetube-server serve --incoming-dir /path/to/incoming
@@ -261,10 +264,10 @@ cargo run --release --locked --package wetube-worker --example import_dvd -- \
   --staging-timeout-secs 1800 --tool-timeout-secs 14400 --threads 2
 ```
 
-For the explicitly accepted shared test mount in this session, the ISO is
-/mnt/private/staging/COUNT_OF_MONTE_CRISTO.ISO and scratch is /mnt/private/streams.
-This tests the media pipeline only: the mirrored SMB mount's forced owner/mode
-display does not make its files private or satisfy deployment safety gates.
+For this session, the ISO is /mnt/share/staging/COUNT_OF_MONTE_CRISTO.ISO and
+the requested local scratch directory is /mnt/c/TempPrivate. This tests the
+media pipeline only; filesystem access controls and deployment safety gates
+must be verified separately.
 
 `--video-treatment` is required: `yadif` uses single-rate deinterlacing;
 `preserve` leaves frames unfiltered. Neither is an approved production profile
@@ -363,8 +366,8 @@ cargo test --package wetube-worker --test inspect --locked \
 ```
 
 Only acknowledge completion after all writers are closed. The selected title
-is a candidate, not an automatic main-feature choice. Scratch must pass the
-worker's owner/mode checks, but those checks alone cannot prove storage privacy:
+is a candidate, not an automatic main-feature choice. Configure and verify
+scratch access controls on the host; the worker does not check Unix owner/mode:
 an SMB mount with forced uid/gid and 0700 modes can still expose the same files
 through another mount/export. Such a mount may be used for an explicitly
 accepted, non-destructive test, but it does not pass the deployment privacy or

@@ -6,7 +6,7 @@ use std::{
     io::{Read, Seek, Write},
     os::{
         fd::AsRawFd,
-        unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
+        unix::fs::{DirBuilderExt, OpenOptionsExt},
     },
     path::{Path, PathBuf},
     sync::Arc,
@@ -42,22 +42,17 @@ impl ImportConfig {
         match std::fs::DirBuilder::new().mode(0o700).create(scratch) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error).context("create private scratch root"),
+            Err(error) => return Err(error).context("create scratch root"),
         }
         let scratch_file = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
             .open(scratch)?;
-        let metadata = scratch_file.metadata()?;
-        ensure!(
-            metadata.mode() & 0o077 == 0 && metadata.uid() == unsafe { libc::geteuid() },
-            "scratch root must be owned by the worker UID and private (0700)"
-        );
         let incoming_path = incoming.canonicalize()?;
         let scratch_path = scratch.canonicalize()?;
         ensure!(
             !incoming_path.starts_with(&scratch_path) && !scratch_path.starts_with(&incoming_path),
-            "incoming and private scratch roots must not overlap"
+            "incoming and scratch roots must not overlap"
         );
         Ok(Self {
             incoming: IncomingRoot::open(incoming)?,
@@ -383,13 +378,13 @@ mod tests {
     }
 
     #[test]
-    fn refuses_shared_or_symlink_scratch_roots() {
+    fn accepts_shared_scratch_but_refuses_symlink_roots() {
         use std::os::unix::fs::PermissionsExt;
         let incoming = tempfile::tempdir().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let scratch = dir.path().join("scratch");
         std::fs::create_dir(&scratch).unwrap();
-        std::fs::set_permissions(&scratch, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&scratch, std::fs::Permissions::from_mode(0o777)).unwrap();
         assert!(
             ImportConfig::open(
                 incoming.path(),
@@ -398,9 +393,8 @@ mod tests {
                 100,
                 Duration::from_secs(600)
             )
-            .is_err()
+            .is_ok()
         );
-        std::fs::set_permissions(&scratch, std::fs::Permissions::from_mode(0o700)).unwrap();
         std::os::unix::fs::symlink(&scratch, dir.path().join("link")).unwrap();
         assert!(
             ImportConfig::open(
