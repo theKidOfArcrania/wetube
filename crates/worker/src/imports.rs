@@ -68,8 +68,26 @@ impl ImportConfig {
         })
     }
 
-    fn scratch_path(&self) -> PathBuf {
+    pub(crate) fn scratch_path(&self) -> PathBuf {
         PathBuf::from(format!("/proc/self/fd/{}", self.scratch.as_raw_fd()))
+    }
+
+    pub(crate) fn require_capacity(&self, bytes: u64) -> Result<()> {
+        let scratch = self.scratch_path();
+        let used = usage(&scratch, 0, &mut 0)?;
+        ensure!(
+            used.checked_add(bytes)
+                .is_some_and(|total| total <= self.max_scratch_bytes),
+            "scratch quota would be exceeded; retained attempts need operator review"
+        );
+        ensure!(
+            fs2::available_space(&scratch)?
+                >= bytes
+                    .checked_add(1024 * 1024 * 1024)
+                    .context("size overflow")?,
+            "insufficient scratch space; reserve at least the requested bytes plus 1 GiB"
+        );
+        Ok(())
     }
 }
 
@@ -101,13 +119,32 @@ fn usage(path: &Path, depth: usize, entries: &mut usize) -> Result<u64> {
     Ok(total)
 }
 
-struct Staged {
-    path: PathBuf,
-    sha256: String,
-    size_bytes: u64,
+pub(crate) struct Staged {
+    pub path: PathBuf,
+    pub file: File,
+    pub sha256: String,
+    pub size_bytes: u64,
+    pub identity: String,
 }
 
-fn stage(config: &ImportConfig, name: &str, expected: &str, attempt: &str) -> Result<Staged> {
+impl Staged {
+    pub(crate) fn verify(&self) -> Result<()> {
+        ensure!(
+            wetube_backend::incoming::identity(&self.file.metadata()?) == self.identity
+                && wetube_backend::incoming::identity(&std::fs::symlink_metadata(&self.path)?)
+                    == self.identity,
+            "verified staged input changed or was replaced"
+        );
+        Ok(())
+    }
+}
+
+pub(crate) fn stage(
+    config: &ImportConfig,
+    name: &str,
+    expected: &str,
+    attempt: &str,
+) -> Result<Staged> {
     let (mut source, entry) = config.incoming.open_file(name)?;
     ensure!(
         entry.identity == expected,
@@ -118,26 +155,12 @@ fn stage(config: &ImportConfig, name: &str, expected: &str, attempt: &str) -> Re
         "ISO exceeds the configured per-file byte limit"
     );
     let scratch = config.scratch_path();
-    let used = usage(&scratch, 0, &mut 0)?;
-    ensure!(
-        used.checked_add(entry.size_bytes)
-            .is_some_and(|total| total <= config.max_scratch_bytes),
-        "scratch quota would be exceeded; retained attempts need operator review"
-    );
-    ensure!(
-        fs2::available_space(&scratch)?
-            >= entry
-                .size_bytes
-                .checked_add(1024 * 1024 * 1024)
-                .context("size overflow")?,
-        "insufficient scratch space; reserve at least the ISO size plus 1 GiB"
-    );
+    config.require_capacity(entry.size_bytes)?;
     let directory = scratch.join(attempt);
     std::fs::DirBuilder::new().mode(0o700).create(&directory)?;
     config.scratch.sync_all()?;
     let path = directory.join("input.iso");
     let mut target = OpenOptions::new()
-        .read(true)
         .write(true)
         .create_new(true)
         .mode(0o600)
@@ -172,8 +195,14 @@ fn stage(config: &ImportConfig, name: &str, expected: &str, attempt: &str) -> Re
     config.incoming.verify(name, &source, expected)?;
     target.sync_all()?;
     File::open(&directory)?.sync_all()?;
+    // CIFS may reconcile write timestamps at close; fingerprint only the final read handle.
+    drop(target);
+    let mut target = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&path)?;
     let digest = hex::encode(hash.finalize());
-    target.rewind()?;
+    let staged_identity = wetube_backend::incoming::identity(&target.metadata()?);
     let mut verify = Sha256::new();
     loop {
         ensure!(
@@ -190,11 +219,20 @@ fn stage(config: &ImportConfig, name: &str, expected: &str, attempt: &str) -> Re
         hex::encode(verify.finalize()) == digest,
         "staged ISO checksum verification failed"
     );
+    ensure!(
+        wetube_backend::incoming::identity(&target.metadata()?) == staged_identity
+            && wetube_backend::incoming::identity(&std::fs::symlink_metadata(&path)?)
+                == staged_identity,
+        "staged ISO changed during checksum verification"
+    );
     config.incoming.verify(name, &source, expected)?;
+    target.rewind()?;
     Ok(Staged {
         path,
+        file: target,
         sha256: digest,
         size_bytes: count,
+        identity: staged_identity,
     })
 }
 
@@ -242,7 +280,10 @@ pub async fn tick(pool: &SqlitePool, config: Arc<ImportConfig>) -> Result<bool> 
             .bind(&id)
             .execute(pool)
             .await?;
-        let inspection = super::probe::inspect_dvd(&staged.path, title, angle).await?;
+        staged.verify()?;
+        let inspection =
+            super::probe::inspect_open_iso(&staged.path, &staged.file, title, angle).await?;
+        staged.verify()?;
         Ok(serde_json::json!({
             "sha256": staged_report["sha256"],
             "size_bytes": staged.size_bytes,
@@ -272,6 +313,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn rejects_a_replaced_verified_staging_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let incoming = dir.path().join("incoming");
+        let scratch = dir.path().join("scratch");
+        std::fs::create_dir(&incoming).unwrap();
+        std::fs::write(incoming.join("movie.iso"), b"verified copy").unwrap();
+        let config =
+            ImportConfig::open(&incoming, &scratch, 1024, 4096, Duration::from_secs(30)).unwrap();
+        let confirmed = config.incoming.open_file("movie.iso").unwrap().1;
+        let staged = stage(&config, &confirmed.name, &confirmed.identity, "attempt").unwrap();
+        staged.verify().unwrap();
+        std::fs::rename(&staged.path, staged.path.with_file_name("retained.iso")).unwrap();
+        std::fs::write(&staged.path, b"verified copy").unwrap();
+        assert!(staged.verify().is_err());
+    }
+
+    #[test]
     fn stages_a_verified_copy_and_preserves_the_source() {
         let dir = tempfile::tempdir().unwrap();
         let incoming = dir.path().join("incoming");
@@ -283,8 +341,12 @@ mod tests {
             ImportConfig::open(&incoming, &scratch, 1024, 4096, Duration::from_secs(600)).unwrap();
         let expected = config.incoming.open_file("movie.iso").unwrap().1.identity;
         assert!(stage(&config, "movie.iso", "stale", "stale").is_err());
-        let staged = stage(&config, "movie.iso", &expected, "attempt").unwrap();
-        assert_eq!(std::fs::read(&staged.path).unwrap(), b"private ISO copy");
+        let mut staged = stage(&config, "movie.iso", &expected, "attempt").unwrap();
+        let mut bytes = Vec::new();
+        staged.file.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"private ISO copy");
+        assert!(staged.file.write_all(b"unexpected write").is_err());
+        staged.verify().unwrap();
         assert_eq!(
             staged.sha256,
             hex::encode(Sha256::digest(b"private ISO copy"))

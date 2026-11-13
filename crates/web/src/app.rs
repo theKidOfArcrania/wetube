@@ -467,13 +467,14 @@ fn ImportsPanel(csrf: StoredValue<String>) -> impl IntoView {
                     };
                     view! {
                         <article class="job">
-                            <strong>{job.name}" - "{label}</strong>
-                            <p class="subtle">"Title "{job.title}", angle "{job.angle}</p>
+                            <h3 class="inspection-source">"Source: "{job.name.clone()}</h3>
+                            <p class="inspection-state">{label}</p>
+                            {inspection_summary(&job)}
                             {job.attempt_id.map(|attempt| view! { <p class="attempt">"Attempt: "{attempt}</p> })}
                             {job.error.map(|message| view! { <p class="error">{message}</p> })}
                             {job.report.map(|report| view! {
                                 <details>
-                                    <summary>"Staging / inspection report"</summary>
+                                    <summary>"Raw staging / inspection JSON"</summary>
                                     <pre>{format!("{report:#}")}</pre>
                                 </details>
                             })}
@@ -483,4 +484,157 @@ fn ImportsPanel(csrf: StoredValue<String>) -> impl IntoView {
             <p class="subtle">"All attempts, including failed/interrupted ones, count against scratch limits and require operator review. No automatic cleanup is enabled."</p>
         </section>
     }
+}
+
+fn approximate_duration(seconds: Option<f64>) -> String {
+    match seconds.filter(|seconds| seconds.is_finite() && *seconds >= 0.0) {
+        Some(seconds) => format!("About {:.0} min ({seconds:.1} s)", (seconds / 60.0).round()),
+        None => "Not reported".to_owned(),
+    }
+}
+
+fn inspection_summary(job: &ProbeJob) -> AnyView {
+    let report = job.report.as_ref();
+    let checksum = report
+        .and_then(|report| report["sha256"].as_str())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("Not reported")
+        .to_owned();
+    let size = report
+        .and_then(|report| report["size_bytes"].as_u64())
+        .map(|bytes| format!("{:.2} GiB ({bytes} bytes)", bytes as f64 / 1_073_741_824.0))
+        .unwrap_or_else(|| "Not reported".to_owned());
+    let inspection = report
+        .and_then(|report| report.get("inspection"))
+        .filter(|inspection| inspection.is_object());
+    let metadata = inspection
+        .and_then(|inspection| inspection.get("metadata"))
+        .filter(|metadata| metadata.is_object());
+    let seconds = metadata.and_then(|metadata| {
+        let duration = &metadata["format"]["duration"];
+        duration
+            .as_f64()
+            .or_else(|| duration.as_str().and_then(|value| value.parse().ok()))
+    });
+    let chapters = metadata
+        .and_then(|metadata| metadata["chapters"].as_array())
+        .map(|chapters| chapters.len().to_string())
+        .unwrap_or_else(|| "Not reported".to_owned());
+    let streams = metadata.and_then(|metadata| metadata["streams"].as_array());
+    let track_groups = [
+        ("video", "Video"),
+        ("audio", "Audio tracks"),
+        ("subtitle", "Subtitle tracks"),
+    ]
+    .into_iter()
+    .map(|(kind, heading)| {
+        let tracks = streams
+            .into_iter()
+            .flatten()
+            .filter(|stream| stream["codec_type"].as_str() == Some(kind))
+            .enumerate()
+            .map(|(position, stream)| {
+                let codec = stream["codec_name"]
+                    .as_str()
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or("Codec not reported");
+                let label = stream["index"]
+                    .as_u64()
+                    .map(|index| format!("Stream {index}"))
+                    .unwrap_or_else(|| format!("Track {}", position + 1));
+                let detail = if kind == "video" {
+                    let resolution = match (
+                        stream["width"].as_u64().filter(|width| *width > 0),
+                        stream["height"].as_u64().filter(|height| *height > 0),
+                    ) {
+                        (Some(width), Some(height)) => format!("{width} × {height}"),
+                        _ => "Resolution not reported".to_owned(),
+                    };
+                    let field_order = match stream["field_order"].as_str() {
+                        Some("progressive") => "Progressive",
+                        Some("tt") => "Top coded / top displayed first",
+                        Some("bb") => "Bottom coded / bottom displayed first",
+                        Some("tb") => "Top coded / bottom displayed first",
+                        Some("bt") => "Bottom coded / top displayed first",
+                        _ => "Not reported",
+                    };
+                    format!("{codec} · {resolution} · Field order: {field_order}")
+                } else {
+                    let language = stream["tags"]["language"]
+                        .as_str()
+                        .filter(|value| !value.trim().is_empty() && *value != "und")
+                        .unwrap_or("Not reported");
+                    if kind == "audio" {
+                        let channels = stream["channels"]
+                            .as_u64()
+                            .filter(|channels| *channels > 0)
+                            .map(|channels| channels.to_string())
+                            .unwrap_or_else(|| "Not reported".to_owned());
+                        format!("{codec} · Language: {language} · Channels: {channels}")
+                    } else {
+                        format!("{codec} · Language: {language}")
+                    }
+                };
+                view! { <li><strong>{label}</strong><span>{detail}</span></li> }
+            })
+            .collect::<Vec<_>>();
+        let empty = if streams.is_none() {
+            "Track metadata not available."
+        } else {
+            "No tracks of this type reported."
+        };
+        view! {
+            <div class="inspection-tracks">
+                <h4>{heading}</h4>
+                {if tracks.is_empty() {
+                    view! { <p class="subtle">{empty}</p> }.into_any()
+                } else {
+                    view! { <ul>{tracks}</ul> }.into_any()
+                }}
+            </div>
+        }
+    })
+    .collect_view();
+    let warnings = inspection.and_then(|inspection| inspection["warnings"].as_array());
+    let warning_items = warnings
+        .into_iter()
+        .flatten()
+        .filter_map(|warning| warning.as_str())
+        .filter(|warning| !warning.trim().is_empty())
+        .map(|warning| view! { <li>{warning.to_owned()}</li> })
+        .collect::<Vec<_>>();
+    let warning_fallback = if warnings.is_some_and(|warnings| warnings.is_empty()) {
+        "No inspection warnings reported."
+    } else {
+        "Inspection warnings not available; consult the raw report if present."
+    };
+    view! {
+        <div class="inspection-summary">
+            <dl class="inspection-facts">
+                <div><dt>"Selected title / angle"</dt><dd>{format!("{} / {}", job.title, job.angle)}</dd></div>
+                <div><dt>"Staged size"</dt><dd>{size}</dd></div>
+                <div class="inspection-checksum"><dt>"Staged SHA-256"</dt><dd><code>{checksum}</code></dd></div>
+            </dl>
+            <h4>"Metadata inspection only"</h4>
+            <p class="subtle">"Only the selected title and angle are described. Nothing is published; this is not conversion or playback validation."</p>
+            {metadata.is_none().then(|| view! {
+                <p class="subtle">"DVD metadata is not available for this attempt. Staging details, if present, do not mean inspection succeeded."</p>
+            })}
+            <dl class="inspection-facts">
+                <div><dt>"Approximate duration"</dt><dd>{approximate_duration(seconds)}</dd></div>
+                <div><dt>"Chapter count"</dt><dd>{chapters}</dd></div>
+            </dl>
+            <p class="subtle">"Duration and chapter timing are approximate; full-disc preindexing is disabled."</p>
+            <div class="inspection-track-grid">{track_groups}</div>
+            <div class="inspection-warnings">
+                <h4>"Inspection warnings"</h4>
+                {if warning_items.is_empty() {
+                    view! { <p class="subtle">{warning_fallback}</p> }.into_any()
+                } else {
+                    view! { <ul>{warning_items}</ul> }.into_any()
+                }}
+            </div>
+        </div>
+    }
+    .into_any()
 }

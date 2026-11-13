@@ -4,10 +4,13 @@ use axum::{
     http::{Request, StatusCode, header},
     response::Response,
 };
+use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
+use std::{sync::Arc, time::Duration};
 use tower::ServiceExt;
 use wetube_backend::{accounts, db};
-use wetube_core::{DiagnosticJob, IncomingFiles, ProbeJob, Role, Session};
+use wetube_core::{DiagnosticJob, IncomingFiles, ProbeJob, ProbeState, Role, Session};
+use wetube_worker::imports::{ImportConfig, tick};
 
 const ORIGIN: &str = "http://wetube.test";
 const PASSWORD: &str = "a household test password";
@@ -169,6 +172,134 @@ async fn incoming_probes_require_admin_confirmation_and_exclude_concurrent_jobs(
         serde_json::from_slice(&to_bytes(history.into_body(), 16 * 1024).await.unwrap()).unwrap();
     assert_eq!(history.len(), 1);
     assert_eq!(history[0].name, "movie.iso");
+}
+
+#[tokio::test]
+async fn admin_selection_is_staged_inspected_and_retained_in_http_history() {
+    let mut fixture = Fixture::new().await;
+    let incoming = fixture._directory.path().join("incoming");
+    let scratch = fixture._directory.path().join("scratch");
+    std::fs::create_dir(&incoming).unwrap();
+    let source = incoming.join("selected.iso");
+    let input = b"synthetic invalid DVD: preserve this exact selected copy";
+    std::fs::write(&source, input).unwrap();
+    std::fs::write(incoming.join("decoy.iso"), b"not the selected input").unwrap();
+    fixture.app = wetube_server::router_with_incoming(
+        fixture.pool.clone(),
+        ORIGIN,
+        fixture._directory.path(),
+        Some(wetube_backend::incoming::IncomingRoot::open(&incoming).unwrap()),
+    )
+    .await
+    .unwrap();
+    let (cookie, session) = fixture.login("admin").await;
+    let response = fixture
+        .send("GET", "/api/v1/admin/incoming", "", Some(&cookie), None)
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let listing: IncomingFiles =
+        serde_json::from_slice(&to_bytes(response.into_body(), 16 * 1024).await.unwrap()).unwrap();
+    assert!(listing.configured);
+    assert_eq!(listing.files.len(), 2);
+    let selected = listing
+        .files
+        .iter()
+        .find(|file| file.name == "selected.iso")
+        .unwrap();
+    let response = fixture
+        .send(
+            "POST",
+            "/api/v1/admin/probes",
+            &serde_json::json!({
+                "name": selected.name,
+                "identity": selected.identity,
+                "title": 7,
+                "angle": 2,
+                "copy_complete": true
+            })
+            .to_string(),
+            Some(&cookie),
+            Some(&session.csrf_token),
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let queued: ProbeJob =
+        serde_json::from_slice(&to_bytes(response.into_body(), 16 * 1024).await.unwrap()).unwrap();
+    assert_eq!(queued.state, ProbeState::Queued);
+    assert_eq!(queued.name, selected.name);
+    assert_eq!((queued.title, queued.angle), (7, 2));
+    let config = Arc::new(
+        ImportConfig::open(&incoming, &scratch, 1024, 4096, Duration::from_secs(30)).unwrap(),
+    );
+    assert!(tick(&fixture.pool, config.clone()).await.unwrap());
+    assert!(!tick(&fixture.pool, config).await.unwrap());
+
+    fixture.app = wetube_server::router_with_incoming(
+        fixture.pool.clone(),
+        ORIGIN,
+        fixture._directory.path(),
+        Some(wetube_backend::incoming::IncomingRoot::open(&incoming).unwrap()),
+    )
+    .await
+    .unwrap();
+    let response = fixture
+        .send("GET", "/api/v1/admin/probes", "", Some(&cookie), None)
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let history: Vec<ProbeJob> =
+        serde_json::from_slice(&to_bytes(response.into_body(), 16 * 1024).await.unwrap()).unwrap();
+    assert_eq!(history.len(), 1);
+    let result = &history[0];
+    assert_eq!(result.id, queued.id);
+    assert_eq!(result.name, selected.name);
+    assert_eq!((result.title, result.angle), (7, 2));
+    assert_eq!(result.state, ProbeState::Failed);
+    assert!(
+        result
+            .error
+            .as_deref()
+            .unwrap()
+            .starts_with("DVD inspection failed:"),
+        "expected ffprobe to reject the staged synthetic DVD: {:?}",
+        result.error
+    );
+    let staged = scratch
+        .join(result.attempt_id.as_ref().unwrap())
+        .join("input.iso");
+    let staged_bytes = std::fs::read(staged).unwrap();
+    assert_eq!(staged_bytes, input);
+    let report = result.report.as_ref().unwrap();
+    let expected_hash = format!("{:x}", Sha256::digest(input));
+    assert_eq!(report["sha256"], expected_hash);
+    assert_eq!(
+        report["sha256"],
+        format!("{:x}", Sha256::digest(&staged_bytes))
+    );
+    assert_eq!(report["size_bytes"], input.len() as u64);
+    assert!(report.get("inspection").is_none());
+    assert_eq!(std::fs::read(&source).unwrap(), input);
+    assert_eq!(
+        wetube_backend::incoming::IncomingRoot::open(&incoming)
+            .unwrap()
+            .list()
+            .unwrap()
+            .iter()
+            .find(|file| file.name == selected.name)
+            .unwrap()
+            .identity,
+        selected.identity
+    );
+    assert_eq!(
+        std::fs::read(incoming.join("decoy.iso")).unwrap(),
+        b"not the selected input"
+    );
+    let response = fixture
+        .send("GET", "/api/v1/movies", "", Some(&cookie), None)
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let library: wetube_core::Library =
+        serde_json::from_slice(&to_bytes(response.into_body(), 16 * 1024).await.unwrap()).unwrap();
+    assert!(library.movies.is_empty());
 }
 
 impl Fixture {

@@ -15,11 +15,14 @@ This is a runnable foundation, not a DVD player yet:
 - Administrator-selected incoming copies, durable staging/inspection jobs,
   checksum verification, and retained reports for manual review.
 
-The library starts empty. Conversion, publication, playback, captions, TMDB,
+The library starts empty. Production conversion, publication, playback, captions, TMDB,
 scheduled backups/restore, and trash are not implemented. Inspection never
 modifies or deletes incoming files and does not add movies to the library.
 Automatic ISO deletion remains disabled pending the design's safety gates.
 Docker packaging is intentionally deferred.
+
+A separate opt-in `import_dvd` Rust example exercises experimental conversion
+and full decoding without enabling the production pipeline; see below.
 
 ## Build locally
 
@@ -214,7 +217,8 @@ production-ready TrueNAS deployment.
 
 ## Next integration checkpoint
 
-Local implementation stops at staged inspection. Before encoding profiles or
+The application's production workflow stops at staged inspection; the standalone
+experiment below does not enable production conversion. Before encoding profiles or
 Docker/TrueNAS packaging, supply disposable, completed ISO copies covering:
 
 | Input | Evidence to collect |
@@ -239,6 +243,92 @@ per-user resume, captions, audio selection, and four streams during an import.
 Docker remains deferred; its next step is the reviewed builder/slim-runtime
 multi-stage image and a verified TrueNAS app pull/install workflow, not an
 assumption that this preview is deployable.
+
+## Experimental full-import example
+
+The standalone program at crates/worker/examples/import_dvd.rs exercises:
+finished ISO copy -> verified staging -> full selected-title video/audio decode
+-> experimental encoding -> output metadata/track checks -> full output decode.
+It uses no application database or HTTP server and never publishes or deletes.
+Stop other workers/examples using the same scratch root before running it.
+
+```sh
+cargo run --release --locked --package wetube-worker --example import_dvd -- \
+  --iso /path/to/incoming/movie.iso \
+  --scratch-dir /private/scratch \
+  --title 1 --angle 1 --copy-complete \
+  --video-treatment yadif \
+  --staging-timeout-secs 1800 --tool-timeout-secs 14400 --threads 2
+```
+
+For the explicitly accepted shared test mount in this session, the ISO is
+/mnt/private/staging/COUNT_OF_MONTE_CRISTO.ISO and scratch is /mnt/private/streams.
+This tests the media pipeline only: the mirrored SMB mount's forced owner/mode
+display does not make its files private or satisfy deployment safety gates.
+
+`--video-treatment` is required: `yadif` uses single-rate deinterlacing;
+`preserve` leaves frames unfiltered. Neither is an approved production profile
+or an automatic telecine decision. The experimental encoder is software H.264,
+CRF 20, veryfast, yuv420p; every source audio track gets an AAC stereo fallback
+at 192 kbit/s. No GPU is required.
+
+Each unique attempt retains:
+
+- input.iso: checksum-verified staged ISO (or the retained ISO referenced by a resume report).
+- movie.mp4: H.264 video, AAC stereo tracks, and chapters, for manual playback.
+- original-tracks.mkv: stream-copied original audio and image subtitles, retaining
+  their language metadata and chapters; omitted for video-only inputs.
+- report.json and phase stdout/stderr logs: success/failure, parameters, source digest,
+  stream metadata/packet counts, durations, and decoded frame counts.
+
+Success requires decoding the entire selected title's video/all audio,
+checking output codecs/dimensions/track counts/languages/chapters, and fully
+decoding the MP4 plus original sidecar audio. Encoded video must have exactly
+the source's decoded frame count. Duration comparisons allow a small tolerance
+for approximate DVD timing. Media-tool errors, missing/empty encoded tracks,
+truncation, timeouts, changed source identity, or byte-cap failures return a
+nonzero exit code, including error-level stderr from a tool that exits zero.
+Encoding preserves the filter's fine-grained timebase instead of rounding DVD
+timestamps to the nominal frame rate; it does not regenerate a guessed cadence.
+Inspection and media tools reuse the checksum-bound ISO descriptor, with
+identity checks to reject a changed or replaced staged copy.
+This does not perform subtitle OCR, assess visual/audio
+quality or synchronization perceptually, or demonstrate browser playback.
+
+Default limits are 16 GiB per ISO, 32 GiB retained scratch, and 8 GiB per output
+file. Before encoding, capacity checks reserve room for two capped outputs plus
+1 GiB free; `--max-output-bytes` and `--max-scratch-bytes` can adjust admission.
+The FFmpeg byte caps may be exceeded slightly before detection; exceeding them
+fails verification. They are not a substitute for dataset quotas. The staging
+budget defaults to 600 seconds (maximum 3,600); each media tool defaults to
+14,400 seconds (maximum 86,400) and 2 MiB captured output. Use `--help` for flags.
+
+Phase stdout/stderr logs are written incrementally within the capture cap, so
+timeouts, cancellation, and output-limit failures keep diagnostics captured so
+far. Filesystem I/O is not hard-cancellable: an unavailable NAS can prevent
+logging, report writes, or final synchronization.
+
+Ctrl-C/SIGTERM cancels active media tools but drains uncancellable staging I/O
+before releasing ownership. Completed staging metadata is recorded even when
+cancellation stops the next phase, allowing a checksum-verified retry.
+Partial attempts and failed reports are normally retained; there is no automatic
+cleanup or production approval action. A forced kill or storage failure
+can leave an attempt without a final report. Do not treat this example as the
+production import, publication, browser compatibility, or source-deletion gate.
+
+To retry an interrupted/failed experimental attempt without copying the ISO
+again, append `--resume-attempt UUID` to the same command. Keep the same incoming
+filename, title, angle, and scratch root. The program checks the earlier report,
+rehashes its retained ISO against the recorded SHA-256, then creates a **new**
+attempt directory for all output and logs. A partial MP4/sidecar is never trusted,
+appended to, or overwritten. A failed/incomplete staging attempt with no verified
+digest cannot be resumed.
+
+The new report records `resumed_from` and `staged_attempt_id`. Keep the referenced
+staged attempt while any resumed report/output is under review: resumed attempts
+do not contain a second input.iso. A failure before attempt-directory allocation
+may return an error without a new report. Repeating resume rehashes the original
+retained ISO again, not a partial encoded artifact.
 
 ## Development
 

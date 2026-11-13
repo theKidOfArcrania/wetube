@@ -5,6 +5,7 @@ use tokio::process::Command;
 use wetube_backend::now;
 use wetube_core::{DiagnosticReport, ToolCheck};
 
+pub mod experimental;
 pub mod imports;
 pub mod probe;
 mod process;

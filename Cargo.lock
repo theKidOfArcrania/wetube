@@ -3181,6 +3181,7 @@ dependencies = [
  "rpassword",
  "serde",
  "serde_json",
+ "sha2",
  "sqlx",
  "subtle",
  "tempfile",
@@ -3193,6 +3194,7 @@ dependencies = [
  "uuid",
  "wetube-backend",
  "wetube-core",
+ "wetube-worker",
 ]
 
 [[package]]

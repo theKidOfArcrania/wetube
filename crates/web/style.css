@@ -20,7 +20,7 @@ p { max-width: 70ch; }
 label { display: block; font-size: .9rem; margin-top: 1rem; }
 input, select, button { font: inherit; border-radius: 7px; padding: .7rem .9rem; }
 input, select { width: 100%; color: #fff; background: #111219; border: 1px solid #4a4e5e; margin: .35rem 0 .7rem; }
-input:focus-visible, select:focus-visible, button:focus-visible { outline: 2px solid #ff7b82; outline-offset: 3px; }
+input:focus-visible, select:focus-visible, button:focus-visible, summary:focus-visible { outline: 2px solid #ff7b82; outline-offset: 3px; }
 button { cursor: pointer; border: 1px solid transparent; background: #db3748; color: #fff; font-weight: 650; }
 button.secondary { background: #262934; border-color: #444958; }
 button:disabled { opacity: .5; cursor: wait; }
@@ -43,6 +43,25 @@ button:disabled { opacity: .5; cursor: wait; }
 .confirmation { display: flex; align-items: baseline; gap: .75rem; }
 .confirmation input { width: auto; }
 .attempt, .job strong, .job .error { overflow-wrap: anywhere; }
+.inspection-source { margin: 0; font-size: 1.05rem; overflow-wrap: anywhere; }
+.inspection-state { color: #e7cda4; margin: .35rem 0 1rem; }
+.inspection-summary h4 { font-size: .95rem; margin: 1rem 0 .4rem; }
+.inspection-summary p { margin: .4rem 0 .8rem; font-size: .9rem; }
+.inspection-facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 220px), 1fr)); gap: .75rem 1.5rem; margin: 1rem 0; }
+.inspection-facts > div { min-width: 0; }
+.inspection-facts dt { color: #a7abb9; font-size: .85rem; }
+.inspection-facts dd { margin: .2rem 0 0; overflow-wrap: anywhere; }
+.inspection-checksum { grid-column: 1 / -1; }
+.inspection-checksum code { font-size: .85rem; }
+.inspection-track-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 240px), 1fr)); gap: 0 1.5rem; }
+.inspection-tracks { min-width: 0; }
+.inspection-tracks ul, .inspection-warnings ul { padding-left: 1.25rem; font-size: .9rem; }
+.inspection-tracks li { margin: .6rem 0; overflow-wrap: anywhere; }
+.inspection-tracks li span { display: block; color: #a7abb9; }
+.inspection-warnings { border-left: 2px solid #e8ba6e; padding-left: 1rem; margin: 1rem 0; }
+.inspection-warnings li { margin: .4rem 0; overflow-wrap: anywhere; }
+.job details { margin: 1rem 0; }
+summary { cursor: pointer; color: #c9cdda; }
 pre { max-height: 32rem; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font-size: .85rem; }
 @media (max-width: 600px) {
   header, main { padding: 1rem; }

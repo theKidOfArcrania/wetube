@@ -75,6 +75,16 @@ fn parse_metadata(bytes: &[u8]) -> Result<Value> {
 
 /// Inspect one operator-selected title; this is not the staged import protocol.
 pub async fn inspect_dvd(path: &Path, title: u8, angle: u8) -> Result<Value> {
+    let (file, _) = open_iso(path)?;
+    inspect_open_iso(path, &file, title, angle).await
+}
+
+pub(crate) async fn inspect_open_iso(
+    path: &Path,
+    file: &File,
+    title: u8,
+    angle: u8,
+) -> Result<Value> {
     ensure!(
         (1..=99).contains(&title),
         "DVD title must be between 1 and 99"
@@ -83,7 +93,7 @@ pub async fn inspect_dvd(path: &Path, title: u8, angle: u8) -> Result<Value> {
         (1..=9).contains(&angle),
         "DVD angle must be between 1 and 9"
     );
-    let (file, identity) = open_iso(path)?;
+    let identity = Identity::from(file.metadata()?);
     let output = super::process::run(
         Command::new("ffprobe")
             .args([
@@ -116,7 +126,7 @@ pub async fn inspect_dvd(path: &Path, title: u8, angle: u8) -> Result<Value> {
     )
     .await
     .context("run ffprobe DVD inspection")?;
-    unchanged(path, &file, &identity)?;
+    unchanged(path, file, &identity)?;
     ensure!(
         output.status.success(),
         "DVD inspection failed: {}",
