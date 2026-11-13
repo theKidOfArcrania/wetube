@@ -19,6 +19,7 @@ pub struct ImportConfig {
     scratch: File,
     max_iso_bytes: u64,
     max_scratch_bytes: u64,
+    staging_timeout: Duration,
 }
 
 impl ImportConfig {
@@ -27,10 +28,16 @@ impl ImportConfig {
         scratch: &Path,
         max_iso_bytes: u64,
         max_scratch_bytes: u64,
+        staging_timeout: Duration,
     ) -> Result<Self> {
         ensure!(
             max_iso_bytes > 0 && max_scratch_bytes >= max_iso_bytes,
             "invalid staging byte limits"
+        );
+        ensure!(
+            staging_timeout >= Duration::from_secs(1)
+                && staging_timeout <= Duration::from_secs(3600),
+            "staging timeout must be between 1 and 3600 seconds"
         );
         match std::fs::DirBuilder::new().mode(0o700).create(scratch) {
             Ok(()) => {}
@@ -57,6 +64,7 @@ impl ImportConfig {
             scratch: scratch_file,
             max_iso_bytes,
             max_scratch_bytes,
+            staging_timeout,
         })
     }
 
@@ -134,14 +142,14 @@ fn stage(config: &ImportConfig, name: &str, expected: &str, attempt: &str) -> Re
         .create_new(true)
         .mode(0o600)
         .open(&path)?;
-    let deadline = Instant::now() + Duration::from_secs(600);
+    let deadline = Instant::now() + config.staging_timeout;
     let mut buffer = vec![0u8; 1024 * 1024];
     let mut hash = Sha256::new();
     let mut count = 0u64;
     loop {
         ensure!(
             Instant::now() < deadline,
-            "staging exceeded its ten-minute copy budget"
+            "staging exceeded its configured copy/verification budget while copying"
         );
         let bytes = source.read(&mut buffer)?;
         if bytes == 0 {
@@ -170,7 +178,7 @@ fn stage(config: &ImportConfig, name: &str, expected: &str, attempt: &str) -> Re
     loop {
         ensure!(
             Instant::now() < deadline,
-            "staging exceeded its ten-minute verification budget"
+            "staging exceeded its configured copy/verification budget while verifying"
         );
         let bytes = target.read(&mut buffer)?;
         if bytes == 0 {
@@ -271,7 +279,8 @@ mod tests {
         std::fs::create_dir(&incoming).unwrap();
         let source = incoming.join("movie.iso");
         std::fs::write(&source, b"private ISO copy").unwrap();
-        let config = ImportConfig::open(&incoming, &scratch, 1024, 4096).unwrap();
+        let config =
+            ImportConfig::open(&incoming, &scratch, 1024, 4096, Duration::from_secs(600)).unwrap();
         let expected = config.incoming.open_file("movie.iso").unwrap().1.identity;
         assert!(stage(&config, "movie.iso", "stale", "stale").is_err());
         let staged = stage(&config, "movie.iso", &expected, "attempt").unwrap();
@@ -287,16 +296,20 @@ mod tests {
     #[test]
     fn rejects_overlapping_roots_and_quota_exhaustion() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(ImportConfig::open(dir.path(), dir.path(), 1, 1).is_err());
+        assert!(
+            ImportConfig::open(dir.path(), dir.path(), 1, 1, Duration::from_secs(600)).is_err()
+        );
         let incoming = dir.path().join("incoming");
         let scratch = dir.path().join("scratch");
         std::fs::create_dir(&incoming).unwrap();
         std::fs::write(incoming.join("movie.iso"), b"too large").unwrap();
-        let config = ImportConfig::open(&incoming, &scratch, 4, 4).unwrap();
+        let config =
+            ImportConfig::open(&incoming, &scratch, 4, 4, Duration::from_secs(600)).unwrap();
         let expected = config.incoming.open_file("movie.iso").unwrap().1.identity;
         assert!(stage(&config, "movie.iso", &expected, "attempt").is_err());
         assert_eq!(usage(&config.scratch_path(), 0, &mut 0).unwrap(), 0);
-        let config = ImportConfig::open(&incoming, &scratch, 10, 10).unwrap();
+        let config =
+            ImportConfig::open(&incoming, &scratch, 10, 10, Duration::from_secs(600)).unwrap();
         std::fs::write(scratch.join("retained-partial.iso"), b"retained").unwrap();
         let error = stage(&config, "movie.iso", &expected, "attempt")
             .err()
@@ -315,10 +328,38 @@ mod tests {
         let scratch = dir.path().join("scratch");
         std::fs::create_dir(&scratch).unwrap();
         std::fs::set_permissions(&scratch, std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(ImportConfig::open(incoming.path(), &scratch, 100, 100).is_err());
+        assert!(
+            ImportConfig::open(
+                incoming.path(),
+                &scratch,
+                100,
+                100,
+                Duration::from_secs(600)
+            )
+            .is_err()
+        );
         std::fs::set_permissions(&scratch, std::fs::Permissions::from_mode(0o700)).unwrap();
         std::os::unix::fs::symlink(&scratch, dir.path().join("link")).unwrap();
-        assert!(ImportConfig::open(incoming.path(), &dir.path().join("link"), 100, 100).is_err());
+        assert!(
+            ImportConfig::open(
+                incoming.path(),
+                &dir.path().join("link"),
+                100,
+                100,
+                Duration::from_secs(600)
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn refuses_unbounded_staging_budgets_before_creating_scratch() {
+        let incoming = tempfile::tempdir().unwrap();
+        let scratch = incoming.path().join("not-created");
+        for timeout in [Duration::ZERO, Duration::from_secs(3601)] {
+            assert!(ImportConfig::open(incoming.path(), &scratch, 100, 100, timeout).is_err());
+        }
+        assert!(!scratch.exists());
     }
 
     #[tokio::test]
@@ -329,7 +370,16 @@ mod tests {
         let incoming = tempfile::tempdir().unwrap();
         let scratch = dir.path().join("scratch");
         std::fs::write(incoming.path().join("movie.iso"), b"not a DVD").unwrap();
-        let config = Arc::new(ImportConfig::open(incoming.path(), &scratch, 1024, 4096).unwrap());
+        let config = Arc::new(
+            ImportConfig::open(
+                incoming.path(),
+                &scratch,
+                1024,
+                4096,
+                Duration::from_secs(600),
+            )
+            .unwrap(),
+        );
         db::initialize(dir.path()).await.unwrap();
         let pool = db::connect(dir.path()).await.unwrap();
         sqlx::query("INSERT INTO users VALUES ('admin', 'admin', 'test hash', 'admin')")

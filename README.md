@@ -149,7 +149,9 @@ require free space for the ISO plus a 1 GiB reserve before copying. These are
 conservative admission checks, not a dataset quota or reservation against other
 NAS workloads. Set real dataset quotas and choose deployment caps after
 measuring available space. Copying plus rehashing has a ten-minute cooperative
-budget checked between reads; kernel filesystem I/O itself has no hard deadline.
+budget checked between reads, configurable from 1 to 3,600 seconds with
+`--staging-timeout-secs` (default 600). Allow for both copy and full rehash,
+particularly over slower mounts; kernel filesystem I/O itself has no hard deadline.
 ffprobe retains its separate 120-second / 1 MiB-per-stream limits.
 
 All incoming files and attempt directories are retained, including failures.
@@ -194,6 +196,7 @@ Do not roll an old binary forward onto the upgraded live state.
 | `WETUBE_SCRATCH_DIR` | Disabled | Worker-private staging root; required together with worker incoming. |
 | `WETUBE_MAX_ISO_BYTES` | `17179869184` | Worker's per-input staging byte limit (16 GiB). |
 | `WETUBE_MAX_SCRATCH_BYTES` | `34359738368` | Worker's total retained scratch byte limit (32 GiB). |
+| `WETUBE_STAGING_TIMEOUT_SECS` | `600` | Combined copy/rehash cooperative budget, 1-3,600 seconds. |
 | `RUST_LOG` | Rust tracing default | Optional local log filter. |
 
 Equivalent flags are available with `--help`. Initialization is explicit:
@@ -249,3 +252,43 @@ cargo clippy --package wetube-web --target wasm32-unknown-unknown --locked -- -D
 The workspace separates portable API contracts (crates/core), backend
 persistence/authentication/locking (crates/backend), HTTP/administration
 (crates/server), diagnostics (crates/worker), and browser UI (crates/web).
+
+### Opt-in real-DVD staged inspection test
+
+The ignored integration case uses an isolated temporary database and the real
+worker executable. It requires a completed disposable ISO and explicitly
+selected title; it retains the staged ISO and integration-report.json under a
+unique attempt directory in scratch, even on inspection failure. No incoming
+file is modified and no movie is published. Allow at least the ISO size plus
+1 GiB free and review retained attempts manually afterward.
+
+```sh
+WETUBE_TEST_COPY_COMPLETE=1 \
+WETUBE_TEST_ISO=/path/to/incoming/movie.iso \
+WETUBE_TEST_SCRATCH=/private/scratch \
+WETUBE_TEST_TITLE=1 \
+WETUBE_TEST_STAGING_TIMEOUT_SECS=1800 \
+cargo test --package wetube-worker --test inspect --locked \
+  real_dvd_copy_reaches_review_without_changing_incoming -- --ignored --exact --nocapture
+```
+
+Only acknowledge completion after all writers are closed. The selected title
+is a candidate, not an automatic main-feature choice. Scratch must pass the
+worker's owner/mode checks, but those checks alone cannot prove storage privacy:
+an SMB mount with forced uid/gid and 0700 modes can still expose the same files
+through another mount/export. Such a mount may be used for an explicitly
+accepted, non-destructive test, but it does not pass the deployment privacy or
+writer-exclusion gates.
+
+The first real-DVD test reached Needs review for a 4,681,420,800-byte ISO,
+title 1 / angle 1, in 687 seconds over the shared SMB test mount using an
+explicit 1,800-second budget. The default 600-second run failed closed during
+rehashing and retained its copy. The successful run verified staging,
+unchanged incoming identity, persisted inspection metadata, and no catalog
+publication. Its probe reported about 131 minutes, 720x480 MPEG-2 video with
+top-field-first metadata, English AC-3 surround/stereo audio, and
+English/Spanish/French image subtitles.
+
+This is one disc's staging/probing result, not a full decode, a confirmed
+main-feature selection, a deinterlacing decision, OCR validation, or a TrueNAS
+performance benchmark. Keep the remaining acceptance matrix above open.

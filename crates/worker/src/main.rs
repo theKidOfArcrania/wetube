@@ -48,6 +48,8 @@ enum Command {
         max_iso_bytes: u64,
         #[arg(long, env = "WETUBE_MAX_SCRATCH_BYTES", default_value_t = 32 * 1024 * 1024 * 1024u64)]
         max_scratch_bytes: u64,
+        #[arg(long, env = "WETUBE_STAGING_TIMEOUT_SECS", default_value_t = 600, value_parser = clap::value_parser!(u64).range(1..=3600))]
+        staging_timeout_secs: u64,
     },
 }
 
@@ -83,6 +85,7 @@ async fn main() -> Result<()> {
             scratch_dir,
             max_iso_bytes,
             max_scratch_bytes,
+            staging_timeout_secs,
         } => {
             let _services = ServiceLock::acquire(&cli.state_dir, false)?;
             let _lock = MaintenanceLock::acquire(&cli.state_dir)?;
@@ -95,6 +98,7 @@ async fn main() -> Result<()> {
                         &scratch,
                         max_iso_bytes,
                         max_scratch_bytes,
+                        Duration::from_secs(staging_timeout_secs),
                     )?))
                 }
                 (None, None) => None,
