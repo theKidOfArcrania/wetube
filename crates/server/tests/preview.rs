@@ -258,6 +258,36 @@ async fn successful_real_media_is_copied_and_unauthorized_ranges_and_progress_ar
     let app = fixture.app().await;
     let (alice, csrf) = login(&app, "alice").await;
     let (bob, _) = login(&app, "bob").await;
+    let labels = wetube_core::MovieLabels {
+        categories: vec!["Family".into()],
+        tags: vec!["Favorite".into()],
+    };
+    wetube_backend::labels::update(
+        &fixture.pool,
+        id,
+        &wetube_core::UpdateMovieLabels {
+            expected: wetube_core::MovieLabels::default(),
+            labels: labels.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    let details = request(
+        &app,
+        "GET",
+        &format!("/api/v1/movies/{id}"),
+        Some(&alice),
+        None,
+        None,
+        "",
+    )
+    .await;
+    assert_eq!(details.status(), StatusCode::OK);
+    let details: wetube_core::MovieDetails =
+        serde_json::from_slice(&to_bytes(details.into_body(), 8192).await.unwrap()).unwrap();
+    assert_eq!(details.movie.categories, labels.categories);
+    assert_eq!(details.movie.tags, labels.tags);
+    assert!((details.duration_seconds - 1.0).abs() < 0.1);
     let video = format!("/api/v1/movies/{id}/video");
     for suffix in ["", "/video", "/progress"] {
         let path = format!("/api/v1/movies/{id}{suffix}");

@@ -10,6 +10,8 @@ This is a runnable local website preview, not a production TrueNAS deployment:
 - Rust/Axum API with SQLite, local admin/viewer accounts, and cookie sessions.
 - Leptos/WASM login, library search, authenticated MP4 playback/seeking, and
   per-user resume.
+- Multiple flat categories and free-form tags per movie, with administrator editing,
+  reusable labels, and viewer search/filtering.
 - Persistent, restart-recoverable diagnostic jobs and a single-owner worker.
 - Read-only checks for required media capabilities and optional English OCR.
 - DVD program discovery with duration/track information and title/angle dropdowns.
@@ -29,6 +31,38 @@ scheduled backups/restore, and trash are not implemented. Inspection never
 modifies or deletes incoming files and does not add movies to the library.
 Automatic ISO deletion remains disabled pending the design's safety gates.
 Docker packaging is intentionally deferred.
+
+### Categories and tags
+
+Administrators can **Edit labels** on published/imported movies. Enter one label
+per line or reuse an existing name; remove a line to unassign it, then **Save labels**.
+Each movie accepts up to 32 unique categories and 32 unique tags, each 1–80 UTF-8 bytes.
+Whitespace is trimmed/collapsed, Unicode is normalized to NFC, and case-insensitive
+duplicates reuse the first catalog spelling. The API accepts up to 128 entries per
+kind before deduplication. Control characters are rejected. Categories are flat; neither
+categories nor tags are folders. Unassigned catalog names remain available for reuse.
+Edits survive library polling. The editor loads current assignments when opened;
+stale saves keep the draft and show the latest saved labels. Reconcile the draft
+and save again. Older in-flight library reads cannot revert a successful label save.
+
+Everyone signed in can read labels. Library search includes titles, descriptions,
+categories and tags, case-insensitively. Category/tag selectors match actual
+assignments using whole normalized names, not text substrings. Search, category and tag are combined with AND;
+empty selectors impose no restriction.
+
+For linked movies, **Suggest TMDB genres** explicitly fetches category suggestions
+using only the existing TMDB movie ID and fixed language option. Suggestions are
+transient, not cached in SQLite, and never applied automatically: check the desired
+suggestions, then **Save labels**. Accepted labels become user-managed and are
+never refreshed, expired or overwritten by TMDB metadata refresh. No tags are
+suggested. Manual labeling works without TMDB configuration or during an outage.
+Unlinked movies do not offer genre lookup; first select TMDB metadata during
+publication review.
+
+Schema 10 adds a shared label catalog and cascading movie assignments. Offline
+`init` upgrades schemas 1–9 after a SQLite-only snapshot; stop both services and
+retain their separate media/attempt roots. No media or existing movie metadata
+is changed by this migration.
 
 ### Optional TMDB metadata
 
@@ -308,13 +342,14 @@ their inputs; children retain the ownership lock until they exit.
 ## Upgrade local state
 
 Stop both services before running `wetube-server init` with this release.
-Initialization upgrades supported older schemas (1–7) to schema 8 only after a consistent `VACUUM INTO`
+Initialization upgrades supported older schemas (1–9) to schema 10 only after a consistent `VACUUM INTO`
 snapshot is written and synced in a private `pre-upgrade-UUID` directory under
 the state root. Newer/unknown versions fail closed. Repeating initialization
 does not create another snapshot once the upgrade succeeds.
 
 Schema 6 adds per-user import archive preferences, lifecycle view and indexes;
-schema 7 adds private comparisons, and schema 8 adds their nullable progress.
+schema 7 adds private comparisons, schema 8 adds their nullable progress,
+schema 9 adds expiring TMDB overlays, and schema 10 adds movie labels.
 Existing jobs, reports, media, attempts and earlier progress snapshots are retained.
 Stop **both** services, retain the state/media/attempt roots, run the matching
 `wetube-server --state-dir <state-root> init`, then restart the matching server

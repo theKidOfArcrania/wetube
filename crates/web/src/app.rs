@@ -371,13 +371,21 @@ fn LoginPage(session: RwSignal<Option<Session>>) -> impl IntoView {
     }
 }
 
+#[derive(Clone, Copy)]
+struct LibraryRevision(RwSignal<u64>);
+
 #[component]
 fn LibraryPage(current: Session, session: RwSignal<Option<Session>>) -> impl IntoView {
     let is_admin = current.user.role == Role::Admin;
     let username = current.user.username.clone();
     let csrf = StoredValue::new(current.csrf_token);
     let movies = RwSignal::new(Vec::<Movie>::new());
+    let library_revision = RwSignal::new(0_u64);
+    provide_context(LibraryRevision(library_revision));
     let selected = RwSignal::new(None::<Movie>);
+    let editing_labels = RwSignal::new(None::<Movie>);
+    let category = RwSignal::new(String::new());
+    let tag = RwSignal::new(String::new());
     let loading = RwSignal::new(true);
     let signing_out = RwSignal::new(false);
     let playback_notice = RwSignal::new(None::<String>);
@@ -394,15 +402,15 @@ fn LibraryPage(current: Session, session: RwSignal<Option<Session>>) -> impl Int
     let query = RwSignal::new(String::new());
     let requesting = RwSignal::new(false);
     let filtered = Signal::derive(move || {
-        let needle = query.get().to_lowercase();
+        let filter = wetube_core::LibraryFilter {
+            q: query.get(),
+            category: category.get(),
+            tag: tag.get(),
+        };
         movies
             .get()
             .into_iter()
-            .filter(|movie| {
-                format!("{} {}", movie.title, movie.description)
-                    .to_lowercase()
-                    .contains(&needle)
-            })
+            .filter(|movie| movie.matches_library(&filter))
             .collect::<Vec<_>>()
     });
     let mounted = Arc::new(AtomicBool::new(true));
@@ -411,6 +419,7 @@ fn LibraryPage(current: Session, session: RwSignal<Option<Session>>) -> impl Int
 
     spawn_local(async move {
         while mounted.load(Ordering::Relaxed) {
+            let revision = library_revision.get_untracked();
             let library = get::<Library>("/api/v1/movies").await;
             let system = get::<SystemStatus>("/api/v1/status").await;
             let history = if is_admin {
@@ -422,10 +431,11 @@ fn LibraryPage(current: Session, session: RwSignal<Option<Session>>) -> impl Int
                 break;
             }
             match library {
-                Ok(library) => {
+                Ok(library) if revision == library_revision.get_untracked() => {
                     movies.set(library.movies);
                     error.set(None);
                 }
+                Ok(_) => {}
                 Err(message) => error.set(Some(message)),
             }
             loading.set(false);
@@ -509,21 +519,45 @@ fn LibraryPage(current: Session, session: RwSignal<Option<Session>>) -> impl Int
         {move || playback_notice.get().map(|message| view! { <p role="alert" class="error">{message}</p> })}
         <div class="toolbar">
             <h2>"Your library"</h2>
-            <input aria-label="Search your library" placeholder="Search titles and descriptions"
+            <input aria-label="Search your library" placeholder="Search titles, descriptions and labels"
                 type="search" bind:value=query/>
         </div>
+        <div class="toolbar">
+            <label>"Category "
+                <select aria-label="Filter by category" bind:value=category>
+                    <option value="">"All categories"</option>
+                    <For each=move || library_label_names(movies.get(), true, category.get())
+                        key=|name| name.clone()
+                        children=|name| view! { <option value=name.clone()>{name.clone()}</option> }/>
+                </select>
+            </label>
+            <label>"Tag "
+                <select aria-label="Filter by tag" bind:value=tag>
+                    <option value="">"All tags"</option>
+                    <For each=move || library_label_names(movies.get(), false, tag.get())
+                        key=|name| name.clone()
+                        children=|name| view! { <option value=name.clone()>{name.clone()}</option> }/>
+                </select>
+            </label>
+            <span class="subtle">"Search and selected filters must all match."</span>
+        </div>
+        <For each=move || editing_labels.get().into_iter()
+            key=|movie| movie.id.clone()
+            children=move |movie| view! {
+                <MovieLabelsEditor movie=movie csrf=csrf movies=movies editing=editing_labels/>
+            }/>
         <Show when=move || loading.get()>
             <p role="status" class="subtle">"Loading your library..."</p>
         </Show>
         <Show when=move || !loading.get()>
             <Show when=move || filtered.get().is_empty()>
                     <section class="empty">
-                        <h2>{move || if query.get().is_empty() { "A home for your DVD collection" } else { "No matching movies" }}</h2>
+                        <h2>{move || if movies.get().is_empty() { "A home for your DVD collection" } else { "No matching movies" }}</h2>
                         <p class="subtle">
-                            {move || if query.get().is_empty() {
+                            {move || if movies.get().is_empty() {
                                 "No movies yet. An administrator must review and publish a validated conversion before it appears here."
                             } else {
-                                "Try a different title or description."
+                                "Try another search or clear the filters."
                             }}
                         </p>
                     </section>
@@ -534,11 +568,29 @@ fn LibraryPage(current: Session, session: RwSignal<Option<Session>>) -> impl Int
                             children=move |movie| {
                             let watch_label = format!("Watch {}", movie.title);
                             let chosen = movie.clone();
+                            let label_id = movie.id.clone();
+                            let edit_id = movie.id.clone();
                             view! {
                             <article class="movie">
                                 <h2>{movie.title}</h2>
                                 <small>{movie.year.map(|year| year.to_string())}</small>
                                 <p>{movie.description}</p>
+                                {move || movies.get().into_iter().find(|movie| movie.id == label_id).map(|movie|
+                                    view! {
+                                        {(!movie.categories.is_empty()).then(|| view! {
+                                            <p class="subtle">"Categories: " {movie.categories.join(", ")}</p>
+                                        })}
+                                        {(!movie.tags.is_empty()).then(|| view! {
+                                            <p class="subtle">"Tags: " {movie.tags.join(", ")}</p>
+                                        })}
+                                    }
+                                )}
+                                {is_admin.then(|| view! {
+                                    <button class="secondary" disabled=move || editing_labels.get().is_some()
+                                        on:click=move |_| editing_labels.set(
+                                            movies.get_untracked().into_iter().find(|movie| movie.id == edit_id)
+                                        )>"Edit labels"</button>
+                                })}
                                 <button on:click=move |_| {
                                     watch_movie.run(chosen.clone());
                                 }
@@ -590,6 +642,270 @@ fn LibraryPage(current: Session, session: RwSignal<Option<Session>>) -> impl Int
     }
 }
 
+fn library_label_names(movies: Vec<Movie>, categories: bool, selected: String) -> Vec<String> {
+    let mut names = movies
+        .into_iter()
+        .flat_map(|movie| {
+            if categories {
+                movie.categories
+            } else {
+                movie.tags
+            }
+        })
+        .collect::<Vec<_>>();
+    if !selected.is_empty() {
+        names.push(selected);
+    }
+    names = names
+        .into_iter()
+        .map(|name| wetube_core::normalize_label_name(&name))
+        .collect();
+    names.sort_by_key(|name| wetube_core::label_key(name));
+    names.dedup_by(|left, right| wetube_core::label_key(left) == wetube_core::label_key(right));
+    names
+}
+
+fn append_label(text: RwSignal<String>, name: &str) {
+    if name.is_empty() {
+        return;
+    }
+    text.update(|text| {
+        if !text
+            .lines()
+            .any(|line| wetube_core::label_key(line) == wetube_core::label_key(name))
+        {
+            if !text.is_empty() && !text.ends_with('\n') {
+                text.push('\n');
+            }
+            text.push_str(name);
+        }
+    });
+}
+
+#[component]
+fn LabelField(
+    title: &'static str,
+    text: RwSignal<String>,
+    names: Signal<Vec<String>>,
+    disabled: Signal<bool>,
+) -> impl IntoView {
+    view! {
+        <label>{title}
+            <textarea aria-label=title rows="3" bind:value=text disabled=move || disabled.get()/>
+        </label>
+        <select aria-label=format!("Reuse {title}") disabled=move || disabled.get()
+            on:change=move |event| {
+                append_label(text, &event_target_value(&event));
+                event_target::<web_sys::HtmlSelectElement>(&event).set_value("");
+            }>
+            <option value="">"Choose an existing label…"</option>
+            {move || names.get().into_iter().map(|name|
+                view! { <option value=name.clone()>{name.clone()}</option> }).collect_view()}
+        </select>
+    }
+}
+
+#[component]
+fn MovieLabelsEditor(
+    movie: Movie,
+    csrf: StoredValue<String>,
+    movies: RwSignal<Vec<Movie>>,
+    editing: RwSignal<Option<Movie>>,
+) -> impl IntoView {
+    let scope = admin_scope();
+    let library_revision = expect_context::<LibraryRevision>().0;
+    let id = StoredValue::new(movie.id);
+    let labels_url = StoredValue::new(format!(
+        "/api/v1/movies/{}/labels",
+        js_sys::encode_uri_component(&id.get_value())
+    ));
+    let expected = RwSignal::new(None::<wetube_core::MovieLabels>);
+    let latest = RwSignal::new(None::<wetube_core::MovieLabels>);
+    let categories = RwSignal::new(String::new());
+    let tags = RwSignal::new(String::new());
+    let catalog = RwSignal::new(wetube_core::MovieLabels::default());
+    let busy = RwSignal::new(false);
+    let message = RwSignal::new(None::<String>);
+    let suggestions = RwSignal::new(Vec::<String>::new());
+    let approved = RwSignal::new(Vec::<String>::new());
+    let fields_disabled = Signal::derive(move || busy.get() || expected.get().is_none());
+    let load_latest = Callback::new(move |()| {
+        if busy.get_untracked() {
+            return;
+        }
+        busy.set(true);
+        message.set(None);
+        let initialize = expected.get_untracked().is_none();
+        spawn_local(async move {
+            let result =
+                admin_get::<wetube_core::MovieLabels>(scope, &labels_url.get_value()).await;
+            if busy.try_set(false).is_some() {
+                return;
+            }
+            match result {
+                Ok(labels) => {
+                    if initialize {
+                        categories.set(labels.categories.join("\n"));
+                        tags.set(labels.tags.join("\n"));
+                    } else {
+                        latest.set(Some(labels.clone()));
+                    }
+                    expected.set(Some(labels));
+                }
+                Err(error) => message.set(Some(error)),
+            }
+        });
+    });
+    load_latest.run(());
+    spawn_local(async move {
+        if let Ok(labels) = admin_get::<wetube_core::MovieLabels>(scope, "/api/v1/labels").await {
+            let _ = catalog.try_set(labels);
+        }
+    });
+    let suggest = move |_| {
+        if busy.get_untracked() {
+            return;
+        }
+        busy.set(true);
+        message.set(None);
+        spawn_local(async move {
+            let result = admin_post::<wetube_core::GenreSuggestions>(
+                scope,
+                &format!(
+                    "/api/v1/admin/movies/{}/genre-suggestions",
+                    js_sys::encode_uri_component(&id.get_value())
+                ),
+                &csrf.get_value(),
+                &(),
+            )
+            .await;
+            if busy.try_set(false).is_some() {
+                return;
+            }
+            match result {
+                Ok(result) => {
+                    approved.set(Vec::new());
+                    if result.categories.is_empty() {
+                        message.set(Some("No genre suggestions found.".into()));
+                    }
+                    suggestions.set(result.categories);
+                }
+                Err(error) => message.set(Some(error)),
+            }
+        });
+    };
+    let save = move |_| {
+        if busy.get_untracked() {
+            return;
+        }
+        let Some(expected_labels) = expected.get_untracked() else {
+            return;
+        };
+        busy.set(true);
+        message.set(None);
+        let mut category_names = categories
+            .get_untracked()
+            .lines()
+            .filter(|name| !name.trim().is_empty())
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        category_names.extend(approved.get_untracked());
+        let request = wetube_core::UpdateMovieLabels {
+            expected: expected_labels,
+            labels: wetube_core::MovieLabels {
+                categories: category_names,
+                tags: tags
+                    .get_untracked()
+                    .lines()
+                    .filter(|name| !name.trim().is_empty())
+                    .map(str::to_owned)
+                    .collect(),
+            },
+        };
+        spawn_local(async move {
+            let current_url = labels_url.get_value();
+            let result = admin_post::<wetube_core::MovieLabels>(
+                scope,
+                &format!(
+                    "/api/v1/admin/movies/{}/labels",
+                    js_sys::encode_uri_component(&id.get_value())
+                ),
+                &csrf.get_value(),
+                &request,
+            )
+            .await;
+            match result {
+                Ok(labels) => {
+                    if busy.try_set(false).is_some() {
+                        return;
+                    }
+                    library_revision.update(|revision| *revision += 1);
+                    movies.update(|movies| {
+                        if let Some(movie) =
+                            movies.iter_mut().find(|movie| movie.id == id.get_value())
+                        {
+                            movie.categories = labels.categories;
+                            movie.tags = labels.tags;
+                        }
+                    });
+                    editing.set(None);
+                }
+                Err(error) => {
+                    let current = admin_get::<wetube_core::MovieLabels>(scope, &current_url).await;
+                    if busy.try_set(false).is_some() {
+                        return;
+                    }
+                    if let Ok(labels) = current {
+                        expected.set(Some(labels.clone()));
+                        latest.set(Some(labels));
+                    }
+                    message.set(Some(error));
+                }
+            }
+        });
+    };
+    view! {
+        <section class="panel" aria-label="Edit movie labels">
+            <h2>{format!("Labels for {}", movie.title)}</h2>
+            <p class="subtle">"One label per line; up to 32 categories and 32 tags, 80 bytes each."</p>
+            <LabelField title="Categories" text=categories names=Signal::derive(move || catalog.get().categories) disabled=fields_disabled/>
+            <LabelField title="Tags" text=tags names=Signal::derive(move || catalog.get().tags) disabled=fields_disabled/>
+            {move || latest.get().map(|labels| view! {
+                <section aria-label="Latest saved labels">
+                    <h3>"Latest saved labels"</h3>
+                    <p>"Categories: " {if labels.categories.is_empty() { "None".into() } else { labels.categories.join(", ") }}</p>
+                    <p>"Tags: " {if labels.tags.is_empty() { "None".into() } else { labels.tags.join(", ") }}</p>
+                </section>
+            })}
+            {movie.tmdb_id.is_some().then(|| view! {
+                <button class="secondary" disabled=move || fields_disabled.get() on:click=suggest>"Suggest TMDB genres"</button>
+                <p class="subtle">"Choose suggestions to add as categories, then save. Existing labels are kept."</p>
+            })}
+            <For each=move || suggestions.get() key=|name| name.clone() children=move |name| {
+                let choice = name.clone();
+                let checked_name = name.clone();
+                view! {
+                    <label class="confirmation">
+                        <input type="checkbox" disabled=move || busy.get()
+                            prop:checked=move || approved.get().contains(&checked_name)
+                            on:change=move |event| approved.update(|approved| {
+                                approved.retain(|name| name != &choice);
+                                if event_target_checked(&event) { approved.push(choice.clone()); }
+                            })/>
+                        {name}
+                    </label>
+                }
+            }/>
+            <div class="toolbar">
+                <button disabled=move || fields_disabled.get() on:click=save>"Save labels"</button>
+                <button class="secondary" disabled=move || busy.get() on:click=move |_| load_latest.run(())>"Reload latest labels"</button>
+                <button class="secondary" disabled=move || busy.get() on:click=move |_| editing.set(None)>"Cancel"</button>
+            </div>
+            {move || message.get().map(|message| view! { <p role="alert">{message}</p> })}
+        </section>
+    }
+}
+
 #[component]
 fn MetadataRefresh(
     movie_id: String,
@@ -598,6 +914,7 @@ fn MetadataRefresh(
     movies: RwSignal<Vec<Movie>>,
 ) -> impl IntoView {
     let scope = admin_scope();
+    let library_revision = expect_context::<LibraryRevision>().0;
     let busy = RwSignal::new(false);
     let message = RwSignal::new(None::<String>);
     let url = StoredValue::new(format!(
@@ -617,14 +934,18 @@ fn MetadataRefresh(
                 return;
             }
             match result {
-                Ok(_) => match admin_get::<Library>(scope, "/api/v1/movies").await {
-                    Ok(library) => {
-                        let _ = movies.try_set(library.movies);
+                Ok(_) => {
+                    let revision = library_revision.get_untracked();
+                    match admin_get::<Library>(scope, "/api/v1/movies").await {
+                        Ok(library) if library_revision.try_get_untracked() == Some(revision) => {
+                            let _ = movies.try_set(library.movies);
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            let _ = message.try_set(Some(error));
+                        }
                     }
-                    Err(error) => {
-                        let _ = message.try_set(Some(error));
-                    }
-                },
+                }
                 Err(error) => message.set(Some(error)),
             }
         });
@@ -2298,6 +2619,7 @@ fn ConversionReview(
     movies: RwSignal<Vec<Movie>>,
     watch_movie: Callback<Movie>,
 ) -> impl IntoView {
+    let library_revision = expect_context::<LibraryRevision>().0;
     let id = StoredValue::new(id);
     let job = Signal::derive(move || jobs.get().into_iter().find(|job| job.id == id.get_value()));
     let title = RwSignal::new(String::new());
@@ -2442,6 +2764,7 @@ fn ConversionReview(
         watching.set(true);
         error.set(None);
         spawn_local(async move {
+            let revision = library_revision.get_untracked();
             let result = admin_get::<Library>(scope, "/api/v1/movies").await;
             if watching.try_update(|watching| *watching = false).is_none() {
                 return;
@@ -2453,7 +2776,9 @@ fn ConversionReview(
                         .iter()
                         .find(|movie| movie.id == movie_id)
                         .cloned();
-                    movies.set(library.movies);
+                    if library_revision.get_untracked() == revision {
+                        movies.set(library.movies);
+                    }
                     if let Some(chosen) = chosen {
                         watch_movie.run(chosen);
                     } else {
@@ -2474,12 +2799,16 @@ fn ConversionReview(
         if published && !refreshed.get_untracked() {
             refreshed.set(true);
             spawn_local(async move {
+                let revision = library_revision.get_untracked();
                 let result = admin_get::<Library>(scope, "/api/v1/movies").await;
                 if scope.try_get_value().is_none() {
                     return;
                 }
                 match result {
-                    Ok(library) => movies.set(library.movies),
+                    Ok(library) if library_revision.get_untracked() == revision => {
+                        movies.set(library.movies)
+                    }
+                    Ok(_) => {}
                     Err(message) => error.set(Some(format!(
                         "Published, but the library refresh failed: {message}"
                     ))),

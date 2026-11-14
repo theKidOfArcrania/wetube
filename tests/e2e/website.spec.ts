@@ -650,6 +650,200 @@ test('TMDB stale publication rejection clears consent and matches and permits ma
   await expect.poll(() => attempts).toBe(2);
 });
 
+test('movie labels persist through polling, reuse and removal, with viewer search and exact filters', async ({ page, browser }) => {
+  await login(page, 'e2e-admin');
+  const session = await (await page.request.get(`${baseURL}/api/v1/auth/me`)).json();
+  const headers = { origin: baseURL, 'x-csrf-token': session.csrf_token };
+  const labelsUrl = `${baseURL}/api/v1/admin/movies/${movieId}/labels`;
+  const empty = { categories: [], tags: [] };
+  let library = await (await page.request.get(`${baseURL}/api/v1/movies`)).json();
+  let movie = library.movies.find((movie: { id: string }) => movie.id === movieId);
+  const reset = await page.request.post(labelsUrl, { headers, data: {
+    expected: { categories: movie.categories, tags: movie.tags }, labels: empty,
+  } });
+  expect(reset.ok()).toBeTruthy();
+  await page.reload();
+  const card = page.locator('article.movie').filter({ has: page.getByRole('heading', { name: title, exact: true }) });
+  await card.getByRole('button', { name: 'Edit labels', exact: true }).click();
+  const editor = page.getByRole('region', { name: 'Edit movie labels', exact: true });
+  await editor.getByRole('textbox', { name: 'Categories', exact: true }).fill(' Family   night \nDRAMA\ndrama');
+  await editor.getByRole('textbox', { name: 'Tags', exact: true }).fill('Special shelf\nspecial shelf');
+  await page.waitForResponse(response => response.url().endsWith('/api/v1/movies'));
+  await expect(editor.getByRole('textbox', { name: 'Categories', exact: true })).toHaveValue(' Family   night \nDRAMA\ndrama');
+  await editor.getByRole('button', { name: 'Save labels', exact: true }).click();
+  await expect(editor).toHaveCount(0);
+  await expect(card.getByText('Categories: DRAMA, Family night', { exact: true })).toBeVisible();
+  library = await (await page.request.get(`${baseURL}/api/v1/movies`)).json();
+  movie = library.movies.find((movie: { id: string }) => movie.id === movieId);
+  expect(movie.tags).toEqual(['Special shelf']);
+  await card.getByRole('button', { name: 'Edit labels', exact: true }).click();
+  await editor.getByRole('textbox', { name: 'Categories', exact: true }).fill('');
+  await editor.getByLabel('Reuse Categories', { exact: true }).selectOption('Family night');
+  await editor.getByRole('textbox', { name: 'Tags', exact: true }).fill('');
+  await editor.getByRole('button', { name: 'Save labels', exact: true }).click();
+  await expect(editor).toHaveCount(0);
+  await page.reload();
+  await expect(card.getByText('Categories: Family night', { exact: true })).toBeVisible();
+  await expect(card.getByText('Tags:', { exact: true })).toHaveCount(0);
+  const viewer = await browser.newPage();
+  try {
+    await login(viewer, 'e2e-viewer');
+    await expect(viewer.getByRole('button', { name: 'Edit labels', exact: true })).toHaveCount(0);
+    await viewer.getByLabel('Search your library', { exact: true }).fill('family night');
+    await expect(viewer.getByRole('heading', { name: title, exact: true })).toBeVisible();
+    await viewer.getByLabel('Filter by category', { exact: true }).selectOption('Family night');
+    await viewer.getByLabel('Search your library', { exact: true }).fill('does not match');
+    await expect(viewer.getByRole('heading', { name: 'No matching movies', exact: true })).toBeVisible();
+    await viewer.getByLabel('Search your library', { exact: true }).fill('');
+    await viewer.waitForResponse(response => response.url().endsWith('/api/v1/movies'));
+    await expect(viewer.getByLabel('Filter by category', { exact: true })).toHaveValue('Family night');
+    await expect(viewer.getByRole('heading', { name: title, exact: true })).toBeVisible();
+    const viewerSession = await (await viewer.request.get(`${baseURL}/api/v1/auth/me`)).json();
+    const denied = await viewer.request.post(labelsUrl, { headers: {
+      origin: baseURL, 'x-csrf-token': viewerSession.csrf_token,
+    }, data: { expected: empty, labels: empty } });
+    expect(denied.status()).toBe(403);
+  } finally {
+    await viewer.close();
+  }
+  // An out-of-date editor must not overwrite another administrator's labels.
+  const beforeOpen = await page.request.post(labelsUrl, { headers, data: {
+    expected: { categories: ['Family night'], tags: [] },
+    labels: { categories: ['Family night'], tags: ['Changed before opening'] },
+  } });
+  expect(beforeOpen.ok()).toBeTruthy();
+  await card.getByRole('button', { name: 'Edit labels', exact: true }).click();
+  await expect(editor.getByRole('textbox', { name: 'Tags', exact: true })).toHaveValue('Changed before opening');
+  await editor.getByRole('textbox', { name: 'Tags', exact: true }).fill('Unsaved draft');
+  const external = await page.request.post(labelsUrl, { headers, data: {
+    expected: { categories: ['Family night'], tags: ['Changed before opening'] },
+    labels: { categories: ['Family night'], tags: ['Changed elsewhere'] },
+  } });
+  expect(external.ok()).toBeTruthy();
+  await editor.getByRole('button', { name: 'Save labels', exact: true }).click();
+  await expect(editor.getByRole('alert')).toContainText('Labels changed elsewhere. Review the latest labels and save again.');
+  await expect(editor.getByRole('region', { name: 'Latest saved labels', exact: true })).toContainText('Changed elsewhere');
+  await expect(editor.getByRole('textbox', { name: 'Tags', exact: true })).toHaveValue('Unsaved draft');
+  await editor.getByRole('textbox', { name: 'Tags', exact: true }).fill('Changed elsewhere\nUnsaved draft');
+  await editor.getByRole('button', { name: 'Save labels', exact: true }).click();
+  await expect(editor).toHaveCount(0);
+  await expect(card.getByText('Tags: Changed elsewhere, Unsaved draft', { exact: true })).toBeVisible();
+  const cleanup = await page.request.post(labelsUrl, { headers, data: {
+    expected: { categories: ['Family night'], tags: ['Changed elsewhere', 'Unsaved draft'] }, labels: empty,
+  } });
+  expect(cleanup.ok()).toBeTruthy();
+});
+
+test('movie label saves reject delayed older library polls without clobbering reopened drafts', async ({ page }) => {
+  const movie = {
+    id: movieId, title: 'Polling movie', year: null, description: '',
+    categories: ['Original'], tags: ['Old tag'],
+  };
+  let polls = 0;
+  let heldPollStarted = false;
+  let releasePoll!: () => void;
+  const heldPoll = new Promise<void>(resolve => { releasePoll = resolve; });
+  await page.route('**/api/v1/movies', async route => {
+    const snapshot = { ...movie, categories: [...movie.categories], tags: [...movie.tags] };
+    polls++;
+    if (polls === 2) {
+      heldPollStarted = true;
+      await heldPoll;
+    }
+    await route.fulfill({ json: { movies: [snapshot] } });
+  });
+  await page.route(`**/api/v1/movies/${movieId}/labels`, route => route.fulfill({
+    json: { categories: movie.categories, tags: movie.tags },
+  }));
+  await page.route('**/api/v1/labels', route => route.fulfill({
+    json: { categories: movie.categories, tags: movie.tags },
+  }));
+  await page.route(`**/api/v1/admin/movies/${movieId}/labels`, async route => {
+    const request = route.request().postDataJSON();
+    expect(request.expected).toEqual({ categories: movie.categories, tags: movie.tags });
+    movie.categories = request.labels.categories;
+    movie.tags = request.labels.tags;
+    await route.fulfill({ json: request.labels });
+  });
+  await login(page, 'e2e-admin');
+  const card = page.locator('article.movie');
+  await card.getByRole('button', { name: 'Edit labels', exact: true }).click();
+  const editor = page.getByRole('region', { name: 'Edit movie labels', exact: true });
+  await editor.getByRole('textbox', { name: 'Tags', exact: true }).fill('Saved now');
+  await expect.poll(() => heldPollStarted).toBe(true);
+  await editor.getByRole('button', { name: 'Save labels', exact: true }).click();
+  await expect(editor).toHaveCount(0);
+  await expect(card.getByText('Tags: Saved now', { exact: true })).toBeVisible();
+  const completedPoll = page.waitForResponse(response => response.url().endsWith('/api/v1/jobs'));
+  releasePoll();
+  await completedPoll;
+  await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+  await expect(card.getByText('Tags: Saved now', { exact: true })).toBeVisible();
+  await card.getByRole('button', { name: 'Edit labels', exact: true }).click();
+  await expect(editor.getByRole('textbox', { name: 'Tags', exact: true })).toHaveValue('Saved now');
+  await editor.getByRole('textbox', { name: 'Tags', exact: true }).fill('Draft after save');
+  await page.waitForResponse(response => response.url().endsWith('/api/v1/movies'));
+  await expect(editor.getByRole('textbox', { name: 'Tags', exact: true })).toHaveValue('Draft after save');
+});
+
+test('TMDB genre suggestions require selected approval and save, and errors leave manual labels usable', async ({ page }) => {
+  const movie = {
+    id: movieId, title: 'Linked movie', year: 2001, description: 'Synopsis',
+    tmdb_id: 7, metadata_expires_at: Math.floor(Date.now() / 1000) + 60,
+    categories: ['Hand-picked'], tags: ['Keep me'],
+  };
+  let suggestions = 0;
+  const saves: Array<{ categories: string[]; tags: string[] }> = [];
+  await page.route('**/api/v1/movies', route => route.fulfill({ json: { movies: [movie] } }));
+  await page.route(`**/api/v1/movies/${movieId}/labels`, route => route.fulfill({ json: {
+    categories: movie.categories, tags: movie.tags,
+  } }));
+  await page.route('**/api/v1/labels', route => route.fulfill({ json: {
+    categories: ['Hand-picked'], tags: ['Keep me'],
+  } }));
+  await page.route(`**/api/v1/admin/movies/${movieId}/genre-suggestions`, route => {
+    expect(route.request().method()).toBe('POST');
+    expect(route.request().headers()['x-csrf-token']).toBeTruthy();
+    suggestions++;
+    return suggestions === 1
+      ? route.fulfill({ status: 503, json: { error: 'TMDB lookup is disabled; enter metadata manually.' } })
+      : route.fulfill({ json: { categories: ['Drama', 'Adventure'] } });
+  });
+  await page.route(`**/api/v1/admin/movies/${movieId}/labels`, async route => {
+    expect(route.request().method()).toBe('POST');
+    expect(route.request().headers()['x-csrf-token']).toBeTruthy();
+    const request = route.request().postDataJSON();
+    expect(request.expected).toEqual({ categories: movie.categories, tags: movie.tags });
+    saves.push(request.labels);
+    movie.categories = request.labels.categories;
+    movie.tags = request.labels.tags;
+    await route.fulfill({ json: request.labels });
+  });
+  await login(page, 'e2e-admin');
+  await page.getByRole('button', { name: 'Edit labels', exact: true }).click();
+  const editor = page.getByRole('region', { name: 'Edit movie labels', exact: true });
+  await editor.getByRole('textbox', { name: 'Categories', exact: true }).fill('Hand-picked\nManual');
+  expect(suggestions).toBe(0);
+  await editor.getByRole('button', { name: 'Suggest TMDB genres', exact: true }).click();
+  await expect(editor.getByRole('alert')).toContainText('TMDB lookup is disabled');
+  await expect(editor.getByRole('textbox', { name: 'Categories', exact: true })).toHaveValue('Hand-picked\nManual');
+  await editor.getByRole('button', { name: 'Save labels', exact: true }).click();
+  await expect(editor).toHaveCount(0);
+  expect(saves).toEqual([{ categories: ['Hand-picked', 'Manual'], tags: ['Keep me'] }]);
+  await page.getByRole('button', { name: 'Edit labels', exact: true }).click();
+  await editor.getByRole('button', { name: 'Suggest TMDB genres', exact: true }).click();
+  await expect(editor.getByRole('checkbox', { name: 'Drama', exact: true })).not.toBeChecked();
+  await expect(editor.getByRole('checkbox', { name: 'Adventure', exact: true })).not.toBeChecked();
+  await editor.getByRole('checkbox', { name: 'Drama', exact: true }).check();
+  await page.waitForResponse(response => response.url().endsWith('/api/v1/movies'));
+  await expect(editor.getByRole('checkbox', { name: 'Drama', exact: true })).toBeChecked();
+  expect(saves).toHaveLength(1);
+  await expect(editor.getByRole('textbox', { name: 'Categories', exact: true })).toHaveValue('Hand-picked\nManual');
+  await editor.getByRole('button', { name: 'Save labels', exact: true }).click();
+  await expect(editor).toHaveCount(0);
+  expect(saves[1]).toEqual({ categories: ['Hand-picked', 'Manual', 'Drama'], tags: ['Keep me'] });
+});
+
 test('TMDB refresh is explicit and survives library polling without blocking local playback', async ({ page }) => {
   const movie = {
     id: movieId, title: 'source.iso', year: null as number | null, description: '',

@@ -28,6 +28,46 @@ GETs never invoke TMDB. About / Credits bundles the approved logo and current
 reviewed attribution notice locally. Operators own retention of offline databases,
 snapshots/backups and current terms compliance; implementation is not legal approval.
 
+### Movie categories and tags (implemented locally)
+
+Schema 10 adds a shared catalog keyed by label kind and an NFC-normalized,
+whitespace-collapsed, Unicode-lowercase canonical name, plus many-to-many movie assignments with foreign
+key cascades. Both categories and tags allow multiple labels per movie; categories
+are flat and tags are free-form. Display names are also normalized to NFC.
+Each kind is bounded to 32 unique labels per movie after deduplication, with a
+separate cap of 128 submitted entries; labels are 1–80 UTF-8 bytes each,
+with control characters rejected. Unassigned catalog names
+remain reusable; no catalog rename/delete API is introduced.
+
+Authenticated `GET /api/v1/labels` supplies reusable catalog names.
+Authenticated `GET /api/v1/movies/{id}/labels` supplies current ready-movie assignments.
+`POST /api/v1/admin/movies/{id}/labels` requires administrator authentication,
+exact Origin and CSRF, and accepts `{labels:{categories,tags}, expected:{categories,tags}}`.
+Full-set replacement for ready movies is atomic, with optimistic comparison of
+the expected assignments to reject stale saves. The editor fetches current
+assignments on opening and after a rejected save; the latter refreshes its expected
+snapshot and displays the saved labels without replacing the draft. The user must
+reconcile and save again. A library revision increment on successful label saves
+discards older in-flight library reads, including polling and publication/metadata
+refresh reads. Polling does not replace the open editor's draft.
+Movie responses default missing label arrays to empty for compatibility.
+Library/detail reads attach labels separately, retaining unlabeled movies and
+avoiding duplicate result rows. `GET /api/v1/movies` supports optional `q`,
+`category` and `tag`; search is case-insensitive across title/description/labels,
+while filters compare whole canonical label names. All supplied predicates use AND, as do
+the equivalent client-side selectors.
+
+`POST /api/v1/admin/movies/{id}/genre-suggestions` shares the protected TMDB client
+and its bounds. Only linked ready movies are eligible; the request sends the
+stored TMDB ID and fixed language option, never filenames or inferred searches.
+It returns bounded normalized genre names as category suggestions, without
+writing metadata or assignments. The browser keeps suggestions only in the open
+editor; fetching alone never approves them. Checked suggestions join the user's
+draft only on an explicit save. Accepted human labels are user-managed, not
+provider-cache records, and metadata expiry/refresh never changes them.
+Disabled or failed provider lookup leaves manual labeling usable. No GET or
+playback request contacts the provider.
+
 ### Current local website test milestone
 
 The local preview supports login, library search, authenticated progressive

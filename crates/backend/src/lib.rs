@@ -4,6 +4,7 @@ pub mod conversions;
 pub mod db;
 pub mod import_history;
 pub mod incoming;
+pub mod labels;
 pub mod lock;
 pub mod metadata;
 pub mod preview;

@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
+use unicode_normalization::UnicodeNormalization;
 
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
-pub const SCHEMA_VERSION: i64 = 9;
+pub const SCHEMA_VERSION: i64 = 10;
 pub const TMDB_SELECTION_EXPIRED: &str = "TMDB selection expired; search again before publication";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -214,6 +215,78 @@ pub struct Movie {
     pub tmdb_id: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata_expires_at: Option<i64>,
+    #[serde(default)]
+    pub categories: Vec<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MovieLabels {
+    pub categories: Vec<String>,
+    pub tags: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateMovieLabels {
+    pub labels: MovieLabels,
+    pub expected: MovieLabels,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct GenreSuggestions {
+    pub categories: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct LibraryFilter {
+    #[serde(default)]
+    pub q: String,
+    #[serde(default)]
+    pub category: String,
+    #[serde(default)]
+    pub tag: String,
+}
+
+pub fn normalize_label_name(name: &str) -> String {
+    name.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .nfc()
+        .collect()
+}
+
+pub fn label_key(name: &str) -> String {
+    normalize_label_name(name).to_lowercase().nfc().collect()
+}
+
+impl Movie {
+    pub fn matches_library(&self, filter: &LibraryFilter) -> bool {
+        let needle = filter.q.trim().nfc().collect::<String>().to_lowercase();
+        let text = format!(
+            "{} {} {} {}",
+            self.title,
+            self.description,
+            self.categories.join(" "),
+            self.tags.join(" ")
+        )
+        .nfc()
+        .collect::<String>()
+        .to_lowercase();
+        text.contains(&needle)
+            && (filter.category.is_empty()
+                || self
+                    .categories
+                    .iter()
+                    .any(|label| label_key(label) == label_key(&filter.category)))
+            && (filter.tag.is_empty()
+                || self
+                    .tags
+                    .iter()
+                    .any(|label| label_key(label) == label_key(&filter.tag)))
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

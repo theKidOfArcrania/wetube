@@ -16,6 +16,291 @@ const ORIGIN: &str = "http://wetube.test";
 const PASSWORD: &str = "a household test password";
 
 #[tokio::test]
+async fn movie_labels_normalize_unicode_updates_catalog_reuse_and_assignment_filters() {
+    use serde_json::json;
+    let fixture = Fixture::new().await;
+    let (admin, session) = fixture.login("admin").await;
+    let (viewer, _) = fixture.login("viewer").await;
+    sqlx::query(
+        "INSERT INTO movies VALUES('one','First',NULL,'','ready'),('two','Second',NULL,'','ready')",
+    )
+    .execute(&fixture.pool)
+    .await
+    .unwrap();
+    for (id, categories, tags) in [
+        (
+            "one",
+            vec!["Café", "Cafe\u{301}"],
+            vec!["Déjà", "De\u{301}ja\u{300}"],
+        ),
+        ("two", vec!["CAFE\u{301}"], vec!["DE\u{301}JA\u{300}"]),
+    ] {
+        let payload = json!({"expected":{"categories":[],"tags":[]}, "labels":{ "categories": categories, "tags": tags }});
+        assert_eq!(
+            fixture
+                .send(
+                    "POST",
+                    &format!("/api/v1/admin/movies/{id}/labels"),
+                    &payload.to_string(),
+                    Some(&admin),
+                    Some(&session.csrf_token)
+                )
+                .await
+                .status(),
+            StatusCode::OK
+        );
+    }
+    let labels = wetube_core::MovieLabels {
+        categories: vec!["Café".into()],
+        tags: vec!["Déjà".into()],
+    };
+    assert_eq!(
+        wetube_backend::labels::catalog(&fixture.pool)
+            .await
+            .unwrap(),
+        labels
+    );
+    let response = fixture
+        .send("GET", "/api/v1/movies/two/labels", "", Some(&viewer), None)
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        serde_json::from_slice::<wetube_core::MovieLabels>(
+            &to_bytes(response.into_body(), 4096).await.unwrap()
+        )
+        .unwrap(),
+        labels
+    );
+    let payload = json!({"expected":{"categories":["Cafe\u{301}"],"tags":["De\u{301}ja\u{300}"]},
+        "labels":{"categories":["Cafe\u{301}"],"tags":["De\u{301}ja\u{300}"]}});
+    assert_eq!(
+        fixture
+            .send(
+                "POST",
+                "/api/v1/admin/movies/one/labels",
+                &payload.to_string(),
+                Some(&admin),
+                Some(&session.csrf_token)
+            )
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    for (key, value, count) in [
+        ("q", "Cafe\u{301}", 2),
+        ("category", "Cafe\u{301}", 2),
+        ("category", "CAFÉ", 2),
+        ("tag", "De\u{301}ja\u{300}", 2),
+        ("category", "Cafe", 0),
+    ] {
+        let query = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair(key, value)
+            .finish();
+        let response = fixture
+            .send(
+                "GET",
+                &format!("/api/v1/movies?{query}"),
+                "",
+                Some(&viewer),
+                None,
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let library: wetube_core::Library =
+            serde_json::from_slice(&to_bytes(response.into_body(), 8192).await.unwrap()).unwrap();
+        assert_eq!(library.movies.len(), count, "{key}={value}");
+    }
+}
+
+#[tokio::test]
+async fn movie_labels_require_admin_csrf_and_filter_real_assignments_without_losing_unlabeled_movies()
+ {
+    use serde_json::json;
+    let fixture = Fixture::new().await;
+    let (admin, session) = fixture.login("admin").await;
+    let (viewer, viewer_session) = fixture.login("viewer").await;
+    sqlx::query("INSERT INTO movies VALUES('one','Local',2000,'Original','ready'),('two','Drama title',NULL,'Favorite text','ready'),('three','Unlabeled',NULL,'','ready')")
+        .execute(&fixture.pool).await.unwrap();
+    sqlx::query("INSERT INTO tmdb_metadata VALUES('one',7,NULL,NULL,NULL,1,1)")
+        .execute(&fixture.pool)
+        .await
+        .unwrap();
+    let path = "/api/v1/admin/movies/one/labels";
+    let payload = json!({"expected":{"categories":[],"tags":[]},
+        "labels":{"categories":["Drama","Family"],"tags":["Favorite"]}})
+    .to_string();
+    for (cookie, csrf, expected) in [
+        (None, None, StatusCode::UNAUTHORIZED),
+        (
+            Some(viewer.as_str()),
+            Some(viewer_session.csrf_token.as_str()),
+            StatusCode::FORBIDDEN,
+        ),
+        (Some(admin.as_str()), None, StatusCode::FORBIDDEN),
+        (
+            Some(admin.as_str()),
+            Some(session.csrf_token.as_str()),
+            StatusCode::OK,
+        ),
+    ] {
+        assert_eq!(
+            fixture
+                .send("POST", path, &payload, cookie, csrf)
+                .await
+                .status(),
+            expected
+        );
+    }
+    for protected in [path, "/api/v1/admin/movies/one/genre-suggestions"] {
+        let response = fixture
+            .app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(protected)
+                    .header(header::HOST, "wetube.test")
+                    .header(header::ORIGIN, "http://evil.test")
+                    .header(header::COOKIE, &admin)
+                    .header("x-csrf-token", &session.csrf_token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(payload.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+    assert_eq!(
+        fixture
+            .send(
+                "POST",
+                path,
+                &payload,
+                Some(&admin),
+                Some(&session.csrf_token)
+            )
+            .await
+            .status(),
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        fixture
+            .send(
+                "POST",
+                "/api/v1/admin/movies/absent/labels",
+                &payload,
+                Some(&admin),
+                Some(&session.csrf_token)
+            )
+            .await
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    for (query, expected) in [
+        ("", vec!["one", "two", "three"]),
+        ("?q=favorite", vec!["one", "two"]),
+        ("?q=family", vec!["one"]),
+        ("?category=Drama", vec!["one"]),
+        ("?category=Dram", vec![]),
+        ("?tag=Favorite", vec!["one"]),
+        ("?category=Family&tag=Favorite&q=local", vec!["one"]),
+        ("?category=Family&tag=Missing", vec![]),
+        ("?q=unlabeled", vec!["three"]),
+    ] {
+        let response = fixture
+            .send(
+                "GET",
+                &format!("/api/v1/movies{query}"),
+                "",
+                Some(&viewer),
+                None,
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let library: wetube_core::Library =
+            serde_json::from_slice(&to_bytes(response.into_body(), 8192).await.unwrap()).unwrap();
+        let ids = library
+            .movies
+            .iter()
+            .map(|movie| movie.id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(ids, expected.into_iter().collect(), "{query}");
+        if let Some(movie) = library.movies.iter().find(|movie| movie.id == "one") {
+            assert_eq!(movie.title, "Local");
+            assert_eq!(movie.tmdb_id, Some(7));
+            assert_eq!(movie.tags, ["Favorite"]);
+        }
+    }
+    let response = fixture
+        .send("GET", "/api/v1/labels", "", Some(&viewer), None)
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        fixture
+            .send("GET", "/api/v1/labels", "", None, None)
+            .await
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        fixture
+            .send("GET", "/api/v1/movies/one/labels", "", None, None)
+            .await
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        fixture
+            .send(
+                "GET",
+                "/api/v1/movies/absent/labels",
+                "",
+                Some(&viewer),
+                None
+            )
+            .await
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    for (cookie, csrf, expected) in [
+        (None, None, StatusCode::UNAUTHORIZED),
+        (
+            Some(viewer.as_str()),
+            Some(viewer_session.csrf_token.as_str()),
+            StatusCode::FORBIDDEN,
+        ),
+        (Some(admin.as_str()), None, StatusCode::FORBIDDEN),
+        (
+            Some(admin.as_str()),
+            Some(session.csrf_token.as_str()),
+            StatusCode::SERVICE_UNAVAILABLE,
+        ),
+    ] {
+        assert_eq!(
+            fixture
+                .send(
+                    "POST",
+                    "/api/v1/admin/movies/one/genre-suggestions",
+                    "null",
+                    cookie,
+                    csrf
+                )
+                .await
+                .status(),
+            expected
+        );
+    }
+    assert_eq!(
+        wetube_backend::labels::for_movie(&fixture.pool, "one")
+            .await
+            .unwrap()
+            .categories,
+        ["Drama", "Family"]
+    );
+}
+
+#[tokio::test]
 async fn metadata_routes_require_admin_origin_csrf_and_allow_disabled_manual_fallback() {
     let fixture = Fixture::new().await;
     let (admin, session) = fixture.login("admin").await;

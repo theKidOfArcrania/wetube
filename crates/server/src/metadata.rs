@@ -255,6 +255,40 @@ pub(crate) async fn refresh(
     Ok(Json(metadata))
 }
 
+pub(crate) async fn genres(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    extension: Option<Extension<Tmdb>>,
+    headers: HeaderMap,
+) -> Result<Json<wetube_core::GenreSuggestions>, HttpError> {
+    let current = admin(&state, &headers).await?;
+    check_csrf(&current, &headers)?;
+    let tmdb_id: i64 = sqlx::query_scalar(
+        "SELECT t.tmdb_id FROM tmdb_metadata t JOIN movies m ON m.id=t.movie_id WHERE m.id=? AND m.status='ready'"
+    ).bind(id).fetch_optional(&state.pool).await.map_err(internal)?
+        .ok_or_else(|| HttpError(StatusCode::NOT_FOUND, "Select TMDB metadata for this movie first.".into()))?;
+    let value = provider(extension)?
+        .fetch(
+            &format!("/movie/{tmdb_id}"),
+            &[("language", "en-US".into())],
+        )
+        .await?;
+    if value["id"].as_i64() != Some(tmdb_id) {
+        return Err(unavailable());
+    }
+    let genres = value["genres"]
+        .as_array()
+        .filter(|genres| genres.len() <= 32)
+        .ok_or_else(unavailable)?;
+    let names = genres
+        .iter()
+        .map(|genre| genre["name"].as_str().map(str::to_owned))
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(unavailable)?;
+    let categories = wetube_backend::labels::normalize(&names).map_err(|_| unavailable())?;
+    Ok(Json(wetube_core::GenreSuggestions { categories }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -303,6 +337,12 @@ mod tests {
             uri.to_string(),
             headers[header::AUTHORIZATION].to_str().unwrap().into(),
         ));
+        if uri.path() == "/movie/8" {
+            return Json(json!({"id":8,"genres":[{"name":"bad\nlabel"}]})).into_response();
+        }
+        if uri.path() == "/movie/9" {
+            return (StatusCode::UNAUTHORIZED, "private provider detail").into_response();
+        }
         match query.get("query").map(String::as_str) {
             Some("failure") => {
                 (StatusCode::UNAUTHORIZED, "private provider detail").into_response()
@@ -319,7 +359,8 @@ mod tests {
             Some("empty") => Json(json!({"results":[]})).into_response(),
             Some("many") => Json(json!({"results": (1..=25).map(|id| json!({"id":id,"title":"Bounded result"})).collect::<Vec<_>>()})).into_response(),
             _ => {
-                let movie = json!({"id":7,"title":"Translated title","release_date":"2001-02-03","overview":"A synopsis"});
+                let movie = json!({"id":7,"title":"Translated title","release_date":"2001-02-03","overview":"A synopsis",
+                    "genres":[{"id":18,"name":"Drama"},{"id":1,"name":" Family "},{"id":2,"name":"family"}]});
                 if uri.path().starts_with("/movie/") {
                     Json(movie).into_response()
                 } else {
@@ -457,6 +498,62 @@ mod tests {
         sqlx::query("INSERT INTO tmdb_metadata VALUES('movie',7,NULL,NULL,NULL,1,1)")
             .execute(&pool)
             .await?;
+        let before = calls.lock().unwrap().len();
+        let (status, _) = send(&app, "GET", "/api/v1/movies", Value::Null).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(calls.lock().unwrap().len(), before);
+        let (status, body) = send(
+            &app,
+            "POST",
+            "/api/v1/admin/movies/movie/genre-suggestions",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, json!({"categories":["Drama","Family"]}));
+        assert_eq!(
+            wetube_backend::labels::for_movie(&pool, "movie").await?,
+            wetube_core::MovieLabels::default()
+        );
+        assert!(
+            sqlx::query_scalar::<_, Option<String>>("SELECT title FROM tmdb_metadata")
+                .fetch_one(&pool)
+                .await?
+                .is_none()
+        );
+        for id in [8, 9] {
+            sqlx::query("UPDATE tmdb_metadata SET tmdb_id=?")
+                .bind(id)
+                .execute(&pool)
+                .await?;
+            let (status, body) = send(
+                &app,
+                "POST",
+                "/api/v1/admin/movies/movie/genre-suggestions",
+                Value::Null,
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_GATEWAY);
+            assert_eq!(
+                body,
+                json!({"error":"TMDB is unavailable. Try again later or enter metadata manually."})
+            );
+            assert_eq!(
+                wetube_backend::labels::for_movie(&pool, "movie").await?,
+                wetube_core::MovieLabels::default()
+            );
+        }
+        sqlx::query("UPDATE tmdb_metadata SET tmdb_id=7")
+            .execute(&pool)
+            .await?;
+        let (status, _) = send(
+            &app,
+            "POST",
+            "/api/v1/admin/movies/absent/genre-suggestions",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
         let (status, _) = send(
             &app,
             "POST",

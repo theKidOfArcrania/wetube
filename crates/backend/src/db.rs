@@ -46,7 +46,7 @@ pub async fn initialize(state_dir: &Path) -> Result<()> {
             // This additive migration does not modify registered media. Snapshot
             // SQLite first; operators must retain the separate media/attempt roots.
             anyhow::ensure!(
-                matches!(version.0, 1..=8),
+                matches!(version.0, 1..=9),
                 "unsupported upgrade; requires a complete asset-aware backup"
             );
             let backup = state_dir.join(format!("pre-upgrade-{}", uuid::Uuid::new_v4()));
@@ -93,6 +93,54 @@ pub async fn check_version(pool: &SqlitePool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn labels_upgrade_from_nine_preserves_provider_overlay_and_snapshots_once() -> Result<()>
+    {
+        let directory = tempfile::tempdir()?;
+        let pool = open(directory.path(), true).await?;
+        let mut migrations = sqlx::migrate!("./migrations");
+        migrations.migrations = std::borrow::Cow::Owned(
+            migrations
+                .iter()
+                .filter(|migration| migration.version <= 9)
+                .cloned()
+                .collect(),
+        );
+        migrations.run(&pool).await?;
+        sqlx::query("INSERT INTO movies VALUES('movie','Local',2000,'Original','ready')")
+            .execute(&pool)
+            .await?;
+        sqlx::query("INSERT INTO tmdb_metadata VALUES('movie',7,'Provider',2001,'Synopsis',1,2)")
+            .execute(&pool)
+            .await?;
+        pool.close().await;
+        initialize(directory.path()).await?;
+        initialize(directory.path()).await?;
+        let pool = connect(directory.path()).await?;
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT title FROM tmdb_metadata")
+                .fetch_one(&pool)
+                .await?,
+            "Provider"
+        );
+        assert_eq!(
+            crate::labels::for_movie(&pool, "movie").await?,
+            wetube_core::MovieLabels::default()
+        );
+        let snapshots = std::fs::read_dir(directory.path())?
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("pre-upgrade-")
+            })
+            .count();
+        assert_eq!(snapshots, 1);
+        pool.close().await;
+        Ok(())
+    }
 
     #[tokio::test]
     async fn metadata_upgrade_from_eight_preserves_local_movies_and_snapshots_once() -> Result<()> {

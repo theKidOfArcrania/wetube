@@ -32,6 +32,7 @@ use wetube_core::{
 };
 
 pub mod admission;
+mod labels;
 pub mod metadata;
 
 const COOKIE_NAME: &str = "wetube_session";
@@ -167,6 +168,13 @@ pub async fn router_with_conversions(
         .route("/auth/logout", post(logout))
         .route("/auth/me", get(me))
         .route("/movies", get(movies))
+        .route("/labels", get(labels::catalog))
+        .route("/movies/{id}/labels", get(labels::get))
+        .route("/admin/movies/{id}/labels", post(labels::update))
+        .route(
+            "/admin/movies/{id}/genre-suggestions",
+            post(metadata::genres),
+        )
         .route("/movies/{id}", get(movie_details))
         .route("/movies/{id}/video", get(video).head(video))
         .route(
@@ -443,6 +451,7 @@ async fn me(State(state): State<AppState>, headers: HeaderMap) -> Result<Json<Se
 
 async fn movies(
     State(state): State<AppState>,
+    Query(filter): Query<wetube_core::LibraryFilter>,
     headers: HeaderMap,
 ) -> Result<Json<Library>, HttpError> {
     session(&state, &headers).await?;
@@ -460,17 +469,27 @@ async fn movies(
     .fetch_all(&state.pool)
     .await
     .map_err(internal)?;
+    let mut assignments = wetube_backend::labels::assignments(&state.pool)
+        .await
+        .map_err(internal)?;
     Ok(Json(Library {
         movies: rows
             .into_iter()
-            .map(|row| Movie {
-                id: row.get("id"),
-                title: row.get("title"),
-                year: row.get("year"),
-                description: row.get("description"),
-                tmdb_id: row.get("tmdb_id"),
-                metadata_expires_at: row.get("metadata_expires_at"),
+            .map(|row| {
+                let id: String = row.get("id");
+                let labels = assignments.remove(&id).unwrap_or_default();
+                Movie {
+                    id: row.get("id"),
+                    title: row.get("title"),
+                    year: row.get("year"),
+                    description: row.get("description"),
+                    tmdb_id: row.get("tmdb_id"),
+                    metadata_expires_at: row.get("metadata_expires_at"),
+                    categories: labels.categories,
+                    tags: labels.tags,
+                }
             })
+            .filter(|movie| movie.matches_library(&filter))
             .collect(),
     }))
 }
@@ -494,6 +513,9 @@ async fn preview(state: &AppState, id: &str) -> Result<ReadyPreview, HttpError> 
          WHERE m.id=? AND m.status='ready'",
     ).bind(now()).bind(id).fetch_optional(&state.pool).await.map_err(internal)?
         .ok_or_else(|| HttpError(StatusCode::NOT_FOUND, "Movie is not available for local preview".into()))?;
+    let labels = wetube_backend::labels::for_movie(&state.pool, id)
+        .await
+        .map_err(internal)?;
     Ok(ReadyPreview {
         details: MovieDetails {
             movie: Movie {
@@ -503,6 +525,8 @@ async fn preview(state: &AppState, id: &str) -> Result<ReadyPreview, HttpError> 
                 description: row.get("description"),
                 tmdb_id: row.get("tmdb_id"),
                 metadata_expires_at: row.get("metadata_expires_at"),
+                categories: labels.categories,
+                tags: labels.tags,
             },
             duration_seconds: row.get("duration_seconds"),
         },
