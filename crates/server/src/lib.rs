@@ -1,7 +1,7 @@
 use axum::{
     Json, Router,
     body::Body,
-    extract::{DefaultBodyLimit, Path as RoutePath, Request, State},
+    extract::{DefaultBodyLimit, Path as RoutePath, Query, Request, State},
     http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -20,12 +20,14 @@ use tokio_util::io::ReaderStream;
 use tower_http::services::ServeDir;
 use uuid::Uuid;
 use wetube_backend::preview::PreviewRoot;
-use wetube_backend::{accounts, conversions, db, incoming::IncomingRoot, now, probe_jobs, scans};
+use wetube_backend::{
+    accounts, conversions, db, import_history, incoming::IncomingRoot, now, probe_jobs, scans,
+};
 use wetube_core::{
-    APP_VERSION, ApiError, ConversionJob, ConversionJobs, ConversionRequest, DiagnosticJob,
-    IncomingFiles, InspectRequest, JobState, Library, LoginRequest, Movie, MovieDetails,
-    PlaybackProgress, ProbeJob, ProbeRequest, PublishRequest, Role, ScanJob, ScanJobs, ScanRequest,
-    Session, SystemStatus, UpdatePlaybackProgress,
+    APP_VERSION, ApiError, ArchiveImport, ConversionJob, ConversionJobs, ConversionRequest,
+    DiagnosticJob, ImportPage, IncomingFiles, InspectRequest, JobState, Library, LoginRequest,
+    Movie, MovieDetails, PlaybackProgress, ProbeJob, ProbeRequest, PublishRequest, Role, ScanJob,
+    ScanJobs, ScanRequest, Session, SystemStatus, UpdatePlaybackProgress,
 };
 
 pub mod admission;
@@ -171,6 +173,8 @@ pub async fn router_with_conversions(
         .route("/jobs", get(jobs))
         .route("/jobs/diagnostics", post(queue_diagnostics))
         .route("/admin/incoming", get(incoming_files))
+        .route("/admin/imports", get(imports))
+        .route("/admin/imports/{kind}/{id}/archive", post(archive_import))
         .route("/admin/probes", get(probes).post(queue_probe))
         .route(
             "/admin/conversions",
@@ -865,6 +869,7 @@ async fn queue_diagnostics(
             id,
             state: JobState::Queued,
             created_at,
+            finished_at: None,
             report: None,
             error: None,
         }),
@@ -877,7 +882,7 @@ async fn jobs(
 ) -> Result<Json<Vec<DiagnosticJob>>, HttpError> {
     admin(&state, &headers).await?;
     let rows = sqlx::query(
-        "SELECT id, state, created_at, report, error FROM diagnostic_jobs ORDER BY created_at DESC, rowid DESC LIMIT 20",
+        "SELECT id, state, created_at, finished_at, report, error FROM diagnostic_jobs ORDER BY created_at DESC, rowid DESC LIMIT 20",
     )
     .fetch_all(&state.pool)
     .await
@@ -900,6 +905,7 @@ async fn jobs(
             id: row.get("id"),
             state: job_state,
             created_at: row.get("created_at"),
+            finished_at: row.get("finished_at"),
             report,
             error: row.get("error"),
         });
@@ -939,6 +945,72 @@ async fn probes(
 ) -> Result<Json<Vec<ProbeJob>>, HttpError> {
     admin(&state, &headers).await?;
     Ok(Json(probe_jobs::list(&state.pool).await.map_err(internal)?))
+}
+
+#[derive(Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ImportQuery {
+    #[serde(default)]
+    history: bool,
+    before: Option<String>,
+    limit: Option<u32>,
+}
+
+async fn imports(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ImportQuery>,
+) -> Result<Json<ImportPage>, HttpError> {
+    let current = admin(&state, &headers).await?;
+    let limit = query.limit.unwrap_or(10);
+    if !(1..=50).contains(&limit)
+        || query
+            .before
+            .as_deref()
+            .is_some_and(|cursor| !import_history::valid_cursor(cursor))
+    {
+        return Err(HttpError(
+            StatusCode::BAD_REQUEST,
+            "Use limit 1–50 and a cursor returned by the previous page".into(),
+        ));
+    }
+    Ok(Json(
+        import_history::page(
+            &state.pool,
+            &current.user.id,
+            query.history,
+            query.before.as_deref(),
+            limit,
+        )
+        .await
+        .map_err(internal)?,
+    ))
+}
+
+async fn archive_import(
+    State(state): State<AppState>,
+    RoutePath((kind, id)): RoutePath<(String, String)>,
+    headers: HeaderMap,
+    Json(request): Json<ArchiveImport>,
+) -> Result<Json<ArchiveImport>, HttpError> {
+    let current = admin(&state, &headers).await?;
+    check_csrf(&current, &headers)?;
+    if !matches!(kind.as_str(), "scan" | "probe" | "conversion") || Uuid::parse_str(&id).is_err() {
+        return Err(HttpError(
+            StatusCode::BAD_REQUEST,
+            "Unknown import kind or invalid job ID".into(),
+        ));
+    }
+    if !import_history::set_archived(&state.pool, &current.user.id, &kind, &id, request.archived)
+        .await
+        .map_err(internal)?
+    {
+        return Err(HttpError(
+            StatusCode::CONFLICT,
+            "Job is missing, active, or still awaiting a decision. Refresh its status.".into(),
+        ));
+    }
+    Ok(Json(request))
 }
 
 async fn queue_probe(

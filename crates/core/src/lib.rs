@@ -1,7 +1,34 @@
 use serde::{Deserialize, Serialize};
 
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "kind", content = "job", rename_all = "snake_case")]
+pub enum ImportJob {
+    Scan(ScanJob),
+    Probe(ProbeJob),
+    Conversion(ConversionJob),
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ImportEntry {
+    pub item: ImportJob,
+    pub can_archive: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ImportPage {
+    pub entries: Vec<ImportEntry>,
+    pub total: u64,
+    pub history_count: u64,
+    pub next: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ArchiveImport {
+    pub archived: bool,
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -215,6 +242,8 @@ pub struct DiagnosticJob {
     pub id: String,
     pub state: JobState,
     pub created_at: i64,
+    #[serde(default)]
+    pub finished_at: Option<i64>,
     pub report: Option<DiagnosticReport>,
     pub error: Option<String>,
 }

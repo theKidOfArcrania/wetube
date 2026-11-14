@@ -1,9 +1,8 @@
-import { expect, test, type Page } from '@playwright/test';
+import { expect, test, type BrowserContext, type Page } from '@playwright/test';
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:net';
-import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -20,6 +19,7 @@ let serverLog = '';
 let retainState = false;
 let incomingFile: string;
 let dvdIncomingFile: string;
+const sessionCookies = new Map<string, Awaited<ReturnType<BrowserContext['cookies']>>>();
 
 function command(program: string, args: string[], input?: string, cwd = repo, extraEnv: NodeJS.ProcessEnv = {}): string {
   const result = spawnSync(program, args, {
@@ -76,7 +76,7 @@ test.beforeAll(async ({}, testInfo) => {
   retainState = testInfo.config.metadata.retainState === true;
   command('cargo', ['build', '--locked', '--package', 'wetube-server', '--package', 'wetube-worker']);
   command('rustup', ['run', 'stable', '/home/henry/.cargo/bin/trunk', 'build', '--release', '--locked'], undefined, join(repo, 'crates/web'));
-  root = mkdtempSync(join(tmpdir(), 'wetube-browser-e2e-'));
+  root = mkdtempSync(join(artifactsBase, 'wetube-browser-e2e-'));
   artifactsRoot = mkdtempSync(join(artifactsBase, 'wetube-media-e2e-'));
   if (retainState) {
     const credentials = join(root, 'login.txt');
@@ -137,6 +137,7 @@ test.beforeAll(async ({}, testInfo) => {
   const binary = join(repo, 'target/debug/wetube-server');
   command(binary, ['--state-dir', state, 'init']);
   command(binary, ['--state-dir', state, 'add-user', '--username', 'e2e-admin', '--admin', '--password-stdin'], `${password}\n`);
+  command(binary, ['--state-dir', state, 'add-user', '--username', 'e2e-other-admin', '--admin', '--password-stdin'], `${password}\n`);
   command(binary, ['--state-dir', state, 'add-user', '--username', 'e2e-viewer', '--password-stdin'], `${password}\n`);
   const admitted = JSON.parse(command(binary, [
     '--state-dir', state, 'admit-preview', '--report', report,
@@ -192,11 +193,41 @@ test.afterAll(async () => {
 });
 
 async function login(page: Page, username: string) {
+  // Feature cases reuse validated sessions; the login/logout case still exercises the UI.
+  const cookies = sessionCookies.get(username);
+  if (cookies) {
+    await page.context().addCookies(cookies);
+    const response = await page.request.get(`${baseURL}/api/v1/auth/me`);
+    if (response.ok() && (await response.json()).user.username === username) {
+      await page.goto(baseURL);
+      await expect(page.getByRole('button', { name: 'Sign out', exact: true })).toBeVisible();
+      return;
+    }
+    await page.context().clearCookies();
+  }
   await page.goto(baseURL);
   await page.getByLabel('Username', { exact: true }).fill(username);
   await page.getByLabel('Password', { exact: true }).fill(password);
   await page.getByRole('button', { name: 'Sign in', exact: true }).click();
   await expect(page.getByRole('button', { name: 'Sign out', exact: true })).toBeVisible();
+  sessionCookies.set(username, await page.context().cookies(baseURL));
+}
+
+async function expandImport(page: Page, id: string, history = false) {
+  if (history) {
+    const historyPanel = page.getByTestId('import-history');
+    await expect(historyPanel).toBeVisible();
+    if (await historyPanel.getAttribute('open') === null) {
+      await historyPanel.locator(':scope > summary').click();
+    }
+  }
+  const row = page.locator(`[data-testid="${history ? 'history-row' : 'attention-row'}"][data-job-id="${id}"]`);
+  const details = row.locator(':scope > details.import-details');
+  await expect(details).toBeVisible();
+  if (await details.getAttribute('open') === null) {
+    await details.locator(':scope > summary').click();
+  }
+  return row;
 }
 
 test('browser login, search, playback, seek, per-user resume and logout', async ({ page, browser }) => {
@@ -290,12 +321,13 @@ test('failed resume save still allows returning to the library with a warning', 
 test('admin diagnostics and ISO scanning retain failed input without publication', async ({ page }) => {
   await login(page, 'e2e-admin');
   await expect(page.getByText('Worker connected', { exact: true })).toBeVisible();
-  await page.getByRole('button', { name: 'Run read-only diagnostics', exact: true }).click();
+  await page.getByRole('button', { name: 'Check again', exact: true }).click();
   await expect.poll(async () => {
     const jobs = await (await page.request.get(`${baseURL}/api/v1/jobs`)).json();
     return jobs.some(job => job.state === 'succeeded' || job.state === 'failed');
   }).toBe(true);
-  await expect(page.getByText('Required scan, inspection and conversion capabilities available. Optional OCR does not determine readiness.', { exact: true })).toBeVisible();
+  await page.getByTestId('latest-readiness').getByText('Individual checks', { exact: true }).click();
+  await expect(page.getByTestId('latest-readiness').getByText('Required scan, inspection and conversion capabilities available. Optional OCR does not determine readiness.', { exact: true })).toBeVisible();
   const original = (await (await page.request.get(`${baseURL}/api/v1/admin/incoming`)).json()).files.find(file => file.name === 'browser-invalid.iso');
   const originalHash = command('sha256sum', [incomingFile]).split(/\s+/, 1)[0];
   await page.getByRole('button', { name: 'Refresh incoming files', exact: true }).click();
@@ -306,9 +338,10 @@ test('admin diagnostics and ISO scanning retain failed input without publication
     const { jobs } = await (await page.request.get(`${baseURL}/api/v1/admin/scans`)).json();
     return jobs.some(job => job.name === 'browser-invalid.iso' && job.state === 'failed');
   }).toBe(true);
-  await expect(page.getByText('Scan failed — ISO, reports and logs retained', { exact: true })).toBeVisible();
   const { jobs } = await (await page.request.get(`${baseURL}/api/v1/admin/scans`)).json();
   const failed = jobs.find(job => job.name === 'browser-invalid.iso');
+  await expandImport(page, failed.id);
+  await expect(page.getByText('Scan failed — ISO, reports and logs retained', { exact: true })).toBeVisible();
   expect(failed.attempt_id).toBeTruthy();
   expect(command('sha256sum', [join(artifactsRoot!, 'scratch', failed.attempt_id, 'input.iso')]).split(/\s+/, 1)[0]).toBe(originalHash);
   expect(command('sha256sum', [incomingFile]).split(/\s+/, 1)[0]).toBe(originalHash);
@@ -364,7 +397,26 @@ test('scanned title and angle choices gate conversion and explicit publication t
         ] } },
     },
   });
-  await page.route('**/api/v1/admin/scans', route => route.fulfill({ json: { jobs: [scan] } }));
+  await page.route('**/api/v1/admin/imports?*', route => {
+    const history = new URL(route.request().url()).searchParams.get('history') === 'true';
+    if (!history) {
+      if (conversionState === 'queued' || conversionState === 'converting') {
+        conversionState = ++conversionPolls >= 2 ? 'needs_review' : 'converting';
+      } else if (conversionState === 'queued_publication') {
+        conversionState = 'published';
+      }
+    }
+    const entries = [
+      { item: { kind: 'scan', job: scan }, can_archive: inspected, history: inspected },
+      ...(inspected ? [{ item: { kind: 'probe', job: probe }, can_archive: !!conversionState, history: !!conversionState }] : []),
+      ...(conversionState ? [{ item: { kind: 'conversion', job: conversion() },
+        can_archive: conversionState === 'published', history: conversionState === 'published' }] : []),
+    ];
+    const filtered = entries.filter(entry => entry.history === history);
+    return route.fulfill({ json: {
+      entries: filtered, total: filtered.length, history_count: entries.filter(entry => entry.history).length,
+    } });
+  });
   await page.route(`**/api/v1/admin/scans/${scanId}/inspect`, async route => {
     expect(route.request().postDataJSON()).toEqual({ title: 2, angle: 2 });
     expect(route.request().headers()['x-csrf-token']).toBeTruthy();
@@ -398,6 +450,7 @@ test('scanned title and angle choices gate conversion and explicit publication t
   });
 
   await login(page, 'e2e-admin');
+  await expandImport(page, scanId);
   const scanCard = page.locator(`[data-testid="scan-job"][data-job-id="${scanId}"]`);
   const titleSelect = scanCard.getByRole('combobox', { name: 'DVD title', exact: true });
   await expect(titleSelect.locator('option')).toHaveCount(3);
@@ -410,6 +463,7 @@ test('scanned title and angle choices gate conversion and explicit publication t
   await scanCard.getByRole('button', { name: 'Inspect selected title', exact: true }).click();
 
   const probeCard = page.locator(`[data-testid="probe-job"][data-job-id="${probeId}"]`);
+  await expandImport(page, probeId);
   const convert = probeCard.getByRole('button', { name: 'Convert reviewed title', exact: true });
   await expect(convert).toBeDisabled();
   await probeCard.getByRole('combobox', { name: 'Video treatment', exact: true }).selectOption('yadif');
@@ -417,6 +471,7 @@ test('scanned title and angle choices gate conversion and explicit publication t
   await convert.click();
 
   const conversionCard = page.locator(`[data-testid="conversion-job"][data-job-id="${conversionId}"]`);
+  await expandImport(page, conversionId);
   await expect(conversionCard.getByText('Conversion needs review — not published', { exact: true })).toBeVisible();
   const publish = conversionCard.getByRole('button', { name: 'Publish to local library', exact: true });
   await expect(publish).toBeDisabled();
@@ -425,9 +480,10 @@ test('scanned title and angle choices gate conversion and explicit publication t
   await conversionCard.getByRole('textbox', { name: 'Description', exact: true }).fill('Reviewed metadata');
   await expect(publish).toBeDisabled();
   await conversionCard.getByRole('checkbox', { name: /I reviewed the validated conversion, warnings and metadata/ }).check();
-  await page.waitForResponse(response => response.url().endsWith('/api/v1/admin/conversions') && response.request().method() === 'GET');
+  await page.waitForResponse(response => response.url().includes('/api/v1/admin/imports?') && response.request().method() === 'GET');
   await expect(conversionCard.getByRole('textbox', { name: 'Movie title', exact: true })).toHaveValue('Reviewed DVD title');
   await publish.click();
+  await expandImport(page, conversionId, true);
   await expect(conversionCard.getByText('Published to the local library', { exact: true })).toBeVisible();
   await conversionCard.getByRole('button', { name: 'Watch published movie', exact: true }).click();
   await expect(page.getByTestId('movie-player')).toBeVisible();
@@ -450,9 +506,17 @@ test('live media progress renders measurable, indeterminate, queued, review, fai
       unit: 'media seconds', updated_at: now(),
     },
   };
-  await page.route('**/api/v1/admin/scans', route => route.fulfill({ json: { jobs: [scan] } }));
-  await page.route('**/api/v1/admin/probes', route => route.fulfill({ json: [] }));
-  await page.route('**/api/v1/admin/conversions', route => route.fulfill({ json: { jobs: [conversion] } }));
+  await page.route('**/api/v1/admin/imports?*', route => {
+    const history = new URL(route.request().url()).searchParams.get('history') === 'true';
+    const entries = [
+      { item: { kind: 'scan', job: scan }, can_archive: scan.state === 'failed', history: false },
+      { item: { kind: 'conversion', job: conversion }, can_archive: ['failed', 'published'].includes(conversion.state),
+        history: conversion.state === 'published' },
+    ];
+    return route.fulfill({ json: { entries: entries.filter(entry => entry.history === history),
+      total: entries.filter(entry => entry.history === history).length,
+      history_count: entries.filter(entry => entry.history).length } });
+  });
   await login(page, 'e2e-admin');
   const scanCard = page.locator(`[data-testid="scan-job"][data-job-id="${scan.id}"]`);
   const convertedCard = page.locator(`[data-testid="conversion-job"][data-job-id="${conversion.id}"]`);
@@ -495,6 +559,7 @@ test('live media progress renders measurable, indeterminate, queued, review, fai
   await expect(convertedCard.locator('.phase-progress')).not.toContainText('remaining');
   conversion.state = 'failed';
   conversion.progress.updated_at = now();
+  await expandImport(page, conversion.id);
   await expect(convertedCard.getByText('Failed — ISO, original tracks, reports and logs retained', { exact: true })).toBeVisible();
   await expect(encode).toHaveAttribute('aria-valuenow', '25');
   await expect(convertedCard.locator('.phase-progress')).not.toContainText('remaining');
@@ -509,10 +574,160 @@ test('live media progress renders measurable, indeterminate, queued, review, fai
   await expect(convertedCard.getByRole('progressbar', { name: 'Review', exact: true })).toHaveAttribute('aria-valuenow', '100');
   await expect(convertedCard.getByRole('progressbar', { name: 'Copy & verify publication', exact: true })).toHaveAttribute('aria-valuenow', '0');
   conversion.state = 'published';
+  await expandImport(page, conversion.id, true);
+  await expect(convertedCard).toHaveCount(1);
+  await expect(page.locator(`[data-testid="attention-row"][data-job-id="${conversion.id}"]`)).toHaveCount(0);
   await expect(convertedCard.getByRole('progressbar', { name: 'Register', exact: true })).toHaveAttribute('aria-valuenow', '100');
   await expect(convertedCard.locator('.phase-progress')).toHaveText('Workflow complete.');
   scan.state = 'needs_review';
+  await expandImport(page, scan.id);
   await expect(scanCard.getByRole('progressbar', { name: 'Discover DVD', exact: true })).toHaveAttribute('aria-valuenow', '100');
+});
+
+test('compact latest readiness, attention disclosures and demand-loaded older history', async ({ page }) => {
+  const timestamp = Math.floor(Date.now() / 1000);
+  const readyReport = { tools: ['ffmpeg', 'ffprobe', 'dvdvideo', 'DVD discovery'].map(name => ({
+    name, available: true, detail: 'Synthetic capability available',
+  })), dvdvideo_available: true };
+  const diagnosticJobs: Array<{
+    id: string; state: string; created_at: number; finished_at: number | null;
+    error: string | null; report: typeof readyReport | null;
+  }> = [
+    { id: randomUUID(), state: 'queued', created_at: timestamp - 5, finished_at: null, error: null, report: null },
+    { id: randomUUID(), state: 'failed', created_at: timestamp - 65, finished_at: timestamp - 60, error: 'Previous synthetic failure', report: null },
+  ];
+  await page.route('**/api/v1/jobs', route => route.fulfill({ json: diagnosticJobs }));
+  await page.route('**/api/v1/jobs/diagnostics', route => {
+    const job = { id: randomUUID(), state: 'failed', created_at: timestamp, finished_at: timestamp + 1,
+      error: 'Newest synthetic failure', report: null };
+    diagnosticJobs.unshift(job);
+    return route.fulfill({ status: 202, json: job });
+  });
+  const scan = (state: string, name: string, error: string | null = null) => ({
+    id: randomUUID(), state, name, created_at: timestamp, attempt_id: null, report: null, error,
+  });
+  const review = scan('needs_review', 'Review fixture.iso');
+  const failed = scan('failed', 'Failed fixture.iso', 'Actionable failure remains visible');
+  const active = { id: randomUUID(), probe_job_id: randomUUID(), state: 'converting', created_at: timestamp,
+    attempt_id: null, video_treatment: 'preserve', phase: null, report: null, error: null,
+    movie_id: null, movie_sha256: null, progress: null };
+  const historyEntries = Array.from({ length: 12 }, (_, index) => ({
+    item: { kind: 'scan', job: scan('failed', `Old ${index}.iso`) }, can_archive: true,
+  }));
+  const historyCursors: Array<string | null> = [];
+  await page.route('**/api/v1/admin/imports?*', route => {
+    const query = new URL(route.request().url()).searchParams;
+    const history = query.get('history') === 'true';
+    const before = query.get('before');
+    const offset = before ? historyEntries.findIndex(entry => `scan:${entry.item.job.id}` === before) + 1 : 0;
+    if (history) historyCursors.push(before);
+    const entries = history ? historyEntries.slice(offset, offset + Number(query.get('limit'))) : [
+      { item: { kind: 'scan', job: review }, can_archive: false },
+      { item: { kind: 'scan', job: failed }, can_archive: true },
+      { item: { kind: 'conversion', job: active }, can_archive: false },
+    ];
+    const next = history && offset + entries.length < historyEntries.length
+      ? `scan:${historyEntries[offset + entries.length - 1].item.job.id}` : null;
+    return route.fulfill({ json: { entries, total: history ? 12 : 3, history_count: 12, next } });
+  });
+  await login(page, 'e2e-admin');
+  const latest = page.getByTestId('latest-readiness');
+  await expect(latest).toHaveCount(1);
+  await expect(latest).toContainText('Queued — waiting for worker');
+  await expect(latest).toContainText('Requested:');
+  await expect(latest.getByText('Synthetic capability available').first()).not.toBeVisible();
+  await latest.getByText('Individual checks', { exact: true }).click();
+  diagnosticJobs[0].state = 'succeeded';
+  diagnosticJobs[0].finished_at = timestamp;
+  diagnosticJobs[0].report = readyReport;
+  await expect(latest).toContainText('Required media capabilities available');
+  await expect(latest).toContainText('Last checked:');
+  await expect(latest.locator('time')).toHaveAttribute('datetime', new Date(timestamp * 1000).toISOString());
+  await expect(latest.locator('details')).toHaveAttribute('open');
+  await expect(latest.getByText('Synthetic capability available').first()).toBeVisible();
+  const previous = page.getByTestId('previous-checks');
+  await expect(previous).not.toHaveAttribute('open');
+  await expect(previous.getByText('Previous synthetic failure', { exact: true })).not.toBeVisible();
+  await previous.locator(':scope > summary').click();
+  await expect(previous.getByText('Previous synthetic failure', { exact: true })).toBeVisible();
+  await previous.locator(':scope > summary').click();
+  await page.getByRole('button', { name: 'Check again', exact: true }).click();
+  await expect(latest).toContainText('Newest synthetic failure');
+  await expect(latest).toContainText('Media capabilities need attention');
+  await expect(latest).toHaveCount(1);
+  const failedRow = page.locator(`[data-testid="attention-row"][data-job-id="${failed.id}"]`);
+  await expect(failedRow.locator(':scope > details')).not.toHaveAttribute('open');
+  await expect(failedRow.locator(':scope > .error')).toHaveText('Actionable failure remains visible');
+  await expect(failedRow.getByRole('button', { name: 'Archive to History', exact: true })).toBeVisible();
+  for (const id of [review.id, active.id]) {
+    await expect(page.locator(`[data-testid="attention-row"][data-job-id="${id}"]`)
+      .getByRole('button', { name: 'Archive to History', exact: true })).toHaveCount(0);
+  }
+  await expect(page.locator(`[data-testid="conversion-job"][data-job-id="${active.id}"]`).getByRole('progressbar')).toHaveCount(7);
+  await expandImport(page, review.id);
+  await expect(page.locator(`[data-testid="scan-job"][data-job-id="${review.id}"]`)).toBeVisible();
+  const historyPanel = page.getByTestId('import-history');
+  await expect(historyPanel.locator(':scope > summary')).toHaveText('History (12)');
+  await expect(historyPanel).not.toHaveAttribute('open');
+  expect(historyCursors).toEqual([]);
+  await historyPanel.locator(':scope > summary').click();
+  await expect(historyPanel.getByTestId('history-row')).toHaveCount(10);
+  await expect(historyPanel.locator('.import-details[open]')).toHaveCount(0);
+  expect(historyCursors).toEqual([null]);
+  await historyPanel.getByRole('button', { name: 'Load older', exact: true }).click();
+  await expect(historyPanel.getByTestId('history-row')).toHaveCount(12);
+  expect(historyCursors).toEqual([null, `scan:${historyEntries[9].item.job.id}`]);
+  await expect(historyPanel.getByRole('button', { name: 'Load older', exact: true })).toHaveCount(0);
+  await historyPanel.locator(':scope > summary').click();
+  await expect(historyPanel.getByTestId('history-row').first()).not.toBeVisible();
+});
+
+test('archive and restore persist across reload without hiding another administrator attention', async ({ page, browser }) => {
+  await login(page, 'e2e-admin');
+  const session = await (await page.request.get(`${baseURL}/api/v1/auth/me`)).json();
+  const incoming = await (await page.request.get(`${baseURL}/api/v1/admin/incoming`)).json();
+  const file = incoming.files.find(file => file.name === 'browser-invalid.iso');
+  const queued = await page.request.post(`${baseURL}/api/v1/admin/scans`, {
+    headers: { Origin: baseURL, 'x-csrf-token': session.csrf_token },
+    data: { name: file.name, identity: file.identity, copy_complete: true },
+  });
+  expect(queued.status()).toBe(202);
+  const scan = await queued.json();
+  await expect.poll(async () => {
+    const { jobs } = await (await page.request.get(`${baseURL}/api/v1/admin/scans`)).json();
+    return jobs.find(job => job.id === scan.id)?.state;
+  }).toBe('failed');
+  const row = page.locator(`[data-testid="attention-row"][data-job-id="${scan.id}"]`);
+  await expect(row.locator(':scope > .error')).toBeVisible();
+  const retainedError = await row.locator(':scope > .error').textContent();
+  await expect(row.locator(':scope > details')).not.toHaveAttribute('open');
+  await row.getByRole('button', { name: 'Archive to History', exact: true }).click();
+  await expect(row).toHaveCount(0);
+  await page.reload();
+  await expect(page.getByTestId('import-history')).toBeVisible();
+  await expect(row).toHaveCount(0);
+  await expect(page.getByTestId('import-history')).not.toHaveAttribute('open');
+  const archived = await expandImport(page, scan.id, true);
+  await expect(archived.locator(':scope > .error')).toHaveText(retainedError!);
+  const isolated = await browser.newContext();
+  try {
+    const otherPage = await isolated.newPage();
+    await login(otherPage, 'e2e-other-admin');
+    const otherRow = otherPage.locator(`[data-testid="attention-row"][data-job-id="${scan.id}"]`);
+    await expect(otherRow.locator(':scope > .error')).toHaveText(retainedError!);
+    await expect(otherRow.getByRole('button', { name: 'Archive to History', exact: true })).toBeVisible();
+  } finally {
+    await isolated.close();
+  }
+  await archived.getByRole('button', { name: 'Restore to attention', exact: true }).click();
+  await expect(row.locator(':scope > .error')).toHaveText(retainedError!);
+  await page.reload();
+  await expect(row.locator(':scope > .error')).toHaveText(retainedError!);
+  const { jobs } = await (await page.request.get(`${baseURL}/api/v1/admin/scans`)).json();
+  const retained = jobs.find(job => job.id === scan.id);
+  expect(retained.state).toBe('failed');
+  expect(retained.attempt_id).toBeTruthy();
+  expect(existsSync(join(artifactsRoot!, 'scratch', retained.attempt_id, 'input.iso'))).toBe(true);
 });
 
 test('real DVD scan, selected inspection, conversion, publication and playback preserve inputs', async ({ page }) => {
@@ -531,6 +746,7 @@ test('real DVD scan, selected inspection, conversion, publication and playback p
   const scan = await (await scanResponse).json();
   const scanCard = page.locator(`[data-testid="scan-job"][data-job-id="${scan.id}"]`);
   const titleSelect = scanCard.getByRole('combobox', { name: 'DVD title', exact: true });
+  await expandImport(page, scan.id);
   await expect(titleSelect.locator('option')).toHaveCount(3, { timeout: 30_000 });
   const { jobs: scans } = await (await page.request.get(`${baseURL}/api/v1/admin/scans`)).json();
   const completedScan = scans.find(job => job.id === scan.id);
@@ -538,6 +754,10 @@ test('real DVD scan, selected inspection, conversion, publication and playback p
   expect(completedScan.progress.stage).toBe(2);
   await expect(scanCard.getByRole('progressbar', { name: 'Discover DVD', exact: true })).toHaveAttribute('aria-valuenow', '100');
   await titleSelect.selectOption('2');
+  await page.waitForResponse(response => response.url().includes('/api/v1/admin/imports?')
+    && !new URL(response.url()).searchParams.has('history'));
+  await expect(titleSelect).toHaveValue('2');
+  await expect(page.locator(`[data-testid="attention-row"][data-job-id="${scan.id}"] > details.import-details`)).toHaveAttribute('open');
   await expect(scanCard.getByRole('combobox', { name: 'DVD angle', exact: true })).toHaveCount(0);
 
   const probeResponse = page.waitForResponse(response => response.url().endsWith(`/admin/scans/${scan.id}/inspect`) && response.request().method() === 'POST');
@@ -546,9 +766,14 @@ test('real DVD scan, selected inspection, conversion, publication and playback p
   expect(probe.attempt_id).toBe(completedScan.attempt_id);
   const probeCard = page.locator(`[data-testid="probe-job"][data-job-id="${probe.id}"]`);
   const convert = probeCard.getByRole('button', { name: 'Convert reviewed title', exact: true });
+  await expandImport(page, probe.id);
   await expect(convert).toBeVisible({ timeout: 30_000 });
   await probeCard.getByRole('combobox', { name: 'Video treatment', exact: true }).selectOption('preserve');
   await probeCard.getByRole('checkbox', { name: /I reviewed this inspection and warnings/ }).check();
+  await page.waitForResponse(response => response.url().includes('/api/v1/admin/imports?')
+    && !new URL(response.url()).searchParams.has('history'));
+  await expect(probeCard.getByRole('combobox', { name: 'Video treatment', exact: true })).toHaveValue('preserve');
+  await expect(probeCard.getByRole('checkbox', { name: /I reviewed this inspection and warnings/ })).toBeChecked();
   const conversionResponse = page.waitForResponse(response => response.url().endsWith('/api/v1/admin/conversions') && response.request().method() === 'POST');
   await convert.click();
   const queued = await (await conversionResponse).json();
@@ -567,6 +792,7 @@ test('real DVD scan, selected inspection, conversion, publication and playback p
   expect(converted.progress.stage).toBe(3);
 
   const convertedCard = page.locator(`[data-testid="conversion-job"][data-job-id="${queued.id}"]`);
+  await expandImport(page, queued.id);
   await expect(convertedCard.getByRole('progressbar', { name: 'Validate output', exact: true })).toHaveAttribute('aria-valuenow', '100');
   await expect(convertedCard.getByRole('progressbar', { name: 'Register', exact: true })).toHaveAttribute('aria-valuenow', '0');
   await convertedCard.getByRole('textbox', { name: 'Movie title', exact: true }).fill('E2E Converted DVD');
@@ -580,6 +806,7 @@ test('real DVD scan, selected inspection, conversion, publication and playback p
     if (current?.state === 'failed') throw new Error(`DVD publication failed: ${current.error}`);
     return current?.state;
   }, { timeout: 30_000 }).toBe('published');
+  await expandImport(page, queued.id, true);
   await expect(convertedCard.getByRole('progressbar', { name: 'Register', exact: true })).toHaveAttribute('aria-valuenow', '100');
   const library = await (await page.request.get(`${baseURL}/api/v1/movies`)).json();
   const published = library.movies.filter(movie => movie.title === 'E2E Converted DVD');

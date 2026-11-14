@@ -16,6 +16,473 @@ const ORIGIN: &str = "http://wetube.test";
 const PASSWORD: &str = "a household test password";
 
 #[tokio::test]
+async fn personal_import_history_validates_lifecycle_permissions_pagination_and_persistence() {
+    use wetube_core::{ImportJob, ImportPage};
+    let fixture = Fixture::new().await;
+    accounts::create_user(&fixture.pool, "other-admin", PASSWORD.into(), Role::Admin)
+        .await
+        .unwrap();
+    let (admin, session) = fixture.login("admin").await;
+    let (other, _) = fixture.login("other-admin").await;
+    let (viewer, viewer_session) = fixture.login("viewer").await;
+    let mut scans = Vec::new();
+    for (state, time) in [
+        ("queued", 10),
+        ("needs_review", 10),
+        ("needs_review", 10),
+        ("failed", 10),
+    ] {
+        let id = uuid::Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO scan_jobs(id,requested_by,name,source_identity,state,created_at,attempt_id,error) VALUES (?,?,'retained.iso','bound',?,?,?,'retained error')")
+            .bind(&id).bind(&session.user.id).bind(state).bind(time).bind(format!("attempt-{id}"))
+            .execute(&fixture.pool).await.unwrap();
+        scans.push(id);
+    }
+    let mut probes = Vec::new();
+    for (state, scan) in [
+        ("probing", None),
+        ("needs_review", Some(&scans[2])),
+        ("needs_review", None),
+        ("needs_review", None),
+        ("failed", None),
+    ] {
+        let id = uuid::Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO probe_jobs(id,requested_by,name,source_identity,title,angle,state,created_at,scan_job_id) VALUES (?,?,'retained.iso','bound',1,1,?,10,?)")
+            .bind(&id).bind(&session.user.id).bind(state).bind(scan).execute(&fixture.pool).await.unwrap();
+        probes.push(id);
+    }
+    let mut conversions = Vec::new();
+    for (state, probe) in [("needs_review", &probes[2]), ("published", &probes[3])] {
+        let id = uuid::Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO conversion_jobs(id,requested_by,probe_job_id,state,created_at,video_treatment) VALUES (?,?,?,?,10,'preserve')")
+            .bind(&id).bind(&session.user.id).bind(probe).bind(state).execute(&fixture.pool).await.unwrap();
+        conversions.push(id);
+    }
+    let archive_path = |kind: &str, id: &str| format!("/api/v1/admin/imports/{kind}/{id}/archive");
+    let failed_path = archive_path("scan", &scans[3]);
+    for path in [
+        "/api/v1/admin/imports",
+        "/api/v1/admin/imports?history=true",
+    ] {
+        assert_eq!(
+            fixture.send("GET", path, "", None, None).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            fixture
+                .send("GET", path, "", Some(&viewer), None)
+                .await
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+    for archived in [true, false] {
+        let body = serde_json::json!({"archived":archived}).to_string();
+        assert_eq!(
+            fixture
+                .send("POST", &failed_path, &body, None, None)
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            fixture
+                .send(
+                    "POST",
+                    &failed_path,
+                    &body,
+                    Some(&viewer),
+                    Some(&viewer_session.csrf_token)
+                )
+                .await
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            fixture
+                .send("POST", &failed_path, &body, Some(&admin), None)
+                .await
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        for origin in [
+            None,
+            Some("http://evil.test"),
+            Some("null"),
+            Some("http://wetube.test/"),
+        ] {
+            let mut request = Request::builder()
+                .method("POST")
+                .uri(&failed_path)
+                .header(header::HOST, "wetube.test")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::COOKIE, &admin)
+                .header("x-csrf-token", &session.csrf_token);
+            if let Some(origin) = origin {
+                request = request.header(header::ORIGIN, origin);
+            }
+            assert_eq!(
+                fixture
+                    .app
+                    .clone()
+                    .oneshot(request.body(Body::from(body.clone())).unwrap())
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::FORBIDDEN
+            );
+        }
+        for (kind, id) in [
+            ("scan", &scans[0]),
+            ("scan", &scans[1]),
+            ("probe", &probes[0]),
+            ("probe", &probes[1]),
+            ("conversion", &conversions[0]),
+        ] {
+            assert_eq!(
+                fixture
+                    .send(
+                        "POST",
+                        &archive_path(kind, id),
+                        &body,
+                        Some(&admin),
+                        Some(&session.csrf_token)
+                    )
+                    .await
+                    .status(),
+                StatusCode::CONFLICT
+            );
+        }
+    }
+    for query in [
+        "limit=0",
+        "limit=51",
+        "before=bad",
+        "before=scan:not-a-uuid",
+        "before=unknown:00000000-0000-0000-0000-000000000000",
+        "limit=4294967296",
+        "history=invalid",
+    ] {
+        assert!(
+            fixture
+                .send(
+                    "GET",
+                    &format!("/api/v1/admin/imports?{query}"),
+                    "",
+                    Some(&admin),
+                    None
+                )
+                .await
+                .status()
+                .is_client_error()
+        );
+    }
+    for state in [
+        "queued",
+        "converting",
+        "needs_review",
+        "queued_publication",
+        "publishing",
+    ] {
+        sqlx::query("UPDATE conversion_jobs SET state=? WHERE id=?")
+            .bind(state)
+            .bind(&conversions[0])
+            .execute(&fixture.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture
+                .send(
+                    "POST",
+                    &archive_path("conversion", &conversions[0]),
+                    "{\"archived\":true}",
+                    Some(&admin),
+                    Some(&session.csrf_token)
+                )
+                .await
+                .status(),
+            StatusCode::CONFLICT
+        );
+    }
+    sqlx::query("UPDATE conversion_jobs SET state='needs_review' WHERE id=?")
+        .bind(&conversions[0])
+        .execute(&fixture.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        fixture
+            .send(
+                "POST",
+                &archive_path("unknown", &scans[3]),
+                "{\"archived\":true}",
+                Some(&admin),
+                Some(&session.csrf_token)
+            )
+            .await
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        fixture
+            .send(
+                "POST",
+                &archive_path("scan", &uuid::Uuid::new_v4().to_string()),
+                "{\"archived\":true}",
+                Some(&admin),
+                Some(&session.csrf_token)
+            )
+            .await
+            .status(),
+        StatusCode::CONFLICT
+    );
+    let read = |response: Response| async {
+        assert_eq!(response.status(), StatusCode::OK);
+        serde_json::from_slice::<ImportPage>(
+            &to_bytes(response.into_body(), 1024 * 1024).await.unwrap(),
+        )
+        .unwrap()
+    };
+    let initial = read(
+        fixture
+            .send("GET", "/api/v1/admin/imports", "", Some(&admin), None)
+            .await,
+    )
+    .await;
+    assert_eq!(
+        initial.history_count, 4,
+        "consumed scan/probes and published conversion collapse by default"
+    );
+    assert_eq!(initial.total, 7);
+    assert!(initial.entries.iter().any(|entry| matches!(&entry.item, ImportJob::Scan(job) if job.id==scans[3] && job.error.as_deref()==Some("retained error"))));
+    assert_eq!(
+        fixture
+            .send(
+                "POST",
+                &failed_path,
+                "{\"archived\":true}",
+                Some(&admin),
+                Some(&session.csrf_token)
+            )
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    let (reloaded_cookie, _) = fixture.login("admin").await;
+    let reloaded = read(
+        fixture
+            .send(
+                "GET",
+                "/api/v1/admin/imports",
+                "",
+                Some(&reloaded_cookie),
+                None,
+            )
+            .await,
+    )
+    .await;
+    assert_eq!(reloaded.history_count, 5);
+    assert_eq!(reloaded.total, 6);
+    let isolated = read(
+        fixture
+            .send("GET", "/api/v1/admin/imports", "", Some(&other), None)
+            .await,
+    )
+    .await;
+    assert_eq!(isolated.history_count, 4);
+    assert_eq!(isolated.total, 7);
+    let first = read(
+        fixture
+            .send(
+                "GET",
+                "/api/v1/admin/imports?history=true&limit=2",
+                "",
+                Some(&admin),
+                None,
+            )
+            .await,
+    )
+    .await;
+    let older = read(
+        fixture
+            .send(
+                "GET",
+                &format!(
+                    "/api/v1/admin/imports?history=true&limit=2&before={}",
+                    first.next.as_ref().unwrap()
+                ),
+                "",
+                Some(&admin),
+                None,
+            )
+            .await,
+    )
+    .await;
+    assert_eq!(first.total, 5);
+    assert_eq!(first.entries.len(), 2);
+    assert_eq!(older.entries.len(), 2);
+    let key = |entry: &wetube_core::ImportEntry| serde_json::to_string(&entry.item).unwrap();
+    assert!(
+        first
+            .entries
+            .iter()
+            .all(|entry| !older.entries.iter().any(|old| key(entry) == key(old)))
+    );
+    let last = read(
+        fixture
+            .send(
+                "GET",
+                &format!(
+                    "/api/v1/admin/imports?history=true&limit=2&before={}",
+                    older.next.as_ref().unwrap()
+                ),
+                "",
+                Some(&admin),
+                None,
+            )
+            .await,
+    )
+    .await;
+    assert_eq!(last.entries.len(), 1);
+    assert!(last.next.is_none());
+    let missing_cursor = read(
+        fixture
+            .send(
+                "GET",
+                &format!("/api/v1/admin/imports?before=scan:{}", uuid::Uuid::new_v4()),
+                "",
+                Some(&admin),
+                None,
+            )
+            .await,
+    )
+    .await;
+    assert!(missing_cursor.entries.is_empty());
+    assert!(missing_cursor.next.is_none());
+    assert_eq!(
+        fixture
+            .send(
+                "POST",
+                &failed_path,
+                "{\"archived\":false}",
+                Some(&admin),
+                Some(&session.csrf_token)
+            )
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    let published_path = archive_path("conversion", &conversions[1]);
+    assert_eq!(
+        fixture
+            .send(
+                "POST",
+                &published_path,
+                "{\"archived\":false}",
+                Some(&admin),
+                Some(&session.csrf_token)
+            )
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    let restored = read(
+        fixture
+            .send("GET", "/api/v1/admin/imports", "", Some(&admin), None)
+            .await,
+    )
+    .await;
+    assert_eq!(restored.history_count, 3);
+    assert_eq!(restored.total, 8);
+    // An archived consumed inspection must return to attention when its child fails.
+    let consumed_path = archive_path("probe", &probes[2]);
+    assert_eq!(
+        fixture
+            .send(
+                "POST",
+                &consumed_path,
+                "{\"archived\":true}",
+                Some(&admin),
+                Some(&session.csrf_token)
+            )
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    sqlx::query("UPDATE conversion_jobs SET state='failed' WHERE id=?")
+        .bind(&conversions[0])
+        .execute(&fixture.pool)
+        .await
+        .unwrap();
+    let attention = read(
+        fixture
+            .send("GET", "/api/v1/admin/imports", "", Some(&admin), None)
+            .await,
+    )
+    .await;
+    assert!(attention.entries.iter().any(|entry| !entry.can_archive
+        && matches!(&entry.item,ImportJob::Probe(job) if job.id==probes[2])));
+    assert_eq!(
+        fixture
+            .send(
+                "POST",
+                &consumed_path,
+                "{\"archived\":true}",
+                Some(&admin),
+                Some(&session.csrf_token)
+            )
+            .await
+            .status(),
+        StatusCode::CONFLICT
+    );
+    let retained: (String, String) =
+        sqlx::query_as("SELECT attempt_id,error FROM scan_jobs WHERE id=?")
+            .bind(&scans[3])
+            .fetch_one(&fixture.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        retained,
+        (format!("attempt-{}", scans[3]), "retained error".into())
+    );
+    assert_eq!(
+        wetube_backend::scans::list(&fixture.pool)
+            .await
+            .unwrap()
+            .len(),
+        4,
+        "legacy list remains unfiltered"
+    );
+    let consumed_scan = archive_path("scan", &scans[2]);
+    assert_eq!(
+        fixture
+            .send(
+                "POST",
+                &consumed_scan,
+                "{\"archived\":true}",
+                Some(&admin),
+                Some(&session.csrf_token)
+            )
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    sqlx::query("UPDATE probe_jobs SET state='failed' WHERE id=?")
+        .bind(&probes[1])
+        .execute(&fixture.pool)
+        .await
+        .unwrap();
+    let attention = read(
+        fixture
+            .send("GET", "/api/v1/admin/imports", "", Some(&admin), None)
+            .await,
+    )
+    .await;
+    assert!(attention.entries.iter().any(|entry| !entry.can_archive
+        && matches!(&entry.item,
+        ImportJob::Scan(job) if job.id==scans[2])));
+}
+
+#[tokio::test]
 async fn conversion_publication_and_scan_selection_require_admin_csrf_and_bound_review() {
     let mut fixture = Fixture::new().await;
     let artifacts = tempfile::tempdir().unwrap();
@@ -800,6 +1267,7 @@ async fn diagnostic_jobs_require_admin_csrf_and_survive_router_recreation() {
     assert_eq!(response.status(), StatusCode::ACCEPTED);
     let job: DiagnosticJob =
         serde_json::from_slice(&to_bytes(response.into_body(), 16 * 1024).await.unwrap()).unwrap();
+    assert!(job.finished_at.is_none());
     assert_eq!(
         fixture
             .send(
@@ -813,6 +1281,13 @@ async fn diagnostic_jobs_require_admin_csrf_and_survive_router_recreation() {
             .status(),
         StatusCode::CONFLICT
     );
+    let completed = job.created_at + 3;
+    sqlx::query("UPDATE diagnostic_jobs SET state='succeeded',finished_at=? WHERE id=?")
+        .bind(completed)
+        .bind(&job.id)
+        .execute(&fixture.pool)
+        .await
+        .unwrap();
     let app = wetube_server::router(fixture.pool.clone(), ORIGIN, fixture._directory.path())
         .await
         .unwrap();
@@ -831,6 +1306,7 @@ async fn diagnostic_jobs_require_admin_csrf_and_survive_router_recreation() {
         serde_json::from_slice(&to_bytes(response.into_body(), 16 * 1024).await.unwrap()).unwrap();
     assert_eq!(jobs.len(), 1);
     assert_eq!(jobs[0].id, job.id);
+    assert_eq!(jobs[0].finished_at, Some(completed));
 }
 
 #[tokio::test]

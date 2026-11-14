@@ -1,6 +1,7 @@
 pub mod accounts;
 pub mod conversions;
 pub mod db;
+pub mod import_history;
 pub mod incoming;
 pub mod lock;
 pub mod preview;

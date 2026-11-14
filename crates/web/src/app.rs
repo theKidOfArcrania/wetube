@@ -8,11 +8,11 @@ use std::sync::{
 };
 use std::{cell::RefCell, rc::Rc};
 use wetube_core::{
-    ApiError, ConversionJob, ConversionJobs, ConversionRequest, ConversionState, DiagnosticJob,
-    DiagnosticReport, IncomingFiles, InspectRequest, JobState, Library, LoginRequest,
-    MediaProgress, MediaProgressState, MediaWorkflow, Movie, MovieDetails, PlaybackProgress,
-    ProbeJob, ProbeState, PublishRequest, Role, ScanJob, ScanJobs, ScanRequest, ScanState, Session,
-    SystemStatus, UpdatePlaybackProgress, VideoTreatment,
+    ApiError, ArchiveImport, ConversionJob, ConversionRequest, ConversionState, DiagnosticJob,
+    DiagnosticReport, ImportEntry, ImportJob, ImportPage, IncomingFiles, InspectRequest, JobState,
+    Library, LoginRequest, MediaProgress, MediaProgressState, MediaWorkflow, Movie, MovieDetails,
+    PlaybackProgress, ProbeJob, ProbeState, PublishRequest, Role, ScanJob, ScanRequest, ScanState,
+    Session, SystemStatus, UpdatePlaybackProgress, VideoTreatment,
 };
 
 async fn decode<T: DeserializeOwned>(response: Response) -> Result<T, String> {
@@ -481,36 +481,78 @@ fn LibraryPage(current: Session, session: RwSignal<Option<Session>>) -> impl Int
                         </p>
                     </div>
                     <button class="secondary" on:click=diagnose disabled=move || requesting.get()>
-                        "Run read-only diagnostics"
+                        "Check again"
                     </button>
                 </div>
-                <p class="subtle">"Read-only capability checks: DVD discovery is required for title scanning;
-                    FFmpeg, ffprobe and DVD-Video support are required for conversion.
-                    Discovery uses the installed DVD library, with lsdvd only an optional fallback.
-                    OCR is optional and does not block current conversion or playback.
-                    No ISO is opened, converted or deleted; captions remain pending."</p>
-                <For each={move || jobs.get().into_iter().take(4).collect::<Vec<_>>()}
-                    key=|job| (job.id.clone(), job.state)
-                    children=|job| {
-                        let label = match job.state {
-                            JobState::Queued => "Queued",
-                            JobState::Running => "Checking media tools",
-                            JobState::Succeeded => "Diagnostic checks completed",
-                            JobState::Failed => "Diagnostic checks need review — see individual capabilities",
-                        };
-                        view! {
-                            <article class="job">
-                                <strong>{label}</strong>
-                                {job.error.map(|message| view! { <p class="error">{message}</p> })}
-                                {job.report.map(diagnostic_capabilities)}
-                            </article>
-                        }
-                    }/>
+                <For each={move || jobs.get().into_iter().take(1).collect::<Vec<_>>()}
+                    key=|job| job.id.clone()
+                    children=move |job| view! { <ReadinessCheck id=job.id jobs=jobs latest=true/> }/>
+                <Show when=move || jobs.get().is_empty()>
+                    <p class="subtle">"Not checked yet. Read-only checks never open or delete an ISO."</p>
+                </Show>
+                <details data-testid="previous-checks">
+                    <summary>{move || format!("Previous checks ({})", jobs.get().len().saturating_sub(1))}</summary>
+                    <For each={move || jobs.get().into_iter().skip(1).collect::<Vec<_>>()}
+                        key=|job| job.id.clone()
+                        children=move |job| view! { <ReadinessCheck id=job.id jobs=jobs latest=false/> }/>
+                    <p class="subtle">"Up to 19 previous checks. All reports remain retained."</p>
+                </details>
             </section>
             <Show when=move || selected.get().is_none() && !signing_out.get()>
                 <ImportsPanel csrf=csrf movies=movies watch_movie=watch_movie/>
             </Show>
         })}
+    }
+}
+
+fn checked_time(seconds: i64) -> String {
+    js_sys::Date::new(&js_sys::wasm_bindgen::JsValue::from_f64(
+        seconds as f64 * 1000.0,
+    ))
+    .to_iso_string()
+    .as_string()
+    .unwrap_or_default()
+}
+
+#[component]
+fn ReadinessCheck(id: String, jobs: RwSignal<Vec<DiagnosticJob>>, latest: bool) -> impl IntoView {
+    let id = StoredValue::new(id);
+    let job = Signal::derive(move || jobs.get().into_iter().find(|job| job.id == id.get_value()));
+    let label = move || {
+        job.get().map(|job| match job.state {
+            JobState::Queued => "Queued — waiting for worker",
+            JobState::Running => "Checking media tools",
+            JobState::Succeeded | JobState::Failed => {
+                if job
+                    .report
+                    .as_ref()
+                    .is_some_and(DiagnosticReport::required_tools_available)
+                {
+                    "Required media capabilities available"
+                } else {
+                    "Media capabilities need attention"
+                }
+            }
+        })
+    };
+    let timestamp = move || {
+        job.get()
+            .map(|job| checked_time(job.finished_at.unwrap_or(job.created_at)))
+    };
+    view! {
+        <div data-testid=if latest { "latest-readiness" } else { "previous-readiness" }>
+            <p><strong>{label}</strong>" · "
+                {move || if job.get().is_some_and(|job| job.finished_at.is_some()) { "Last checked: " } else { "Requested: " }}
+                <time datetime=timestamp>{timestamp}</time>
+            </p>
+            {move || job.get().and_then(|job| job.error).map(|message| view! { <p role="alert" class="error">{message}</p> })}
+            <details>
+                <summary>"Individual checks"</summary>
+                <p class="subtle">"Read-only capability checks, not conversion approval. No ISO is opened or deleted.
+                    DVD discovery, FFmpeg, ffprobe and DVD-Video support are required. OCR is optional."</p>
+                {move || job.get().and_then(|job| job.report).map(diagnostic_capabilities)}
+            </details>
+        </div>
     }
 }
 
@@ -911,9 +953,19 @@ fn ImportsPanel(
     let refreshing = RwSignal::new(false);
     let requesting = RwSignal::new(false);
     let error = RwSignal::new(None::<String>);
-    let probe_error = RwSignal::new(None::<String>);
-    let scan_error = RwSignal::new(None::<String>);
-    let conversion_error = RwSignal::new(None::<String>);
+    let main_entries = RwSignal::new(Vec::<ImportEntry>::new());
+    let history_entries = RwSignal::new(Vec::<ImportEntry>::new());
+    let main_cursor = RwSignal::new(None::<String>);
+    let main_next = RwSignal::new(None::<String>);
+    let main_previous = RwSignal::new(Vec::<Option<String>>::new());
+    let history_count = RwSignal::new(0_u64);
+    let history_open = RwSignal::new(false);
+    let history_generation = RwSignal::new(0_u64);
+    let history_next = RwSignal::new(None::<String>);
+    let history_busy = RwSignal::new(false);
+    let history_error = RwSignal::new(None::<String>);
+    let jobs_error = RwSignal::new(None::<String>);
+    let revision = RwSignal::new(0_u64);
     let scope = admin_scope();
     let mounted = Arc::new(AtomicBool::new(true));
     let cleanup = mounted.clone();
@@ -939,40 +991,114 @@ fn ImportsPanel(
         });
     };
     refresh();
+    Effect::new(move |_| {
+        let main = main_entries.get();
+        let history = history_entries.get();
+        let mut scan_list = Vec::new();
+        let mut probe_list = Vec::new();
+        let mut conversion_list = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for entry in main.into_iter().chain(history) {
+            if !seen.insert(import_key(&entry)) {
+                continue;
+            }
+            match entry.item {
+                ImportJob::Scan(job) => scan_list.push(job),
+                ImportJob::Probe(job) => probe_list.push(job),
+                ImportJob::Conversion(job) => conversion_list.push(job),
+            }
+        }
+        scans.set(scan_list);
+        jobs.set(probe_list);
+        conversions.set(conversion_list);
+    });
+    let load_history = move |reset: bool| {
+        let before = if reset {
+            None
+        } else {
+            history_next.get_untracked()
+        };
+        let cursor = before
+            .map(|cursor| format!("&before={cursor}"))
+            .unwrap_or_default();
+        let generation = history_generation.get_untracked() + 1;
+        history_generation.set(generation);
+        history_busy.set(true);
+        spawn_local(async move {
+            let result = admin_get::<ImportPage>(
+                scope,
+                &format!("/api/v1/admin/imports?history=true&limit=10{cursor}"),
+            )
+            .await;
+            if history_generation.try_get_untracked() != Some(generation) {
+                return;
+            }
+            history_busy.set(false);
+            match result {
+                Ok(page) => {
+                    remove_import_overlaps(main_entries, &page.entries);
+                    history_next.set(page.next);
+                    if reset {
+                        history_entries.set(page.entries);
+                    } else {
+                        history_entries.update(|entries| {
+                            for entry in page.entries {
+                                if !entries
+                                    .iter()
+                                    .any(|existing| import_key(existing) == import_key(&entry))
+                                {
+                                    entries.push(entry);
+                                }
+                            }
+                        });
+                    }
+                    history_error.set(None);
+                }
+                Err(message) => history_error.set(Some(message)),
+            }
+        });
+    };
+    Effect::new(move |_| {
+        if !history_open.get() {
+            return;
+        }
+        history_count.get();
+        revision.get();
+        load_history(true);
+    });
     spawn_local(async move {
         while mounted.load(Ordering::Relaxed) {
-            let result = admin_get::<ScanJobs>(scope, "/api/v1/admin/scans").await;
+            let before = main_cursor.get_untracked();
+            let cursor = before
+                .as_ref()
+                .map(|cursor| format!("&before={cursor}"))
+                .unwrap_or_default();
+            let result =
+                admin_get::<ImportPage>(scope, &format!("/api/v1/admin/imports?limit=50{cursor}"))
+                    .await;
             if !mounted.load(Ordering::Relaxed) {
                 break;
             }
-            match result {
-                Ok(history) => {
-                    scans.set(history.jobs);
-                    scan_error.set(None);
+            if before == main_cursor.get_untracked() {
+                match result {
+                    Ok(page) => {
+                        if before.is_some() && page.entries.is_empty() {
+                            main_cursor
+                                .set(main_previous.get_untracked().last().cloned().flatten());
+                            main_previous.update(|previous| {
+                                previous.pop();
+                            });
+                        }
+                        remove_import_overlaps(history_entries, &page.entries);
+                        main_entries.set(page.entries);
+                        main_next.set(page.next);
+                        if history_count.get_untracked() != page.history_count {
+                            history_count.set(page.history_count);
+                        }
+                        jobs_error.set(None);
+                    }
+                    Err(message) => jobs_error.set(Some(message)),
                 }
-                Err(message) => scan_error.set(Some(message)),
-            }
-            let result = admin_get::<Vec<ProbeJob>>(scope, "/api/v1/admin/probes").await;
-            if !mounted.load(Ordering::Relaxed) {
-                break;
-            }
-            match result {
-                Ok(history) => {
-                    jobs.set(history);
-                    probe_error.set(None);
-                }
-                Err(message) => probe_error.set(Some(message)),
-            }
-            let result = admin_get::<ConversionJobs>(scope, "/api/v1/admin/conversions").await;
-            if !mounted.load(Ordering::Relaxed) {
-                break;
-            }
-            match result {
-                Ok(history) => {
-                    conversions.set(history.jobs);
-                    conversion_error.set(None);
-                }
-                Err(message) => conversion_error.set(Some(message)),
             }
             gloo_timers::future::TimeoutFuture::new(1000).await;
         }
@@ -1014,10 +1140,14 @@ fn ImportsPanel(
             }
             copy_complete.set(false);
             match result {
-                Ok(job) => scans.update(|scans| {
-                    scans.retain(|existing| existing.id != job.id);
-                    scans.insert(0, job);
-                }),
+                Ok(job) => {
+                    main_cursor.set(None);
+                    main_previous.set(Vec::new());
+                    scans.update(|scans| {
+                        scans.retain(|existing| existing.id != job.id);
+                        scans.insert(0, job);
+                    });
+                }
                 Err(message) => error.set(Some(message)),
             }
         });
@@ -1074,60 +1204,277 @@ fn ImportsPanel(
                 </button>
             </form>
             {move || error.get().map(|message| view! { <p role="alert" class="error">{message}</p> })}
-            <h2>"DVD scan history"</h2>
-            {move || scan_error.get().map(|message| view! { <p role="alert" class="error">"Could not refresh DVD scans: "{message}</p> })}
-            <For each={move || scans.get().into_iter().map(|scan| scan.id).collect::<Vec<_>>()}
-                key=|id| id.clone()
-                children=move |id| view! { <ScanSelection id=id csrf=csrf scans=scans probes=jobs/> }/>
-            <h2>"Inspection history"</h2>
-            {move || probe_error.get().map(|message| view! { <p role="alert" class="error">"Could not refresh inspection jobs: "{message}</p> })}
-            <For each=move || jobs.get() key=|job| (job.id.clone(), job.state, job.progress.as_ref().map(|p| p.updated_at))
-                children=move |job| {
-                    let label = match job.state {
-                        ProbeState::Queued => "Queued",
-                        ProbeState::Staging => "Copying and verifying private input",
-                        ProbeState::Probing => "Inspecting the selected title",
-                        ProbeState::NeedsReview => "Needs review - not published",
-                        ProbeState::Failed => "Failed - inputs retained",
-                    };
-                    view! {
-                        <article class="job" data-testid="probe-job" data-job-id=job.id.clone()>
-                            <h3 class="inspection-source">"Source: "{job.name.clone()}</h3>
-                            <p class="inspection-state">{label}</p>
-                            <MediaJobProgress workflow=MediaWorkflow::Inspect progress=job.progress.clone()
+            <h2>"Active imports and attention"</h2>
+            <p class="subtle">"Expand a review to choose a title, inspect warnings or publish. Errors stay here until you archive them.
+                Archive acknowledges a job for your account only; it never deletes inputs, reports or media."</p>
+            {move || jobs_error.get().map(|message| view! { <p role="alert" class="error">"Could not refresh imports: "{message}</p> })}
+            <For each=move || main_entries.get() key=import_key
+                children=move |entry| view! {
+                    <ImportRow entry_key=import_key(&entry) entries=main_entries history=false
+                        csrf=csrf scans=scans probes=jobs conversions=conversions movies=movies
+                        watch_movie=watch_movie revision=revision/>
+                }/>
+            <div class="toolbar">
+                <Show when=move || !main_previous.get().is_empty()>
+                    <button class="secondary" on:click=move |_| {
+                        main_cursor.set(main_previous.get_untracked().last().cloned().flatten());
+                        main_previous.update(|previous| { previous.pop(); });
+                    }>"Previous imports"</button>
+                </Show>
+                <Show when=move || main_next.get().is_some()>
+                    <button class="secondary" on:click=move |_| {
+                        main_previous.update(|previous| previous.push(main_cursor.get_untracked()));
+                        main_cursor.set(main_next.get_untracked());
+                        main_next.set(None);
+                    }>"More imports needing attention"</button>
+                </Show>
+            </div>
+            <p class="subtle">"All attempts, including failed/interrupted ones, count against scratch limits and require operator review. No automatic cleanup is enabled."</p>
+            <details data-testid="import-history" on:toggle=move |event| {
+                use js_sys::wasm_bindgen::JsCast;
+                let open = event.target().and_then(|target| target.dyn_into::<web_sys::Element>().ok())
+                    .is_some_and(|target| target.has_attribute("open"));
+                history_open.set(open);
+            }>
+                <summary>{move || format!("History ({})", history_count.get())}</summary>
+                <p class="subtle">"Completed steps and your archived jobs. Restore returns a row to your attention list, not to the worker queue."</p>
+                <For each=move || history_entries.get() key=import_key
+                    children=move |entry| view! {
+                        <ImportRow entry_key=import_key(&entry) entries=history_entries history=true
+                            csrf=csrf scans=scans probes=jobs conversions=conversions movies=movies
+                            watch_movie=watch_movie revision=revision/>
+                    }/>
+                {move || history_error.get().map(|message| view! { <p role="alert" class="error">{message}</p> })}
+                <Show when=move || history_busy.get()><p role="status">"Loading history..."</p></Show>
+                <Show when=move || history_next.get().is_some()>
+                    <button class="secondary" disabled=move || history_busy.get()
+                        on:click=move |_| load_history(false)>"Load older"</button>
+                </Show>
+                <Show when=move || history_error.get().is_some()>
+                    <button class="secondary" disabled=move || history_busy.get()
+                        on:click=move |_| load_history(true)>"Retry history"</button>
+                </Show>
+            </details>
+        </section>
+    }
+}
+
+fn import_key(entry: &ImportEntry) -> (String, String) {
+    let (kind, id) = match &entry.item {
+        ImportJob::Scan(job) => ("scan", &job.id),
+        ImportJob::Probe(job) => ("probe", &job.id),
+        ImportJob::Conversion(job) => ("conversion", &job.id),
+    };
+    (kind.into(), id.clone())
+}
+
+fn remove_import_overlaps(entries: RwSignal<Vec<ImportEntry>>, incoming: &[ImportEntry]) {
+    let keys = incoming
+        .iter()
+        .map(import_key)
+        .collect::<std::collections::HashSet<_>>();
+    if entries
+        .get_untracked()
+        .iter()
+        .any(|entry| keys.contains(&import_key(entry)))
+    {
+        entries.update(|entries| entries.retain(|entry| !keys.contains(&import_key(entry))));
+    }
+}
+
+fn import_active(entry: &ImportEntry) -> bool {
+    match &entry.item {
+        ImportJob::Scan(job) => matches!(
+            job.state,
+            ScanState::Queued | ScanState::Staging | ScanState::Scanning
+        ),
+        ImportJob::Probe(job) => matches!(
+            job.state,
+            ProbeState::Queued | ProbeState::Staging | ProbeState::Probing
+        ),
+        ImportJob::Conversion(job) => matches!(
+            job.state,
+            ConversionState::Queued
+                | ConversionState::Converting
+                | ConversionState::QueuedPublication
+                | ConversionState::Publishing
+        ),
+    }
+}
+
+fn import_label(entry: &ImportEntry) -> String {
+    let (label, state, created) = match &entry.item {
+        ImportJob::Scan(job) => (
+            format!("DVD scan · {}", job.name),
+            match job.state {
+                ScanState::NeedsReview if entry.can_archive => "Inspection started — scan retained",
+                ScanState::NeedsReview => "Needs review — choose a title",
+                ScanState::Failed => "Failed — inputs retained",
+                _ => "Active",
+            },
+            job.created_at,
+        ),
+        ImportJob::Probe(job) => (
+            format!(
+                "Inspection · {} · title {} / angle {}",
+                job.name, job.title, job.angle
+            ),
+            match job.state {
+                ProbeState::NeedsReview if entry.can_archive => {
+                    "Conversion started — inspection retained"
+                }
+                ProbeState::NeedsReview => "Needs review — choose conversion treatment",
+                ProbeState::Failed => "Failed — inputs retained",
+                _ => "Active",
+            },
+            job.created_at,
+        ),
+        ImportJob::Conversion(job) => (
+            format!("Conversion · {}", job.id),
+            match job.state {
+                ConversionState::NeedsReview => "Needs review — publication decision",
+                ConversionState::Published => "Published",
+                ConversionState::Failed => "Failed — inputs retained",
+                _ => "Active",
+            },
+            job.created_at,
+        ),
+    };
+    format!("{label} · {state} · {}", checked_time(created))
+}
+
+#[component]
+fn ImportRow(
+    entry_key: (String, String),
+    entries: RwSignal<Vec<ImportEntry>>,
+    history: bool,
+    csrf: StoredValue<String>,
+    scans: RwSignal<Vec<ScanJob>>,
+    probes: RwSignal<Vec<ProbeJob>>,
+    conversions: RwSignal<Vec<ConversionJob>>,
+    movies: RwSignal<Vec<Movie>>,
+    watch_movie: Callback<Movie>,
+    revision: RwSignal<u64>,
+) -> impl IntoView {
+    let key = StoredValue::new(entry_key);
+    let entry = Signal::derive(move || {
+        entries
+            .get()
+            .into_iter()
+            .find(|entry| import_key(entry) == key.get_value())
+    });
+    let busy = RwSignal::new(false);
+    let error = RwSignal::new(None::<String>);
+    let scope = admin_scope();
+    let archive = move |_| {
+        if busy.get_untracked() {
+            return;
+        }
+        busy.set(true);
+        error.set(None);
+        let (kind, id) = key.get_value();
+        spawn_local(async move {
+            let result = admin_post::<ArchiveImport>(
+                scope,
+                &format!("/api/v1/admin/imports/{kind}/{id}/archive"),
+                &csrf.get_value(),
+                &ArchiveImport { archived: !history },
+            )
+            .await;
+            if busy.try_update(|busy| *busy = false).is_none() {
+                return;
+            }
+            match result {
+                Ok(_) => {
+                    entries.update(|entries| {
+                        entries.retain(|entry| import_key(entry) != key.get_value())
+                    });
+                    revision.update(|revision| *revision += 1);
+                }
+                Err(message) => error.set(Some(message)),
+            }
+        });
+    };
+    let body = move || {
+        let (kind, id) = key.get_value();
+        match kind.as_str() {
+            "scan" => view! { <ScanSelection id=id csrf=csrf scans=scans probes=probes/> }.into_any(),
+            "probe" => view! { <ProbeReview id=id csrf=csrf probes=probes conversions=conversions/> }.into_any(),
+            _ => view! { <ConversionReview id=id csrf=csrf jobs=conversions movies=movies watch_movie=watch_movie/> }.into_any(),
+        }
+    };
+    view! {
+        <div class="import-row" data-testid=if history { "history-row" } else { "attention-row" }
+            data-job-id=key.get_value().1>
+            <Show when=move || !history && entry.get().is_some_and(|entry| import_active(&entry))
+                fallback=move || view! {
+                    <details class="import-details">
+                        <summary>{move || entry.get().map(|entry| import_label(&entry))}</summary>
+                        {body()}
+                    </details>
+                }>
+                {body()}
+            </Show>
+            {move || entry.get().and_then(|entry| match entry.item {
+                ImportJob::Scan(job) => job.error,
+                ImportJob::Probe(job) => job.error,
+                ImportJob::Conversion(job) => job.error,
+            }).map(|message| view! { <p role="alert" class="error">{message}</p> })}
+            <Show when=move || entry.get().is_some_and(|entry| entry.can_archive)>
+                <button class="secondary" disabled=move || busy.get() on:click=archive>
+                    {if history { "Restore to attention" } else { "Archive to History" }}
+                </button>
+            </Show>
+            {move || error.get().map(|message| view! { <p role="alert" class="error">{message}</p> })}
+        </div>
+    }
+}
+
+#[component]
+fn ProbeReview(
+    id: String,
+    csrf: StoredValue<String>,
+    probes: RwSignal<Vec<ProbeJob>>,
+    conversions: RwSignal<Vec<ConversionJob>>,
+) -> impl IntoView {
+    let id = StoredValue::new(id);
+    view! {
+        <For each={move || probes.get().into_iter().filter(|job| job.id == id.get_value()).collect::<Vec<_>>()}
+            key=|job| (job.id.clone(), job.state)
+            children=move |job| {
+                let job_id = StoredValue::new(job.id.clone());
+                let label = match job.state {
+                    ProbeState::Queued => "Queued",
+                    ProbeState::Staging => "Copying and verifying private input",
+                    ProbeState::Probing => "Inspecting the selected title",
+                    ProbeState::NeedsReview => "Needs review - not published",
+                    ProbeState::Failed => "Failed - inputs retained",
+                };
+                view! {
+                    <article class="job" data-testid="probe-job" data-job-id=job.id.clone()>
+                        <h3 class="inspection-source">"Source: "{job.name.clone()}</h3>
+                        <p class="inspection-state">{label}</p>
+                        {move || probes.get().into_iter().find(|job| job.id == job_id.get_value()).map(|job| view! {
+                            <MediaJobProgress workflow=MediaWorkflow::Inspect progress=job.progress
                                 state=match job.state {
                                     ProbeState::Queued => MediaProgressState::Queued,
                                     ProbeState::NeedsReview => MediaProgressState::Complete,
                                     ProbeState::Failed => MediaProgressState::Failed,
                                     _ => MediaProgressState::Active,
                                 }/>
-                            {inspection_summary(&job)}
-                            {(job.state == ProbeState::NeedsReview).then(|| view! {
-                                <ProbeConversion probe_id=job.id.clone() csrf=csrf conversions=conversions/>
-                            })}
-                            {job.attempt_id.map(|attempt| view! { <p class="attempt">"Attempt: "{attempt}</p> })}
-                            {job.error.map(|message| view! { <p class="error">{message}</p> })}
-                            {job.report.map(|report| view! {
-                                <details>
-                                    <summary>"Raw staging / inspection JSON"</summary>
-                                    <pre>{format!("{report:#}")}</pre>
-                                </details>
-                            })}
-                        </article>
-                    }
-                }/>
-            <p class="subtle">"All attempts, including failed/interrupted ones, count against scratch limits and require operator review. No automatic cleanup is enabled."</p>
-            <h2>"Conversion and publication history"</h2>
-            <p class="notice">"Conversion can take a long time. Inputs, reports and logs are retained on failure.
-                A validated conversion still needs metadata review and your deliberate publication confirmation."</p>
-            {move || conversion_error.get().map(|message| view! { <p role="alert" class="error">"Could not refresh conversions: "{message}</p> })}
-            <For each={move || conversions.get().into_iter().map(|job| job.id).collect::<Vec<_>>()}
-                key=|id| id.clone()
-                children=move |id| view! {
-                    <ConversionReview id=id csrf=csrf jobs=conversions movies=movies
-                        watch_movie=watch_movie/>
-                }/>
-        </section>
+                        })}
+                        {inspection_summary(&job)}
+                        {(job.state == ProbeState::NeedsReview).then(|| view! {
+                            <ProbeConversion probe_id=job.id.clone() csrf=csrf conversions=conversions/>
+                        })}
+                        {job.attempt_id.map(|attempt| view! { <p class="attempt">"Attempt: "{attempt}</p> })}
+                        {job.error.map(|message| view! { <p class="error">{message}</p> })}
+                        {job.report.map(|report| view! {
+                            <details><summary>"Raw staging / inspection JSON"</summary><pre>{format!("{report:#}")}</pre></details>
+                        })}
+                    </article>
+                }
+            }/>
     }
 }
 

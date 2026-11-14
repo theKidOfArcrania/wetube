@@ -17,6 +17,8 @@ This is a runnable local website preview, not a production TrueNAS deployment:
   inspection, explicit conversion, and separate reviewed local-library publication.
 - Preserved original audio/image-subtitle sidecars and retained failed attempts.
 - Live, persisted media-phase progress with labeled stage-based workflow bars.
+- Compact latest media readiness, expandable checks, and per-admin import
+  archive/restore with collapsed, paginated History; no deletion or retention changes.
 
 The library starts empty. The complete production publication protocol, captions,
 TMDB, scheduled backups/restore, and trash are not implemented. Inspection never
@@ -203,18 +205,38 @@ their inputs; children retain the ownership lock until they exit.
 ## Upgrade local state
 
 Stop both services before running `wetube-server init` with this release.
-Initialization upgrades supported older schemas (1–4) to schema 5 only after a consistent `VACUUM INTO`
+Initialization upgrades supported older schemas (1–5) to schema 6 only after a consistent `VACUUM INTO`
 snapshot is written and synced in a private `pre-upgrade-UUID` directory under
 the state root. Newer/unknown versions fail closed. Repeating initialization
 does not create another snapshot once the upgrade succeeds.
 
-Schema 5 adds nullable progress snapshots to scan, inspection and conversion
-jobs. Stop **both** services, retain the state/media/attempt roots, run the matching
+Schema 6 adds per-user import archive preferences, lifecycle view and indexes;
+existing jobs, reports, media and attempts are unchanged. Schema 5's nullable
+progress snapshots are retained. Stop **both** services, retain the state/media/attempt roots, run the matching
 `wetube-server --state-dir <state-root> init`, then restart the matching server
 and worker with the same roots and rebuilt frontend. Existing jobs have no
 historical telemetry; interrupted jobs still fail closed and retain their last
 observation rather than resuming a clock. Do not initialize a database while
 either old service is running.
+
+Media readiness shows one latest check with its completion time (or explicitly
+labeled request time while pending/unavailable), expandable individual capabilities,
+and collapsed Previous checks. Active imports retain labeled progress.
+Failures and pending decisions stay in compact attention rows with errors
+visible until acknowledged by **Archive to History**. Active jobs and genuinely
+pending title/treatment/publication decisions cannot be archived or restored.
+Completed scan/inspection steps move into collapsed **History (count)** once
+a nonfailed child exists; a failed child returns its parent to attention.
+Published conversions also default to History. Expand History for ten recent
+rows and **Load older** on demand. **Restore to attention** restores visibility,
+not execution. Preferences live in SQLite per administrator, persist across
+reload/devices, and never hide another administrator's failures. Legacy job APIs
+are unchanged; additive `/api/v1/admin/imports` pages accept `history`, `limit`
+(1–50, default 10), and the previous page's `next` cursor as `before`. Keyset
+pagination includes equal-time ties and has no deep-offset limit. Counts are
+exact, with at most 50 records returned per request. Main attention pages show 50 rows.
+Archive/restore requires admin, exact Origin, CSRF, and an atomic current-state
+eligibility check. No archive operation modifies job state or deletes files.
 
 Progress bars count workflow stages, not equal amounts of work or remaining
 time. Only measurable current phases show percentage, elapsed, average rate and

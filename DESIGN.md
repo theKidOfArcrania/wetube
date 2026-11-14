@@ -68,6 +68,23 @@ in-memory tail for final validation, and capped progress logs; stderr retains
 its existing strict quota/error checks. Progress never substitutes for source
 identity, content hashes, full decode, publication confirmation or registration.
 
+The approved compact administrator UX shows one latest Media readiness result
+and its completion time (request time if unfinished), expandable capabilities and collapsed previous checks.
+Active imports retain segmented progress; decisions and unacknowledged failures
+use compact expandable rows with errors outside the disclosure. Completed work
+defaults to collapsed History with a count, ten recent rows and demand-loaded
+older rows. Schema 6 stores per-user archive/restore overrides, not global hidden
+flags. Open disclosures and review selections survive polling; main/history
+snapshot reconciliation keeps each job in one place. Only failed/published jobs
+and consumed scan/inspection results may be archived: a nonfailed child consumes
+a result; failed children return the parent
+to attention even if previously archived. Durable worker states are unchanged.
+Restore means visible attention, never retry or publication authorization.
+New additive admin APIs enforce current lifecycle eligibility atomically,
+exact-Origin CSRF, and bounded pages; old list contracts remain unchanged.
+Migration requires both services stopped and a synced SQLite snapshot; retained
+media/attempt roots stay in place. Retention and deletion remain deferred.
+
 An authored two-title DVD passes browser scan, inspection, conversion,
 publication, and playback. Full-length real-disc validation, Docker integration,
 and deployment acceptance remain separate gates; a failed retained attempt is

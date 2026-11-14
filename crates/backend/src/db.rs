@@ -46,7 +46,7 @@ pub async fn initialize(state_dir: &Path) -> Result<()> {
             // This additive migration does not modify registered media. Snapshot
             // SQLite first; operators must retain the separate media/attempt roots.
             anyhow::ensure!(
-                matches!(version.0, 1..=4),
+                matches!(version.0, 1..=5),
                 "unsupported upgrade; requires a complete asset-aware backup"
             );
             let backup = state_dir.join(format!("pre-upgrade-{}", uuid::Uuid::new_v4()));
@@ -95,7 +95,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn progress_upgrade_preserves_schema_four_jobs_and_snapshots_once() -> Result<()> {
+    async fn history_upgrade_preserves_schema_five_jobs_and_snapshots_once() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let migrations = tempfile::tempdir()?;
         for (name, sql) in [
@@ -114,6 +114,10 @@ mod tests {
             (
                 "0004_conversions.sql",
                 include_str!("../migrations/0004_conversions.sql"),
+            ),
+            (
+                "0005_media_progress.sql",
+                include_str!("../migrations/0005_media_progress.sql"),
             ),
         ] {
             std::fs::write(migrations.path().join(name), sql)?;
@@ -146,6 +150,18 @@ mod tests {
         );
         assert!(conversion.progress.is_none());
         assert_eq!(conversion.state, wetube_core::ConversionState::Failed);
+        let history = crate::import_history::page(&pool, "admin", true, None, 10).await?;
+        assert_eq!(
+            history.total, 1,
+            "only the consumed scan collapses; failed conversion returns its probe to attention"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM import_preferences")
+                .fetch_one(&pool)
+                .await?,
+            0,
+            "migration does not acknowledge anyone's failures"
+        );
         let backups: Vec<_> = std::fs::read_dir(directory.path())?
             .filter_map(|entry| entry.ok())
             .filter(|entry| {
@@ -167,7 +183,7 @@ mod tests {
             sqlx::query_scalar::<_, i64>("SELECT schema_version FROM app_metadata")
                 .fetch_one(&snapshot)
                 .await?,
-            4
+            5
         );
         assert!(
             sqlx::query("PRAGMA foreign_key_check")
