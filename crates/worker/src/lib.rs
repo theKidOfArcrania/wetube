@@ -13,6 +13,7 @@ pub mod imports;
 pub mod preview;
 pub mod probe;
 mod process;
+mod progress;
 pub mod scans;
 
 const OUTPUT_LIMIT: usize = 64 * 1024;

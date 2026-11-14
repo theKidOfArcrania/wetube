@@ -4,6 +4,10 @@ use wetube_core::{ConversionJob, ConversionRequest, PublishRequest};
 
 pub fn from_row(row: &SqliteRow) -> Result<ConversionJob> {
     Ok(ConversionJob {
+        progress: row
+            .try_get::<Option<String>, _>("progress")?
+            .map(|text| serde_json::from_str(&text))
+            .transpose()?,
         id: row.try_get("id")?,
         probe_job_id: row.try_get("probe_job_id")?,
         state: serde_json::from_value(row.try_get::<String, _>("state")?.into())?,

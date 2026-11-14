@@ -78,3 +78,11 @@ pre { max-height: 32rem; overflow: auto; white-space: pre-wrap; overflow-wrap: a
   .tool strong { display: block; }
   .login { margin-top: 2vh; }
 }
+.stage-segments { display: grid; grid-template-columns: repeat(auto-fit, minmax(6rem, 1fr)); gap: .4rem; }
+.stage-segment { flex: 1 1 6rem; min-width: 0; }
+.stage-label { display: block; font-size: .75rem; min-height: 2.5em; }
+.stage-track { background: #39404b; height: .65rem; border-radius: .2rem; overflow: hidden; }
+.stage-fill { display: block; height: 100%; background: #67d4aa; }
+.stage-track.indeterminate { background: repeating-linear-gradient(110deg, #39404b, #39404b 8px, #657382 8px, #657382 16px); }
+.phase-progress { font-size: .85rem; overflow-wrap: anywhere; }
+.media-progress { margin: 1rem 0; }

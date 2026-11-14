@@ -151,9 +151,24 @@ pub async fn tick(pool: &SqlitePool, config: Arc<super::imports::ImportConfig>) 
     let expected: String = row.try_get("source_identity")?;
     let stage_config = config.clone();
     let stage_attempt = attempt.clone();
+    let recording = super::progress::Recording::start(
+        pool,
+        "scan_jobs",
+        &id,
+        wetube_core::MediaWorkflow::Scan,
+        0,
+    );
+    let progress = &recording.progress;
+    let staging_progress = progress.clone();
     let result: Result<DvdScanReport> = async {
         let staged = tokio::task::spawn_blocking(move || {
-            super::imports::stage(&stage_config, &name, &expected, &stage_attempt)
+            super::imports::stage_progress(
+                &stage_config,
+                &name,
+                &expected,
+                &stage_attempt,
+                Some(&staging_progress),
+            )
         })
         .await??;
         sqlx::query("UPDATE scan_jobs SET state='scanning',sha256=?,size_bytes=? WHERE id=?")
@@ -163,6 +178,7 @@ pub async fn tick(pool: &SqlitePool, config: Arc<super::imports::ImportConfig>) 
             .execute(pool)
             .await?;
         staged.verify()?;
+        progress.stage(2, "Discovering DVD titles and angles", None, "");
         config.require_capacity(4 * 1024 * 1024)?;
         let directory = config.scratch_path().join(&attempt);
         let stdout = OpenOptions::new()
@@ -232,6 +248,7 @@ pub async fn tick(pool: &SqlitePool, config: Arc<super::imports::ImportConfig>) 
                 .await?;
         }
     }
+    recording.finish().await;
     Ok(true)
 }
 

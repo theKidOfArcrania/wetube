@@ -1,4 +1,5 @@
 //! Opt-in feasibility example, never used by the production job queue.
+use crate::progress::Progress;
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, ValueEnum};
 use serde_json::{Value, json};
@@ -20,6 +21,8 @@ use wetube_backend::{
     incoming::{IncomingRoot, identity},
     lock::MaintenanceLock,
 };
+
+type LiveJob<'a> = Option<(&'a sqlx::SqlitePool, &'a str, &'a Progress)>;
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum VideoTreatment {
@@ -106,6 +109,17 @@ async fn tool(
     cancel: &mut watch::Receiver<bool>,
     directory: &Path,
 ) -> Result<Vec<u8>> {
+    tool_progress(phase, command, timeout, cancel, directory, None).await
+}
+
+async fn tool_progress(
+    phase: &str,
+    command: &mut Command,
+    timeout: Duration,
+    cancel: &mut watch::Receiver<bool>,
+    directory: &Path,
+    progress: Option<&Progress>,
+) -> Result<Vec<u8>> {
     cancelled(cancel)?;
     eprintln!("{phase}...");
     let started = Instant::now();
@@ -121,7 +135,13 @@ async fn tool(
         .mode(0o600)
         .open(directory.join(format!("{phase}.stdout.txt")))?;
     let outcome = tokio::select! {
-        result = super::process::run_logged(command, timeout, 2 * 1024 * 1024, stdout.try_clone()?, log.try_clone()?) => result.with_context(|| phase.to_owned()),
+        result = async {
+            if matches!(phase, "source-decode" | "encode" | "output-decode") {
+                super::process::run_logged_progress(command, timeout, 2 * 1024 * 1024, stdout.try_clone()?, log.try_clone()?, progress).await
+            } else {
+                super::process::run_logged(command, timeout, 2 * 1024 * 1024, stdout.try_clone()?, log.try_clone()?).await
+            }
+        } => result.with_context(|| phase.to_owned()),
         _ = cancel.changed() => Err(anyhow::anyhow!("{phase} interrupted; attempt retained")),
     };
     log.sync_all()?;
@@ -179,7 +199,7 @@ fn ffmpeg() -> Command {
         "-max_error_rate",
         "0",
         "-stats_period",
-        "10",
+        "1",
         "-progress",
         "pipe:1",
     ]);
@@ -393,7 +413,7 @@ async fn media_pipeline(
     file: &mut File,
     dvd: bool,
     cancel: &mut watch::Receiver<bool>,
-    job: Option<(&sqlx::SqlitePool, &str)>,
+    job: LiveJob<'_>,
 ) -> Result<Value> {
     let timeout = Duration::from_secs(options.tool_timeout_secs);
     file.rewind()?;
@@ -413,7 +433,15 @@ async fn media_pipeline(
             .stdin(Stdio::from(file.try_clone()?));
     }
     phase(job, "source_decode").await?;
-    let source_progress = tool(
+    if let Some((_, _, progress)) = job {
+        progress.stage(
+            1,
+            "Full source decode",
+            Some(duration(source)?),
+            "media seconds",
+        );
+    }
+    let source_progress = tool_progress(
         "source-decode",
         decode.args([
             "-map",
@@ -434,6 +462,7 @@ async fn media_pipeline(
         timeout,
         cancel,
         directory,
+        job.map(|(_, _, progress)| progress),
     )
     .await?;
     let (source_frames, source_seconds) = progress(&source_progress)?;
@@ -532,7 +561,23 @@ async fn media_pipeline(
         ]);
     }
     phase(job, "encoding").await?;
-    tool("encode", &mut encode, timeout, cancel, directory).await?;
+    if let Some((_, _, progress)) = job {
+        progress.stage(
+            2,
+            "Encoding movie and preserving original tracks",
+            Some(source_seconds),
+            "media seconds",
+        );
+    }
+    tool_progress(
+        "encode",
+        &mut encode,
+        timeout,
+        cancel,
+        directory,
+        job.map(|(_, _, progress)| progress),
+    )
+    .await?;
     let after_encode = file.metadata()?;
     ensure!(
         identity(&after_encode) == before,
@@ -634,7 +679,15 @@ async fn media_pipeline(
     if has_tracks {
         verify.args(["-map", "1:a?"]);
     }
-    let verified = tool(
+    if let Some((_, _, progress)) = job {
+        progress.stage(
+            3,
+            "Full output decode",
+            Some(source_seconds),
+            "media seconds",
+        );
+    }
+    let verified = tool_progress(
         "output-decode",
         verify.args([
             "-sn",
@@ -651,6 +704,7 @@ async fn media_pipeline(
         timeout,
         cancel,
         directory,
+        job.map(|(_, _, progress)| progress),
     )
     .await?;
     let (output_frames, output_seconds) = progress(&verified)?;
@@ -919,8 +973,15 @@ pub async fn run(options: Options) -> Result<PathBuf> {
     }
 }
 
-async fn phase(job: Option<(&sqlx::SqlitePool, &str)>, phase: &str) -> Result<()> {
-    if let Some((pool, id)) = job {
+async fn phase(job: LiveJob<'_>, phase: &str) -> Result<()> {
+    if let Some((pool, id, progress)) = job {
+        let stage = match phase {
+            "source_decode" => 1,
+            "encoding" => 2,
+            "validating" => 3,
+            _ => 0,
+        };
+        progress.stage(stage, phase, None, "");
         sqlx::query("UPDATE conversion_jobs SET phase=? WHERE id=? AND state='converting'")
             .bind(phase)
             .bind(id)
@@ -930,7 +991,12 @@ async fn phase(job: Option<(&sqlx::SqlitePool, &str)>, phase: &str) -> Result<()
     Ok(())
 }
 
-pub(crate) fn bounded_hash(file: &mut File, size: u64, timeout: Duration) -> Result<String> {
+pub(crate) fn bounded_hash_progress(
+    file: &mut File,
+    size: u64,
+    timeout: Duration,
+    progress: Option<&Progress>,
+) -> Result<String> {
     file.rewind()?;
     let before = identity(&file.metadata()?);
     let deadline = Instant::now() + timeout;
@@ -949,6 +1015,9 @@ pub(crate) fn bounded_hash(file: &mut File, size: u64, timeout: Duration) -> Res
         count = count.checked_add(bytes as u64).context("hash overflow")?;
         ensure!(count <= size, "input grew during checksum verification");
         digest.update(&buffer[..bytes]);
+        if let Some(progress) = progress {
+            progress.units(count as f64);
+        }
     }
     ensure!(
         count == size && identity(&file.metadata()?) == before,
@@ -964,6 +1033,7 @@ pub(crate) async fn convert(
     job: &wetube_core::ConversionJob,
     probe: &wetube_core::ProbeJob,
     limits: &super::conversions::Limits,
+    progress: &Progress,
 ) -> Result<Value> {
     let attempt = job
         .attempt_id
@@ -981,9 +1051,14 @@ pub(crate) async fn convert(
     let result: Result<()> = async {
         let staged_config = config.clone();
         let staged_probe = probe.clone();
-        phase(Some((pool, &job.id)), "revalidating_input").await?;
+        phase(Some((pool, &job.id, progress)), "revalidating_input").await?;
+        let staging_progress = progress.clone();
         let mut staged = tokio::task::spawn_blocking(move || {
-            super::imports::revalidate(&staged_config, &staged_probe)
+            super::imports::revalidate_progress(
+                &staged_config,
+                &staged_probe,
+                Some(&staging_progress),
+            )
         })
         .await??;
         report["input_sha256"] = json!(staged.sha256);
@@ -1003,6 +1078,7 @@ pub(crate) async fn convert(
                 .context("output overflow")?,
         )?;
         staged.verify()?;
+        progress.stage(0, "Reinspecting checksum-bound program", None, "");
         let inspection =
             super::probe::inspect_open_iso(&staged.path, &staged.file, probe.title, probe.angle)
                 .await?;
@@ -1033,7 +1109,7 @@ pub(crate) async fn convert(
             &mut staged.file,
             true,
             &mut cancel,
-            Some((pool, &job.id)),
+            Some((pool, &job.id, progress)),
         )
         .await?;
         staged.verify()?;
@@ -1057,9 +1133,17 @@ pub(crate) async fn convert(
             );
             let size = file.metadata()?.len();
             let timeout = limits.timeout;
-            let digest =
-                tokio::task::spawn_blocking(move || bounded_hash(&mut file, size, timeout))
-                    .await??;
+            progress.stage(
+                3,
+                &format!("Checksum validation: {name}"),
+                Some(size as f64),
+                "bytes",
+            );
+            let hashing_progress = progress.clone();
+            let digest = tokio::task::spawn_blocking(move || {
+                bounded_hash_progress(&mut file, size, timeout, Some(&hashing_progress))
+            })
+            .await??;
             ensure!(
                 identity(&open_input(&path)?.metadata()?) == before,
                 "output replaced while hashing"
@@ -1272,6 +1356,13 @@ mod tests {
 
     #[tokio::test]
     async fn synthetic_media_runs_full_decode_encode_and_validation() -> Result<()> {
+        for reject_progress in [false, true] {
+            synthetic_media_case(reject_progress).await?;
+        }
+        Ok(())
+    }
+
+    async fn synthetic_media_case(reject_progress: bool) -> Result<()> {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("fixture.mkv");
         let chapters = dir.path().join("chapters.ffmetadata");
@@ -1379,6 +1470,20 @@ mod tests {
             "30",
         ])?;
         let mut input = open_input(&path)?;
+        let telemetry = sqlx::SqlitePool::connect("sqlite::memory:").await?;
+        sqlx::query("CREATE TABLE conversion_jobs(id TEXT,state TEXT,phase TEXT,progress TEXT)")
+            .execute(&telemetry)
+            .await?;
+        sqlx::query("INSERT INTO conversion_jobs(id,state) VALUES ('generated','converting')")
+            .execute(&telemetry)
+            .await?;
+        let recording = crate::progress::Recording::start(
+            &telemetry,
+            "conversion_jobs",
+            "generated",
+            wetube_core::MediaWorkflow::Conversion,
+            0,
+        );
         let validation = media_pipeline(
             &options,
             dir.path(),
@@ -1386,9 +1491,25 @@ mod tests {
             &mut input,
             false,
             &mut cancel,
-            None,
+            Some((&telemetry, "generated", &recording.progress)),
         )
         .await?;
+        recording.finish().await;
+        let snapshot: String = sqlx::query_scalar("SELECT progress FROM conversion_jobs")
+            .fetch_one(&telemetry)
+            .await?;
+        let snapshot: wetube_core::MediaProgress = serde_json::from_str(&snapshot)?;
+        assert_eq!(snapshot.stage, 3);
+        assert_eq!(snapshot.phase, "Full output decode");
+        assert!(snapshot.completed_units.unwrap() > 0.0);
+        assert!(snapshot.fraction().unwrap() <= 0.99);
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT state FROM conversion_jobs")
+                .fetch_one(&telemetry)
+                .await?,
+            "converting"
+        );
+        telemetry.close().await;
         assert_eq!(validation["source_decoded_frames"], 50);
         assert_eq!(validation["output_decoded_frames"], 50);
         assert_eq!(validation["movie"]["chapters"].as_array().unwrap().len(), 2);
@@ -1483,6 +1604,9 @@ mod tests {
             threads: 1,
             max_output_bytes: 8 * 1024 * 1024,
         };
+        if reject_progress {
+            sqlx::query("CREATE TRIGGER reject_conversion_progress BEFORE UPDATE OF progress ON conversion_jobs BEGIN SELECT RAISE(FAIL,'injected telemetry failure'); END").execute(&pool).await?;
+        }
         assert!(super::super::conversions::tick(&pool, config.clone(), &media, &limits).await?);
         let published = wetube_backend::conversions::list(&pool).await?.remove(0);
         assert_eq!(
@@ -1491,6 +1615,20 @@ mod tests {
             "{:?}",
             published.error
         );
+        if reject_progress {
+            assert!(published.progress.is_none());
+        } else {
+            let published_progress = published
+                .progress
+                .as_ref()
+                .context("missing publication telemetry")?;
+            assert_eq!(published_progress.stage, 6);
+            assert_eq!(
+                published_progress.phase,
+                "Durably registering verified package"
+            );
+            assert_eq!(published_progress.total_units, None);
+        }
         let package: String =
             sqlx::query_scalar("SELECT package_id FROM preview_media WHERE movie_id=?")
                 .bind(published.movie_id.as_ref())

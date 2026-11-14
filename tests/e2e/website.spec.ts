@@ -433,6 +433,88 @@ test('scanned title and angle choices gate conversion and explicit publication t
   await expect(page.getByTestId('movie-player')).toBeVisible();
 });
 
+test('live media progress renders measurable, indeterminate, queued, review, failed and terminal stages honestly', async ({ page }) => {
+  const now = () => Math.floor(Date.now() / 1000);
+  const scan = {
+    id: randomUUID(), name: 'Progress fixture.iso', state: 'queued',
+    created_at: now(), attempt_id: null, report: null, error: null,
+    progress: null as null | Record<string, unknown>,
+  };
+  const conversion = {
+    id: randomUUID(), probe_job_id: randomUUID(), state: 'queued',
+    created_at: now(), attempt_id: null, video_treatment: 'preserve',
+    phase: null, report: null, error: null, movie_id: null, movie_sha256: null,
+    progress: {
+      workflow: 'conversion', stage: 2, phase: 'Encoding movie',
+      elapsed_seconds: 10, completed_units: 20, total_units: 80 as number | null,
+      unit: 'media seconds', updated_at: now(),
+    },
+  };
+  await page.route('**/api/v1/admin/scans', route => route.fulfill({ json: { jobs: [scan] } }));
+  await page.route('**/api/v1/admin/probes', route => route.fulfill({ json: [] }));
+  await page.route('**/api/v1/admin/conversions', route => route.fulfill({ json: { jobs: [conversion] } }));
+  await login(page, 'e2e-admin');
+  const scanCard = page.locator(`[data-testid="scan-job"][data-job-id="${scan.id}"]`);
+  const convertedCard = page.locator(`[data-testid="conversion-job"][data-job-id="${conversion.id}"]`);
+  await expect(scanCard.getByRole('progressbar')).toHaveCount(3);
+  await expect(convertedCard.getByRole('progressbar')).toHaveCount(7);
+  await expect(convertedCard.getByRole('progressbar', { name: 'Encode', exact: true })).toHaveAttribute('aria-valuenow', '0');
+  await expect(convertedCard.locator('.phase-progress')).toHaveText('Queued — waiting for worker.');
+
+  conversion.state = 'converting';
+  conversion.progress.updated_at = now();
+  await expect(convertedCard.getByRole('progressbar', { name: 'Revalidate input', exact: true })).toHaveAttribute('aria-valuenow', '100');
+  await expect(convertedCard.getByRole('progressbar', { name: 'Decode source', exact: true })).toHaveAttribute('aria-valuenow', '100');
+  const encode = convertedCard.getByRole('progressbar', { name: 'Encode', exact: true });
+  await expect(encode).toHaveAttribute('aria-valuenow', '25');
+  await expect(convertedCard.locator('.phase-progress')).toContainText('elapsed 10s');
+  await expect(convertedCard.locator('.phase-progress')).toContainText('2.0 media seconds/s · estimated 30s remaining in this phase');
+  await expect(convertedCard.getByText('Total workflow — stage-based, not elapsed-time weighted', { exact: true })).toBeVisible();
+
+  conversion.progress.completed_units = 80;
+  await expect(encode).toHaveAttribute('aria-valuenow', '99');
+  await expect(convertedCard.locator('.phase-progress')).not.toContainText('remaining');
+  conversion.progress.total_units = null;
+  await expect(encode).not.toHaveAttribute('aria-valuenow');
+  await expect(convertedCard.locator('.phase-progress')).toContainText('indeterminate');
+
+  scan.state = 'scanning';
+  scan.progress = {
+    workflow: 'scan', stage: 2, phase: 'Discovering DVD titles',
+    elapsed_seconds: 3, completed_units: null, total_units: null, unit: '', updated_at: now(),
+  };
+  await expect(scanCard.getByRole('progressbar', { name: 'Copy input', exact: true })).toHaveAttribute('aria-valuenow', '100');
+  await expect(scanCard.getByRole('progressbar', { name: 'Verify input', exact: true })).toHaveAttribute('aria-valuenow', '100');
+  await expect(scanCard.getByRole('progressbar', { name: 'Discover DVD', exact: true })).not.toHaveAttribute('aria-valuenow');
+  await expect(scanCard.locator('.phase-progress')).not.toContainText('remaining');
+
+  conversion.progress.completed_units = 20;
+  conversion.progress.total_units = 80;
+  conversion.progress.updated_at = now() - 60;
+  await expect(convertedCard.locator('.phase-progress')).toContainText('last recorded; not live');
+  await expect(convertedCard.locator('.phase-progress')).not.toContainText('remaining');
+  conversion.state = 'failed';
+  conversion.progress.updated_at = now();
+  await expect(convertedCard.getByText('Failed — ISO, original tracks, reports and logs retained', { exact: true })).toBeVisible();
+  await expect(encode).toHaveAttribute('aria-valuenow', '25');
+  await expect(convertedCard.locator('.phase-progress')).not.toContainText('remaining');
+
+  conversion.state = 'needs_review';
+  await expect(convertedCard.locator('.phase-progress')).toHaveText('Awaiting administrator review — not published.');
+  await expect(convertedCard.getByRole('progressbar', { name: 'Validate output', exact: true })).toHaveAttribute('aria-valuenow', '100');
+  await expect(convertedCard.getByRole('progressbar', { name: 'Review', exact: true })).toHaveAttribute('aria-valuenow', '0');
+  await expect(convertedCard.getByRole('progressbar', { name: 'Register', exact: true })).toHaveAttribute('aria-valuenow', '0');
+  await expect(convertedCard.getByRole('button', { name: 'Publish to local library', exact: true })).toHaveCount(0);
+  conversion.state = 'queued_publication';
+  await expect(convertedCard.getByRole('progressbar', { name: 'Review', exact: true })).toHaveAttribute('aria-valuenow', '100');
+  await expect(convertedCard.getByRole('progressbar', { name: 'Copy & verify publication', exact: true })).toHaveAttribute('aria-valuenow', '0');
+  conversion.state = 'published';
+  await expect(convertedCard.getByRole('progressbar', { name: 'Register', exact: true })).toHaveAttribute('aria-valuenow', '100');
+  await expect(convertedCard.locator('.phase-progress')).toHaveText('Workflow complete.');
+  scan.state = 'needs_review';
+  await expect(scanCard.getByRole('progressbar', { name: 'Discover DVD', exact: true })).toHaveAttribute('aria-valuenow', '100');
+});
+
 test('real DVD scan, selected inspection, conversion, publication and playback preserve inputs', async ({ page }) => {
   test.setTimeout(120_000);
   await login(page, 'e2e-admin');
@@ -452,6 +534,9 @@ test('real DVD scan, selected inspection, conversion, publication and playback p
   await expect(titleSelect.locator('option')).toHaveCount(3, { timeout: 30_000 });
   const { jobs: scans } = await (await page.request.get(`${baseURL}/api/v1/admin/scans`)).json();
   const completedScan = scans.find(job => job.id === scan.id);
+  expect(completedScan.progress.workflow).toBe('scan');
+  expect(completedScan.progress.stage).toBe(2);
+  await expect(scanCard.getByRole('progressbar', { name: 'Discover DVD', exact: true })).toHaveAttribute('aria-valuenow', '100');
   await titleSelect.selectOption('2');
   await expect(scanCard.getByRole('combobox', { name: 'DVD angle', exact: true })).toHaveCount(0);
 
@@ -478,8 +563,12 @@ test('real DVD scan, selected inspection, conversion, publication and playback p
   expect(converted.report.input_sha256).toBe(originalHash);
   expect(converted.report.validation.output_decoded_frames).toBe(converted.report.validation.source_decoded_frames);
   expect(converted.movie_sha256).toMatch(/^[a-f0-9]{64}$/);
+  expect(converted.progress.workflow).toBe('conversion');
+  expect(converted.progress.stage).toBe(3);
 
   const convertedCard = page.locator(`[data-testid="conversion-job"][data-job-id="${queued.id}"]`);
+  await expect(convertedCard.getByRole('progressbar', { name: 'Validate output', exact: true })).toHaveAttribute('aria-valuenow', '100');
+  await expect(convertedCard.getByRole('progressbar', { name: 'Register', exact: true })).toHaveAttribute('aria-valuenow', '0');
   await convertedCard.getByRole('textbox', { name: 'Movie title', exact: true }).fill('E2E Converted DVD');
   await convertedCard.getByRole('spinbutton', { name: 'Year (optional)', exact: true }).fill('2002');
   await convertedCard.getByRole('textbox', { name: 'Description', exact: true }).fill('Generated DVD fixture; not a NAS movie.');
@@ -491,6 +580,7 @@ test('real DVD scan, selected inspection, conversion, publication and playback p
     if (current?.state === 'failed') throw new Error(`DVD publication failed: ${current.error}`);
     return current?.state;
   }, { timeout: 30_000 }).toBe('published');
+  await expect(convertedCard.getByRole('progressbar', { name: 'Register', exact: true })).toHaveAttribute('aria-valuenow', '100');
   const library = await (await page.request.get(`${baseURL}/api/v1/movies`)).json();
   const published = library.movies.filter(movie => movie.title === 'E2E Converted DVD');
   expect(published).toHaveLength(1);

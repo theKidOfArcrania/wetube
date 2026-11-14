@@ -6,6 +6,10 @@ pub fn from_row(row: &SqliteRow) -> Result<ProbeJob> {
     let state: ProbeState =
         serde_json::from_value(serde_json::Value::String(row.try_get("state")?))?;
     Ok(ProbeJob {
+        progress: row
+            .try_get::<Option<String>, _>("progress")?
+            .map(|text| serde_json::from_str(&text))
+            .transpose()?,
         id: row.try_get("id")?,
         name: row.try_get("name")?,
         title: u8::try_from(row.try_get::<i64, _>("title")?)?,

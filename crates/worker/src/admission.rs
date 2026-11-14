@@ -1,4 +1,5 @@
 //! Explicit local preview admission. Never publishes production assets or cleans sources.
+use crate::progress::Progress;
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -40,11 +41,12 @@ fn output(path: &Path) -> Result<File> {
         .open(path)?)
 }
 
-fn copy_and_hash(
+fn copy_and_hash_progress(
     mut source: File,
     mut target: File,
     size: u64,
     timeout: Duration,
+    progress: Option<&Progress>,
 ) -> Result<String> {
     let deadline = Instant::now() + timeout;
     let mut digest = Sha256::new();
@@ -60,13 +62,21 @@ fn copy_and_hash(
         ensure!(count <= size, "movie changed during copy");
         target.write_all(&buffer[..bytes])?;
         digest.update(&buffer[..bytes]);
+        if let Some(progress) = progress {
+            progress.units(count as f64);
+        }
     }
     ensure!(count == size, "movie changed during copy");
     target.sync_all()?;
     Ok(hex::encode(digest.finalize()))
 }
 
-fn hash_copy(mut file: File, size: u64, timeout: Duration) -> Result<String> {
+fn hash_copy_progress(
+    mut file: File,
+    size: u64,
+    timeout: Duration,
+    progress: Option<&Progress>,
+) -> Result<String> {
     file.rewind()?;
     let deadline = Instant::now() + timeout;
     let mut digest = Sha256::new();
@@ -81,13 +91,16 @@ fn hash_copy(mut file: File, size: u64, timeout: Duration) -> Result<String> {
         count = count.checked_add(bytes as u64).context("hash overflow")?;
         ensure!(count <= size, "validated copy changed");
         digest.update(&buffer[..bytes]);
+        if let Some(progress) = progress {
+            progress.units(count as f64);
+        }
     }
     ensure!(count == size, "validated copy changed");
     Ok(hex::encode(digest.finalize()))
 }
 
 pub async fn admit(pool: &SqlitePool, root: &PreviewRoot, options: Admission<'_>) -> Result<Value> {
-    admit_inner(pool, root, options, None).await
+    admit_inner(pool, root, options, None, None).await
 }
 
 pub(crate) async fn admit_conversion(
@@ -95,8 +108,9 @@ pub(crate) async fn admit_conversion(
     root: &PreviewRoot,
     options: Admission<'_>,
     job_id: &str,
+    progress: &Progress,
 ) -> Result<Value> {
-    admit_inner(pool, root, options, Some(job_id)).await
+    admit_inner(pool, root, options, Some(job_id), Some(progress)).await
 }
 
 async fn admit_inner(
@@ -104,6 +118,7 @@ async fn admit_inner(
     root: &PreviewRoot,
     options: Admission<'_>,
     job_id: Option<&str>,
+    progress: Option<&Progress>,
 ) -> Result<Value> {
     wetube_backend::db::check_version(pool).await?;
     let databases = sqlx::query_as::<_, (i64, String, String)>("PRAGMA database_list")
@@ -218,8 +233,18 @@ async fn admit_inner(
     let source_reader = source.try_clone()?;
     let target_writer = output(&target)?;
     let timeout = options.timeout;
+    if let Some(progress) = progress {
+        progress.stage(5, "Copying and hashing movie", Some(size as f64), "bytes");
+    }
+    let copying_progress = progress.cloned();
     let sha256 = tokio::task::spawn_blocking(move || {
-        copy_and_hash(source_reader, target_writer, size, timeout)
+        copy_and_hash_progress(
+            source_reader,
+            target_writer,
+            size,
+            timeout,
+            copying_progress.as_ref(),
+        )
     })
     .await??;
     ensure!(
@@ -234,11 +259,26 @@ async fn admit_inner(
     // Some filesystems finalize write timestamps only when the last writer closes.
     let copied = input(&target)?;
     let copy_identity = identity(&copied.metadata()?);
-    let validated = crate::preview::validate(&copied, &report, options.timeout).await?;
+    if let Some(progress) = progress {
+        progress.stage(5, "Independently decoding published copy", None, "");
+    }
+    let validated =
+        crate::preview::validate_progress(&copied, &report, options.timeout, progress).await?;
     // Rehash the actual validated copy before finalization.
     let hash_file = copied.try_clone()?;
-    let actual_hash =
-        tokio::task::spawn_blocking(move || hash_copy(hash_file, size, timeout)).await??;
+    if let Some(progress) = progress {
+        progress.stage(
+            5,
+            "Verifying published movie checksum",
+            Some(size as f64),
+            "bytes",
+        );
+    }
+    let hashing_progress = progress.cloned();
+    let actual_hash = tokio::task::spawn_blocking(move || {
+        hash_copy_progress(hash_file, size, timeout, hashing_progress.as_ref())
+    })
+    .await??;
     ensure!(
         actual_hash == sha256
             && identity(&copied.metadata()?) == copy_identity
@@ -277,8 +317,23 @@ async fn admit_inner(
         let target_path = staging.join("original-tracks.mkv");
         let source_reader = tracks.try_clone()?;
         let target_writer = output(&target_path)?;
+        if let Some(progress) = progress {
+            progress.stage(
+                5,
+                "Copying and hashing preservation tracks",
+                Some(tracks_size as f64),
+                "bytes",
+            );
+        }
+        let copying_progress = progress.cloned();
         let digest = tokio::task::spawn_blocking(move || {
-            copy_and_hash(source_reader, target_writer, tracks_size, timeout)
+            copy_and_hash_progress(
+                source_reader,
+                target_writer,
+                tracks_size,
+                timeout,
+                copying_progress.as_ref(),
+            )
         })
         .await??;
         if job_id.is_some() {
@@ -295,9 +350,19 @@ async fn admit_inner(
         let copied_tracks = input(&target_path)?;
         let copied_identity = identity(&copied_tracks.metadata()?);
         let hash_file = copied_tracks.try_clone()?;
-        let actual =
-            tokio::task::spawn_blocking(move || hash_copy(hash_file, tracks_size, timeout))
-                .await??;
+        if let Some(progress) = progress {
+            progress.stage(
+                5,
+                "Verifying published preservation tracks",
+                Some(tracks_size as f64),
+                "bytes",
+            );
+        }
+        let hashing_progress = progress.cloned();
+        let actual = tokio::task::spawn_blocking(move || {
+            hash_copy_progress(hash_file, tracks_size, timeout, hashing_progress.as_ref())
+        })
+        .await??;
         ensure!(
             actual == digest
                 && identity(&copied_tracks.metadata()?) == copied_identity
@@ -333,6 +398,9 @@ async fn admit_inner(
         "final preview payload changed"
     );
     let movie_id = uuid::Uuid::new_v4().to_string();
+    if let Some(progress) = progress {
+        progress.stage(6, "Durably registering verified package", None, "");
+    }
     let mut transaction = pool.begin().await?;
     sqlx::query("INSERT INTO movies (id,title,year,description,status) VALUES (?,?,?,?,'ready')")
         .bind(&movie_id)

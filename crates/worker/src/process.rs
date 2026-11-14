@@ -1,6 +1,12 @@
+use crate::progress::Progress;
 use anyhow::{Context, Result};
 use std::{fs::File, io::Write, process::ExitStatus, time::Duration};
 use tokio::{io::AsyncReadExt, process::Command};
+
+enum Capture<'a> {
+    Bounded,
+    Progress(Option<&'a Progress>),
+}
 
 pub(crate) struct Output {
     pub stdout: Vec<u8>,
@@ -46,7 +52,7 @@ pub(crate) async fn run(
     timeout: Duration,
     output_limit: usize,
 ) -> Result<Output> {
-    run_capture(command, timeout, output_limit, None, None).await
+    run_capture(command, timeout, output_limit, None, None, Capture::Bounded).await
 }
 
 pub(crate) async fn run_logged(
@@ -62,8 +68,88 @@ pub(crate) async fn run_logged(
         output_limit,
         Some(stdout_log),
         Some(stderr_log),
+        Capture::Bounded,
     )
     .await
+}
+
+pub(crate) async fn run_logged_progress(
+    command: &mut Command,
+    timeout: Duration,
+    output_limit: usize,
+    stdout_log: File,
+    stderr_log: File,
+    progress: Option<&Progress>,
+) -> Result<Output> {
+    run_capture(
+        command,
+        timeout,
+        output_limit,
+        Some(stdout_log),
+        Some(stderr_log),
+        Capture::Progress(progress),
+    )
+    .await
+}
+
+pub(crate) async fn run_progress(
+    command: &mut Command,
+    timeout: Duration,
+    output_limit: usize,
+    progress: Option<&Progress>,
+) -> Result<Output> {
+    run_capture(
+        command,
+        timeout,
+        output_limit,
+        None,
+        None,
+        Capture::Progress(progress),
+    )
+    .await
+}
+
+async fn progress_output(
+    mut reader: impl tokio::io::AsyncRead + Unpin,
+    limit: usize,
+    mut log: Option<File>,
+    progress: Option<&Progress>,
+) -> std::io::Result<Vec<u8>> {
+    let mut output = Vec::new();
+    let mut pending = Vec::new();
+    let mut logged = 0;
+    let mut buffer = [0u8; 8192];
+    loop {
+        let bytes = reader.read(&mut buffer).await?;
+        if bytes == 0 {
+            break;
+        }
+        let keep = bytes.min(limit.saturating_sub(logged));
+        if let Some(log) = &mut log {
+            log.write_all(&buffer[..keep])?;
+        }
+        logged += keep;
+        output.extend_from_slice(&buffer[..bytes]);
+        if output.len() > limit {
+            output.drain(..output.len() - limit);
+        }
+        for byte in &buffer[..bytes] {
+            if *byte == b'\n' {
+                if let Some(progress) = progress
+                    && let Ok(line) = std::str::from_utf8(&pending)
+                {
+                    progress.ffmpeg_line(line);
+                }
+                pending.clear();
+            } else {
+                if pending.len() >= 8192 {
+                    return Err(std::io::Error::other("oversized FFmpeg progress line"));
+                }
+                pending.push(*byte);
+            }
+        }
+    }
+    Ok(output)
 }
 
 async fn run_capture(
@@ -72,6 +158,7 @@ async fn run_capture(
     output_limit: usize,
     stdout_log: Option<File>,
     stderr_log: Option<File>,
+    capture: Capture<'_>,
 ) -> Result<Output> {
     let mut child = command
         .stdout(std::process::Stdio::piped())
@@ -85,7 +172,14 @@ async fn run_capture(
     let stderr = child.stderr.take().unwrap();
     let outcome = tokio::time::timeout(timeout, async {
         tokio::try_join!(
-            limited_output(stdout, output_limit, stdout_log),
+            async {
+                match capture {
+                    Capture::Progress(progress) => {
+                        progress_output(stdout, output_limit, stdout_log, progress).await
+                    }
+                    Capture::Bounded => limited_output(stdout, output_limit, stdout_log).await,
+                }
+            },
             limited_output(stderr, output_limit, stderr_log),
             child.wait()
         )
@@ -116,6 +210,30 @@ async fn run_capture(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn streaming_progress_keeps_bounded_logs_and_the_final_validation_record() {
+        let log = tempfile::NamedTempFile::new().unwrap();
+        let stream = format!(
+            "{}frame=100\nout_time_us=4000000\nprogress=end\n",
+            "out_time_us=N/A\n".repeat(10000)
+        );
+        let captured = progress_output(stream.as_bytes(), 128, Some(log.reopen().unwrap()), None)
+            .await
+            .unwrap();
+        assert!(captured.len() <= 128);
+        assert!(
+            std::str::from_utf8(&captured)
+                .unwrap()
+                .ends_with("frame=100\nout_time_us=4000000\nprogress=end\n")
+        );
+        assert_eq!(std::fs::metadata(log.path()).unwrap().len(), 128);
+        assert!(
+            progress_output(&vec![b'x'; 8193][..], 128, None, None)
+                .await
+                .is_err()
+        );
+    }
 
     #[tokio::test]
     async fn output_limits_and_deadlines_are_enforced() {

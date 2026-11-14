@@ -97,6 +97,35 @@ async fn conversion_publication_and_scan_selection_require_admin_csrf_and_bound_
     assert_eq!(response.status(), StatusCode::ACCEPTED);
     let job: wetube_core::ConversionJob =
         serde_json::from_slice(&to_bytes(response.into_body(), 32768).await.unwrap()).unwrap();
+    assert!(job.progress.is_none());
+    let progress = wetube_core::MediaProgress {
+        workflow: wetube_core::MediaWorkflow::Conversion,
+        stage: 2,
+        phase: "Encoding".into(),
+        elapsed_seconds: 10.0,
+        completed_units: Some(20.0),
+        total_units: Some(80.0),
+        unit: "media seconds".into(),
+        updated_at: wetube_backend::now(),
+    };
+    sqlx::query("UPDATE conversion_jobs SET progress=? WHERE id=?")
+        .bind(serde_json::to_string(&progress).unwrap())
+        .bind(&job.id)
+        .execute(&fixture.pool)
+        .await
+        .unwrap();
+    let response = fixture
+        .send("GET", "/api/v1/admin/conversions", "", Some(&admin), None)
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let jobs: wetube_core::ConversionJobs =
+        serde_json::from_slice(&to_bytes(response.into_body(), 32768).await.unwrap()).unwrap();
+    assert_eq!(jobs.jobs[0].progress.as_ref(), Some(&progress));
+    assert_eq!(
+        jobs.jobs[0].state,
+        wetube_core::ConversionState::Queued,
+        "observational telemetry cannot advance durable job state"
+    );
     assert_eq!(
         fixture
             .send(

@@ -25,6 +25,15 @@ async fn checked(command: &mut Command, timeout: Duration) -> Result<Vec<u8>> {
 }
 
 pub async fn validate(file: &File, report: &Value, timeout: Duration) -> Result<Validated> {
+    validate_progress(file, report, timeout, None).await
+}
+
+pub(crate) async fn validate_progress(
+    file: &File,
+    report: &Value,
+    timeout: Duration,
+    progress: Option<&crate::progress::Progress>,
+) -> Result<Validated> {
     ensure!(
         timeout > Duration::ZERO && timeout <= Duration::from_secs(86400),
         "invalid validation deadline"
@@ -165,7 +174,15 @@ pub async fn validate(file: &File, report: &Value, timeout: Duration) -> Result<
     same_duration(duration, output_seconds)?;
     let mut input = file.try_clone()?;
     input.seek(SeekFrom::Start(0))?;
-    let bytes = checked(
+    if let Some(progress) = progress {
+        progress.stage(
+            5,
+            "Full decode of published movie",
+            Some(source_seconds),
+            "media seconds",
+        );
+    }
+    let output = super::process::run_progress(
         Command::new("ffmpeg")
             .args([
                 "-hide_banner",
@@ -199,15 +216,23 @@ pub async fn validate(file: &File, report: &Value, timeout: Duration) -> Result<
                 "-progress",
                 "pipe:1",
                 "-stats_period",
-                "10",
+                "1",
                 "-f",
                 "null",
                 "-",
             ])
             .stdin(Stdio::from(input)),
         timeout,
+        2 * 1024 * 1024,
+        progress,
     )
     .await?;
+    ensure!(
+        output.status.success() && output.stderr.is_empty(),
+        "preview media tool rejected payload: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bytes = output.stdout;
     let text = std::str::from_utf8(&bytes)?;
     let mut frames = None;
     let mut seconds = None;

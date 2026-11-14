@@ -46,7 +46,7 @@ pub async fn initialize(state_dir: &Path) -> Result<()> {
             // This additive migration does not modify registered media. Snapshot
             // SQLite first; operators must retain the separate media/attempt roots.
             anyhow::ensure!(
-                matches!(version.0, 1..=3),
+                matches!(version.0, 1..=4),
                 "unsupported upgrade; requires a complete asset-aware backup"
             );
             let backup = state_dir.join(format!("pre-upgrade-{}", uuid::Uuid::new_v4()));
@@ -93,6 +93,92 @@ pub async fn check_version(pool: &SqlitePool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn progress_upgrade_preserves_schema_four_jobs_and_snapshots_once() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let migrations = tempfile::tempdir()?;
+        for (name, sql) in [
+            (
+                "0001_foundation.sql",
+                include_str!("../migrations/0001_foundation.sql"),
+            ),
+            (
+                "0002_probe_jobs.sql",
+                include_str!("../migrations/0002_probe_jobs.sql"),
+            ),
+            (
+                "0003_local_preview.sql",
+                include_str!("../migrations/0003_local_preview.sql"),
+            ),
+            (
+                "0004_conversions.sql",
+                include_str!("../migrations/0004_conversions.sql"),
+            ),
+        ] {
+            std::fs::write(migrations.path().join(name), sql)?;
+        }
+        let pool = open(directory.path(), true).await?;
+        sqlx::migrate::Migrator::new(migrations.path())
+            .await?
+            .run(&pool)
+            .await?;
+        sqlx::query("INSERT INTO users VALUES ('admin','admin','hash','admin')")
+            .execute(&pool)
+            .await?;
+        sqlx::query("INSERT INTO scan_jobs(id,requested_by,name,source_identity,state,created_at,attempt_id,report) VALUES ('scan','admin','test.iso','bound','needs_review',1,'retained-scan','{\"titles\":[]}')").execute(&pool).await?;
+        sqlx::query("INSERT INTO probe_jobs(id,requested_by,name,source_identity,title,angle,state,created_at,scan_job_id,attempt_id,report) VALUES ('probe','admin','test.iso','bound',1,1,'needs_review',1,'scan','retained-probe','{}')").execute(&pool).await?;
+        sqlx::query("INSERT INTO conversion_jobs(id,requested_by,probe_job_id,state,created_at,video_treatment,attempt_id,report) VALUES ('conversion','admin','probe','failed',1,'preserve','retained-conversion','{}')").execute(&pool).await?;
+        pool.close().await;
+        initialize(directory.path()).await?;
+        initialize(directory.path()).await?;
+        let pool = connect(directory.path()).await?;
+        let scan = crate::scans::list(&pool).await?.remove(0);
+        assert_eq!(scan.attempt_id.as_deref(), Some("retained-scan"));
+        assert!(scan.progress.is_none());
+        let probe = crate::probe_jobs::list(&pool).await?.remove(0);
+        assert_eq!(probe.attempt_id.as_deref(), Some("retained-probe"));
+        assert!(probe.progress.is_none());
+        let conversion = crate::conversions::list(&pool).await?.remove(0);
+        assert_eq!(
+            conversion.attempt_id.as_deref(),
+            Some("retained-conversion")
+        );
+        assert!(conversion.progress.is_none());
+        assert_eq!(conversion.state, wetube_core::ConversionState::Failed);
+        let backups: Vec<_> = std::fs::read_dir(directory.path())?
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("pre-upgrade-")
+            })
+            .collect();
+        assert_eq!(backups.len(), 1);
+        let snapshot = SqlitePoolOptions::new()
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(backups[0].path().join("wetube.sqlite3"))
+                    .read_only(true),
+            )
+            .await?;
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT schema_version FROM app_metadata")
+                .fetch_one(&snapshot)
+                .await?,
+            4
+        );
+        assert!(
+            sqlx::query("PRAGMA foreign_key_check")
+                .fetch_all(&pool)
+                .await?
+                .is_empty()
+        );
+        snapshot.close().await;
+        pool.close().await;
+        Ok(())
+    }
 
     #[tokio::test]
     async fn initialization_is_repeatable_and_version_mismatches_fail_closed() {

@@ -49,12 +49,24 @@ pub async fn tick(
         return Ok(false);
     };
     let job = conversions::from_row(&row)?;
+    let recording = super::progress::Recording::start(
+        pool,
+        "conversion_jobs",
+        &job.id,
+        wetube_core::MediaWorkflow::Conversion,
+        if job.state == wetube_core::ConversionState::Converting {
+            0
+        } else {
+            5
+        },
+    );
+    let progress = &recording.progress;
     let result: Result<()> = async {
         if job.state == wetube_core::ConversionState::Converting {
             let probe = sqlx::query("SELECT * FROM probe_jobs WHERE id=? AND state='needs_review'")
                 .bind(&job.probe_job_id).fetch_one(pool).await?;
             let probe = probe_jobs::from_row(&probe)?;
-            let report = super::experimental::convert(pool,config.clone(),&job,&probe,limits).await?;
+            let report = super::experimental::convert(pool,config.clone(),&job,&probe,limits,progress).await?;
             sqlx::query("UPDATE conversion_jobs SET report=? WHERE id=?")
                 .bind(report.to_string()).bind(&job.id).execute(pool).await?;
             ensure!(report["status"] == "verified_experimental_output", "{}",report["error"].as_str().unwrap_or("conversion failed"));
@@ -69,7 +81,7 @@ pub async fn tick(
             super::admission::admit_conversion(pool,media,super::admission::Admission {
                 report:&report,title:&publication.title,year:publication.year,description:&publication.description,
                 movie_sha256:&publication.movie_sha256,max_bytes:limits.max_output_bytes,timeout:limits.timeout,
-            },&job.id).await?;
+            },&job.id,progress).await?;
         }
         Ok(())
     }.await;
@@ -83,6 +95,7 @@ pub async fn tick(
         .execute(pool)
         .await?;
     }
+    recording.finish().await;
     Ok(true)
 }
 

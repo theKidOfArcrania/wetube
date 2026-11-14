@@ -2,6 +2,13 @@ use std::process::Command;
 
 #[tokio::test]
 async fn integrated_scan_failure_retains_staged_input_logs_and_no_movies() -> anyhow::Result<()> {
+    for reject_progress in [false, true] {
+        integrated_scan_failure_case(reject_progress).await?;
+    }
+    Ok(())
+}
+
+async fn integrated_scan_failure_case(reject_progress: bool) -> anyhow::Result<()> {
     use anyhow::{Context, ensure};
     use wetube_backend::{db, incoming::IncomingRoot, scans};
     use wetube_core::{ScanRequest, ScanState};
@@ -22,6 +29,9 @@ async fn integrated_scan_failure_retains_staged_input_logs_and_no_movies() -> an
     sqlx::query("INSERT INTO users VALUES('admin','admin','hash','admin')")
         .execute(&pool)
         .await?;
+    if reject_progress {
+        sqlx::query("CREATE TRIGGER reject_scan_progress BEFORE UPDATE OF progress ON scan_jobs BEGIN SELECT RAISE(FAIL,'injected telemetry failure'); END").execute(&pool).await?;
+    }
     let file = IncomingRoot::open(&incoming)?.list()?.remove(0);
     let job = scans::enqueue(
         &pool,
@@ -50,6 +60,23 @@ async fn integrated_scan_failure_retains_staged_input_logs_and_no_movies() -> an
     let failed = scans::list(&pool).await?.remove(0);
     assert_eq!(failed.id, job.id);
     assert_eq!(failed.state, ScanState::Failed);
+    if reject_progress {
+        assert!(failed.progress.is_none());
+    } else {
+        let progress = failed
+            .progress
+            .as_ref()
+            .context("missing retained scan progress")?;
+        assert_eq!(progress.workflow, wetube_core::MediaWorkflow::Scan);
+        assert_eq!(progress.stage, 2);
+        assert_eq!(progress.total_units, None);
+    }
+    assert!(
+        failed
+            .error
+            .as_ref()
+            .is_some_and(|error| error.contains("DVD discovery"))
+    );
     let attempt = scratch.join(failed.attempt_id.context("missing retained attempt")?);
     assert_eq!(
         std::fs::read(attempt.join("input.iso"))

@@ -159,6 +159,16 @@ pub(crate) fn stage(
     expected: &str,
     attempt: &str,
 ) -> Result<Staged> {
+    stage_progress(config, name, expected, attempt, None)
+}
+
+pub(crate) fn stage_progress(
+    config: &ImportConfig,
+    name: &str,
+    expected: &str,
+    attempt: &str,
+    progress: Option<&super::progress::Progress>,
+) -> Result<Staged> {
     let (mut source, entry) = config.incoming.open_file(name)?;
     ensure!(
         entry.identity == expected,
@@ -180,6 +190,14 @@ pub(crate) fn stage(
         .mode(0o600)
         .open(&path)?;
     let deadline = Instant::now() + config.staging_timeout;
+    if let Some(progress) = progress {
+        progress.stage(
+            0,
+            "Copying private input",
+            Some(entry.size_bytes as f64),
+            "bytes",
+        );
+    }
     let mut buffer = vec![0u8; 1024 * 1024];
     let mut hash = Sha256::new();
     let mut count = 0u64;
@@ -201,6 +219,9 @@ pub(crate) fn stage(
         );
         hash.update(&buffer[..bytes]);
         target.write_all(&buffer[..bytes])?;
+        if let Some(progress) = progress {
+            progress.units(count as f64);
+        }
     }
     ensure!(
         count == entry.size_bytes,
@@ -218,6 +239,15 @@ pub(crate) fn stage(
     let digest = hex::encode(hash.finalize());
     let staged_identity = wetube_backend::incoming::identity(&target.metadata()?);
     let mut verify = Sha256::new();
+    let mut verified = 0u64;
+    if let Some(progress) = progress {
+        progress.stage(
+            1,
+            "Verifying private input checksum",
+            Some(count as f64),
+            "bytes",
+        );
+    }
     loop {
         ensure!(
             Instant::now() < deadline,
@@ -228,6 +258,10 @@ pub(crate) fn stage(
             break;
         }
         verify.update(&buffer[..bytes]);
+        verified += bytes as u64;
+        if let Some(progress) = progress {
+            progress.units(verified as f64);
+        }
     }
     ensure!(
         hex::encode(verify.finalize()) == digest,
@@ -251,7 +285,16 @@ pub(crate) fn stage(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn revalidate(config: &ImportConfig, probe: &wetube_core::ProbeJob) -> Result<Staged> {
+    revalidate_progress(config, probe, None)
+}
+
+pub(crate) fn revalidate_progress(
+    config: &ImportConfig,
+    probe: &wetube_core::ProbeJob,
+    progress: Option<&super::progress::Progress>,
+) -> Result<Staged> {
     let report = probe.report.as_ref().context("probe has no report")?;
     let attempt = uuid::Uuid::parse_str(
         report["staged_attempt_id"]
@@ -283,7 +326,20 @@ pub(crate) fn revalidate(config: &ImportConfig, probe: &wetube_core::ProbeJob) -
         "staged input size changed"
     );
     let before = wetube_backend::incoming::identity(&file.metadata()?);
-    let sha256 = super::experimental::bounded_hash(&mut file, size, config.staging_timeout)?;
+    if let Some(progress) = progress {
+        progress.stage(
+            0,
+            "Revalidating retained input checksum",
+            Some(size as f64),
+            "bytes",
+        );
+    }
+    let sha256 = super::experimental::bounded_hash_progress(
+        &mut file,
+        size,
+        config.staging_timeout,
+        progress,
+    )?;
     ensure!(
         sha256 == expected,
         "staged input checksum mismatch; prior outputs cannot be reused"
@@ -333,9 +389,22 @@ pub async fn tick(pool: &SqlitePool, config: Arc<ImportConfig>) -> Result<bool> 
     let stage_config = config.clone();
     let staged_probe = wetube_backend::probe_jobs::from_row(&row)?;
     let reuse = row.try_get::<Option<String>, _>("scan_job_id")?.is_some();
+    let recording = super::progress::Recording::start(
+        pool,
+        "probe_jobs",
+        &id,
+        if reuse {
+            wetube_core::MediaWorkflow::Reinspect
+        } else {
+            wetube_core::MediaWorkflow::Inspect
+        },
+        0,
+    );
+    let progress = &recording.progress;
+    let staging_progress = progress.clone();
     let result: Result<serde_json::Value> = async {
         let staged = tokio::task::spawn_blocking(move || {
-            if reuse { revalidate(&stage_config,&staged_probe) } else { stage(&stage_config, &name, &expected, &stage_attempt) }
+            if reuse { revalidate_progress(&stage_config,&staged_probe,Some(&staging_progress)) } else { stage_progress(&stage_config, &name, &expected, &stage_attempt,Some(&staging_progress)) }
         })
         .await
         .context("staging task failed")??;
@@ -352,6 +421,7 @@ pub async fn tick(pool: &SqlitePool, config: Arc<ImportConfig>) -> Result<bool> 
             .execute(pool)
             .await?;
         staged.verify()?;
+        progress.stage(if reuse { 1 } else { 2 }, "Inspecting selected DVD program", None, "");
         let inspection =
             super::probe::inspect_open_iso(&staged.path, &staged.file, title, angle).await?;
         staged.verify()?;
@@ -377,6 +447,7 @@ pub async fn tick(pool: &SqlitePool, config: Arc<ImportConfig>) -> Result<bool> 
                 .await?;
         }
     }
+    recording.finish().await;
     Ok(true)
 }
 
@@ -628,9 +699,12 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        sqlx::query("CREATE TRIGGER reject_probe_progress BEFORE UPDATE OF progress ON probe_jobs BEGIN SELECT RAISE(FAIL,'injected telemetry failure'); END")
+            .execute(&pool).await.unwrap();
         assert!(tick(&pool, config.clone()).await.unwrap());
         let failed = probe_jobs::list(&pool).await.unwrap().remove(0);
         assert_eq!(failed.state, ProbeState::Failed);
+        assert!(failed.progress.is_none());
         let error = failed.error.unwrap();
         assert!(error.contains("DVD inspection"), "{error}");
         assert!(failed.report.as_ref().unwrap()["sha256"].is_string());

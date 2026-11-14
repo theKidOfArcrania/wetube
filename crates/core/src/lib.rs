@@ -1,7 +1,112 @@
 use serde::{Deserialize, Serialize};
 
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaWorkflow {
+    Scan,
+    Inspect,
+    Reinspect,
+    Conversion,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MediaProgressState {
+    Queued,
+    Active,
+    Review,
+    Complete,
+    Failed,
+    QueuedPublication,
+}
+
+impl MediaWorkflow {
+    pub fn stages(self) -> &'static [&'static str] {
+        match self {
+            Self::Scan => &["Copy input", "Verify input", "Discover DVD"],
+            Self::Inspect => &["Copy input", "Verify input", "Inspect program"],
+            Self::Reinspect => &["Revalidate input", "Inspect program"],
+            Self::Conversion => &[
+                "Revalidate input",
+                "Decode source",
+                "Encode",
+                "Validate output",
+                "Review",
+                "Copy & verify publication",
+                "Register",
+            ],
+        }
+    }
+
+    pub fn stage_fills(
+        self,
+        progress: Option<&MediaProgress>,
+        state: MediaProgressState,
+    ) -> Vec<Option<f64>> {
+        let progress = progress.filter(|p| p.workflow == self && p.stage < self.stages().len());
+        let stage = match state {
+            MediaProgressState::Complete => self.stages().len(),
+            MediaProgressState::Review => 4,
+            MediaProgressState::QueuedPublication => 5,
+            MediaProgressState::Queued => 0,
+            _ => progress.map_or(0, |p| p.stage),
+        };
+        (0..self.stages().len())
+            .map(|index| {
+                if index < stage {
+                    Some(1.0)
+                } else if index == stage
+                    && matches!(
+                        state,
+                        MediaProgressState::Active | MediaProgressState::Failed
+                    )
+                {
+                    progress.and_then(MediaProgress::fraction)
+                } else {
+                    Some(0.0)
+                }
+            })
+            .collect()
+    }
+}
+
+/// Observational only: job state and validation, never this snapshot, authorize readiness.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct MediaProgress {
+    pub workflow: MediaWorkflow,
+    pub stage: usize,
+    pub phase: String,
+    pub elapsed_seconds: f64,
+    pub completed_units: Option<f64>,
+    pub total_units: Option<f64>,
+    pub unit: String,
+    pub updated_at: i64,
+}
+
+impl MediaProgress {
+    pub fn fraction(&self) -> Option<f64> {
+        let (done, total) = (self.completed_units?, self.total_units?);
+        (done.is_finite() && total.is_finite() && done >= 0.0 && total > 0.0)
+            .then(|| (done / total).clamp(0.0, 0.99))
+    }
+
+    pub fn rate_and_eta(&self) -> Option<(f64, f64)> {
+        let (done, total) = (self.completed_units?, self.total_units?);
+        if self.fraction().is_none()
+            || !self.elapsed_seconds.is_finite()
+            || self.elapsed_seconds < 2.0
+            || done <= 0.0
+            || done >= total
+        {
+            return None;
+        }
+        let rate = done / self.elapsed_seconds;
+        let eta = (total - done) / rate;
+        (rate.is_finite() && rate > 0.0 && eta.is_finite()).then_some((rate, eta))
+    }
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -148,6 +253,8 @@ pub enum ProbeState {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ProbeJob {
+    #[serde(default)]
+    pub progress: Option<MediaProgress>,
     pub id: String,
     pub name: String,
     pub title: u8,
@@ -197,6 +304,8 @@ pub struct PublishRequest {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ConversionJob {
+    #[serde(default)]
+    pub progress: Option<MediaProgress>,
     pub id: String,
     pub probe_job_id: String,
     pub state: ConversionState,
@@ -260,6 +369,8 @@ pub struct DvdScanReport {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ScanJob {
+    #[serde(default)]
+    pub progress: Option<MediaProgress>,
     pub id: String,
     pub name: String,
     pub state: ScanState,
@@ -305,6 +416,95 @@ pub fn validate_password(password: &str) -> Result<(), ValidationError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn media_progress() -> MediaProgress {
+        MediaProgress {
+            workflow: MediaWorkflow::Conversion,
+            stage: 2,
+            phase: "Encoding".into(),
+            elapsed_seconds: 10.0,
+            completed_units: Some(20.0),
+            total_units: Some(80.0),
+            unit: "media seconds".into(),
+            updated_at: 1,
+        }
+    }
+
+    #[test]
+    fn stage_measurements_never_claim_validation_or_an_aggregate_time_percentage() {
+        let mut progress = media_progress();
+        assert_eq!(progress.fraction(), Some(0.25));
+        assert_eq!(progress.rate_and_eta(), Some((2.0, 30.0)));
+        let workflow = MediaWorkflow::Conversion;
+        assert_eq!(
+            workflow.stage_fills(Some(&progress), MediaProgressState::Active),
+            vec![
+                Some(1.0),
+                Some(1.0),
+                Some(0.25),
+                Some(0.0),
+                Some(0.0),
+                Some(0.0),
+                Some(0.0)
+            ]
+        );
+        progress.completed_units = Some(90.0);
+        assert_eq!(progress.fraction(), Some(0.99));
+        assert_eq!(progress.rate_and_eta(), None);
+        progress.total_units = None;
+        assert_eq!(progress.fraction(), None);
+        assert_eq!(
+            workflow.stage_fills(Some(&progress), MediaProgressState::Active)[2],
+            None
+        );
+        assert_eq!(progress.rate_and_eta(), None);
+        for invalid in [f64::NAN, f64::INFINITY, -1.0, 0.0] {
+            progress.total_units = Some(invalid);
+            assert_eq!(progress.fraction(), None);
+        }
+    }
+
+    #[test]
+    fn queued_review_failure_and_terminal_segments_follow_job_state_not_telemetry() {
+        let progress = media_progress();
+        let workflow = MediaWorkflow::Conversion;
+        assert_eq!(
+            workflow.stage_fills(Some(&progress), MediaProgressState::Queued),
+            vec![Some(0.0); 7]
+        );
+        let review = workflow.stage_fills(Some(&progress), MediaProgressState::Review);
+        assert_eq!(
+            review,
+            vec![
+                Some(1.0),
+                Some(1.0),
+                Some(1.0),
+                Some(1.0),
+                Some(0.0),
+                Some(0.0),
+                Some(0.0)
+            ]
+        );
+        let queued = workflow.stage_fills(Some(&progress), MediaProgressState::QueuedPublication);
+        assert_eq!(&queued[..5], &[Some(1.0); 5]);
+        assert_eq!(&queued[5..], &[Some(0.0); 2]);
+        assert_eq!(
+            workflow.stage_fills(Some(&progress), MediaProgressState::Failed),
+            workflow.stage_fills(Some(&progress), MediaProgressState::Active)
+        );
+        assert_eq!(
+            workflow.stage_fills(None, MediaProgressState::Complete),
+            vec![Some(1.0); 7]
+        );
+        assert_eq!(
+            MediaWorkflow::Scan.stage_fills(None, MediaProgressState::Complete),
+            vec![Some(1.0); 3]
+        );
+        assert_eq!(
+            MediaWorkflow::Scan.stage_fills(Some(&progress), MediaProgressState::Active),
+            vec![None, Some(0.0), Some(0.0)]
+        );
+    }
 
     #[test]
     fn usernames_are_canonical_and_cannot_contain_paths() {

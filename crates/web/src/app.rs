@@ -9,9 +9,10 @@ use std::sync::{
 use std::{cell::RefCell, rc::Rc};
 use wetube_core::{
     ApiError, ConversionJob, ConversionJobs, ConversionRequest, ConversionState, DiagnosticJob,
-    DiagnosticReport, IncomingFiles, InspectRequest, JobState, Library, LoginRequest, Movie,
-    MovieDetails, PlaybackProgress, ProbeJob, ProbeState, PublishRequest, Role, ScanJob, ScanJobs,
-    ScanRequest, ScanState, Session, SystemStatus, UpdatePlaybackProgress, VideoTreatment,
+    DiagnosticReport, IncomingFiles, InspectRequest, JobState, Library, LoginRequest,
+    MediaProgress, MediaProgressState, MediaWorkflow, Movie, MovieDetails, PlaybackProgress,
+    ProbeJob, ProbeState, PublishRequest, Role, ScanJob, ScanJobs, ScanRequest, ScanState, Session,
+    SystemStatus, UpdatePlaybackProgress, VideoTreatment,
 };
 
 async fn decode<T: DeserializeOwned>(response: Response) -> Result<T, String> {
@@ -23,6 +24,92 @@ async fn decode<T: DeserializeOwned>(response: Response) -> Result<T, String> {
             .unwrap_or_else(|_| format!("Request failed ({})", response.status())));
     }
     response.json().await.map_err(|error| error.to_string())
+}
+
+#[component]
+fn MediaJobProgress(
+    workflow: MediaWorkflow,
+    progress: Option<MediaProgress>,
+    state: MediaProgressState,
+) -> impl IntoView {
+    let workflow = progress.as_ref().map_or(workflow, |p| p.workflow);
+    let fills = workflow.stage_fills(progress.as_ref(), state);
+    let now = RwSignal::new(js_sys::Date::now() / 1000.0);
+    if state == MediaProgressState::Active {
+        let timer = gloo_timers::callback::Interval::new(1000, move || {
+            let _ = now.try_set(js_sys::Date::now() / 1000.0);
+        });
+        let timer = StoredValue::new_local(Some(timer));
+        on_cleanup(move || {
+            let _ = timer.try_update_value(|timer| timer.take());
+        });
+    }
+    let message = move || {
+        let fresh = progress
+            .as_ref()
+            .is_some_and(|p| (now.get() - p.updated_at as f64).abs() <= 10.0);
+        let active = state == MediaProgressState::Active && fresh;
+        match state {
+            MediaProgressState::Queued => "Queued — waiting for worker.".to_owned(),
+            MediaProgressState::QueuedPublication => {
+                "Publication queued — no publication ETA yet.".to_owned()
+            }
+            MediaProgressState::Review => {
+                "Awaiting administrator review — not published.".to_owned()
+            }
+            MediaProgressState::Complete => "Workflow complete.".to_owned(),
+            _ => progress.as_ref().map_or_else(
+                || "Progress telemetry unavailable.".to_owned(),
+                |p| {
+                    let percentage = p
+                        .fraction()
+                        .map(|n| format!("{:.0}%", (n * 100.0).floor()))
+                        .unwrap_or_else(|| "indeterminate".into());
+                    let mut text = format!(
+                        "{} · {} · elapsed {:.0}s",
+                        p.phase, percentage, p.elapsed_seconds
+                    );
+                    if active {
+                        if let Some((rate, eta)) = p.rate_and_eta() {
+                            text.push_str(&format!(
+                                " · {:.1} {}/s · estimated {:.0}s remaining in this phase",
+                                rate,
+                                p.unit,
+                                eta.ceil()
+                            ));
+                        }
+                    } else {
+                        text.push_str(" · last recorded; not live");
+                    }
+                    text
+                },
+            ),
+        }
+    };
+    view! {
+        <section class="media-progress" data-testid="media-progress">
+            <p class="subtle">"Total workflow — stage-based, not elapsed-time weighted"</p>
+            <div class="stage-segments" role="group" aria-label="Total workflow stages">
+                {workflow.stages().iter().zip(fills).map(|(label, fill)| {
+                    let indeterminate = fill.is_none();
+                    let width = format!("width: {}%", fill.unwrap_or(0.0) * 100.0);
+                    let label = *label;
+                    view! {
+                        <div class="stage-segment">
+                            <span class="stage-label">{label}</span>
+                            <div class="stage-track" class:indeterminate=indeterminate
+                                role="progressbar" aria-label=label aria-valuemin="0" aria-valuemax="100"
+                                aria-valuenow=fill.map(|n| format!("{:.0}", n * 100.0))
+                                aria-valuetext=if indeterminate { "Indeterminate" } else { "Stage progress" }>
+                                <span class="stage-fill" style=width></span>
+                            </div>
+                        </div>
+                    }
+                }).collect_view()}
+            </div>
+            <p class="phase-progress" role="status">{message}</p>
+        </section>
+    }
 }
 
 async fn get<T: DeserializeOwned>(path: &str) -> Result<T, String> {
@@ -887,7 +974,7 @@ fn ImportsPanel(
                 }
                 Err(message) => conversion_error.set(Some(message)),
             }
-            gloo_timers::future::TimeoutFuture::new(5000).await;
+            gloo_timers::future::TimeoutFuture::new(1000).await;
         }
     });
 
@@ -994,7 +1081,7 @@ fn ImportsPanel(
                 children=move |id| view! { <ScanSelection id=id csrf=csrf scans=scans probes=jobs/> }/>
             <h2>"Inspection history"</h2>
             {move || probe_error.get().map(|message| view! { <p role="alert" class="error">"Could not refresh inspection jobs: "{message}</p> })}
-            <For each=move || jobs.get() key=|job| (job.id.clone(), job.state)
+            <For each=move || jobs.get() key=|job| (job.id.clone(), job.state, job.progress.as_ref().map(|p| p.updated_at))
                 children=move |job| {
                     let label = match job.state {
                         ProbeState::Queued => "Queued",
@@ -1007,6 +1094,13 @@ fn ImportsPanel(
                         <article class="job" data-testid="probe-job" data-job-id=job.id.clone()>
                             <h3 class="inspection-source">"Source: "{job.name.clone()}</h3>
                             <p class="inspection-state">{label}</p>
+                            <MediaJobProgress workflow=MediaWorkflow::Inspect progress=job.progress.clone()
+                                state=match job.state {
+                                    ProbeState::Queued => MediaProgressState::Queued,
+                                    ProbeState::NeedsReview => MediaProgressState::Complete,
+                                    ProbeState::Failed => MediaProgressState::Failed,
+                                    _ => MediaProgressState::Active,
+                                }/>
                             {inspection_summary(&job)}
                             {(job.state == ProbeState::NeedsReview).then(|| view! {
                                 <ProbeConversion probe_id=job.id.clone() csrf=csrf conversions=conversions/>
@@ -1165,6 +1259,13 @@ fn ScanSelection(
                 view! {
                     <h3 class="inspection-source">"Source: "{scan.name}</h3>
                     <p class="inspection-state" role="status">{label}</p>
+                    <MediaJobProgress workflow=MediaWorkflow::Scan progress=scan.progress
+                        state=match scan.state {
+                            ScanState::Queued => MediaProgressState::Queued,
+                            ScanState::NeedsReview => MediaProgressState::Complete,
+                            ScanState::Failed => MediaProgressState::Failed,
+                            _ => MediaProgressState::Active,
+                        }/>
                     <p class="attempt">"Scan job: "{scan.id}</p>
                     {scan.attempt_id.map(|attempt| view! { <p class="attempt">"Attempt: "{attempt}</p> })}
                     {scan.error.map(|message| view! { <p role="alert" class="error">{message}</p> })}
@@ -1569,6 +1670,15 @@ fn ConversionReview(
                 };
                 view! {
                     <p class="inspection-state" role="status">{state}</p>
+                    <MediaJobProgress workflow=MediaWorkflow::Conversion progress=job.progress
+                        state=match job.state {
+                            ConversionState::Queued => MediaProgressState::Queued,
+                            ConversionState::NeedsReview => MediaProgressState::Review,
+                            ConversionState::QueuedPublication => MediaProgressState::QueuedPublication,
+                            ConversionState::Published => MediaProgressState::Complete,
+                            ConversionState::Failed => MediaProgressState::Failed,
+                            _ => MediaProgressState::Active,
+                        }/>
                     <p class="subtle">"Inspection job: "{job.probe_job_id}
                         " · Video treatment: "{match job.video_treatment {
                             VideoTreatment::Preserve => "Preserve (no deinterlacing filter)",

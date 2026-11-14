@@ -47,6 +47,27 @@ checks and durably registers the package before library eligibility. Preserve
 the original audio/subtitle sidecar and all source ISOs. Failures and
 interruptions retain attempts and never expose unvalidated media.
 
+Live media progress is persisted as observational snapshots on scan, inspection,
+and conversion jobs, coalesced to about one write per second plus a final flush.
+The website polls administrator jobs every second. Labeled, equal-width stage
+segments show completed stages and the current measurable phase; they are not
+a time-weighted completion percentage or an overall remaining-time estimate.
+Bytes copied/hashed and decoded media timestamps support phase percentage,
+elapsed time, average throughput and an estimated phase remainder. Discovery
+and metadata inspection remain indeterminate; validation/publication may contain
+multiple explicitly named phases. Unknown or stalled measurements and stale
+snapshots have no ETA. Current measured fills stop at 99% until the next validated
+stage or authoritative terminal state. Review waits, queued jobs and failed or
+interrupted attempts never masquerade as running work or library readiness.
+Repeated or regressing media timestamps do not refresh the ten-second
+no-advancement limit. Snapshot writes are best-effort: failures retry on later
+ticks with rate-limited warnings, never override authoritative job results, and
+the optional final flush has a one-second deadline after result persistence.
+FFmpeg progress is drained continuously with bounded line buffers, a bounded
+in-memory tail for final validation, and capped progress logs; stderr retains
+its existing strict quota/error checks. Progress never substitutes for source
+identity, content hashes, full decode, publication confirmation or registration.
+
 An authored two-title DVD passes browser scan, inspection, conversion,
 publication, and playback. Full-length real-disc validation, Docker integration,
 and deployment acceptance remain separate gates; a failed retained attempt is

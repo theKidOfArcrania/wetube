@@ -16,6 +16,7 @@ This is a runnable local website preview, not a production TrueNAS deployment:
 - Administrator-selected incoming copies, checksum-verified private staging,
   inspection, explicit conversion, and separate reviewed local-library publication.
 - Preserved original audio/image-subtitle sidecars and retained failed attempts.
+- Live, persisted media-phase progress with labeled stage-based workflow bars.
 
 The library starts empty. The complete production publication protocol, captions,
 TMDB, scheduled backups/restore, and trash are not implemented. Inspection never
@@ -202,10 +203,29 @@ their inputs; children retain the ownership lock until they exit.
 ## Upgrade local state
 
 Stop both services before running `wetube-server init` with this release.
-Initialization upgrades supported older schemas to schema 4 only after a consistent `VACUUM INTO`
+Initialization upgrades supported older schemas (1–4) to schema 5 only after a consistent `VACUUM INTO`
 snapshot is written and synced in a private `pre-upgrade-UUID` directory under
 the state root. Newer/unknown versions fail closed. Repeating initialization
 does not create another snapshot once the upgrade succeeds.
+
+Schema 5 adds nullable progress snapshots to scan, inspection and conversion
+jobs. Stop **both** services, retain the state/media/attempt roots, run the matching
+`wetube-server --state-dir <state-root> init`, then restart the matching server
+and worker with the same roots and rebuilt frontend. Existing jobs have no
+historical telemetry; interrupted jobs still fail closed and retain their last
+observation rather than resuming a clock. Do not initialize a database while
+either old service is running.
+
+Progress bars count workflow stages, not equal amounts of work or remaining
+time. Only measurable current phases show percentage, elapsed, average rate and
+estimated phase remainder. DVD discovery/metadata inspection are indeterminate;
+review waits and stale/failed observations have no live ETA. Publication includes
+separate copy, decode and checksum phases for the movie and preservation assets.
+Current phase fills are capped at 99% until validation advances the stage;
+only durable job state establishes completion/readiness. Progress stdout logs
+retain at most the initial 2 MiB per tool; final validation uses a bounded 2 MiB
+tail while continuing to drain progress, so a long conversion cannot exhaust
+memory or fill scratch with progress logs. Error logs keep their existing quota.
 
 This is a narrow SQLite-only pre-upgrade safeguard, not the design's complete
 daily, off-device, asset-aware backup/restore system. Schema 3 can already
