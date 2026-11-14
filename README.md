@@ -326,6 +326,10 @@ either old service is running.
 Media readiness shows one latest check with its completion time (or explicitly
 labeled request time while pending/unavailable), expandable individual capabilities,
 and collapsed Previous checks. Active imports retain labeled progress.
+Readiness, import/history and metadata expiry dates use the viewing browser's
+locale and time zone, including the UTC offset at that instant. API/database
+timestamps, machine-readable dates and raw JSON reports retain their canonical
+UTC/epoch values; media positions and elapsed durations are unchanged.
 Failures and pending decisions stay in compact attention rows with errors
 visible until acknowledged by **Archive to History**. Active jobs and genuinely
 pending title/treatment/publication decisions cannot be archived or restored.

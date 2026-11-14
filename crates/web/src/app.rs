@@ -558,19 +558,45 @@ fn MetadataRefresh(
         });
     };
     view! {
-        <p class="subtle">{format!("TMDB metadata expires: {}. Local playback remains available.", expires.map(checked_time).unwrap_or_default())}</p>
+        <p class="subtle">{format!("TMDB metadata expires: {}. Local playback remains available.", expires.map(local_time).unwrap_or_default())}</p>
         <button class="secondary" disabled=move || busy.get() on:click=refresh>"Refresh TMDB metadata"</button>
         {move || message.get().map(|message| view! { <p role="alert">{message}</p> })}
     }
 }
 
-fn checked_time(seconds: i64) -> String {
-    js_sys::Date::new(&js_sys::wasm_bindgen::JsValue::from_f64(
+fn timestamp_date(seconds: i64) -> Option<js_sys::Date> {
+    let date = js_sys::Date::new(&js_sys::wasm_bindgen::JsValue::from_f64(
         seconds as f64 * 1000.0,
-    ))
-    .to_iso_string()
-    .as_string()
-    .unwrap_or_default()
+    ));
+    date.get_time().is_finite().then_some(date)
+}
+
+fn local_time(seconds: i64) -> String {
+    thread_local! {
+        static FORMATTER: js_sys::Intl::DateTimeFormat = {
+            let options = js_sys::Object::new();
+            for (key, value) in [
+                ("year", "numeric"), ("month", "short"), ("day", "numeric"),
+                ("hour", "numeric"), ("minute", "2-digit"), ("second", "2-digit"),
+                ("timeZoneName", "longOffset"),
+            ] {
+                js_sys::Reflect::set(&options, &key.into(), &value.into())
+                    .expect("date format option");
+            }
+            js_sys::Intl::DateTimeFormat::new(&js_sys::Array::new(), &options)
+        };
+    }
+    let Some(date) = timestamp_date(seconds) else {
+        return "Unknown time".into();
+    };
+    FORMATTER.with(|formatter| {
+        formatter
+            .format()
+            .call1(&js_sys::wasm_bindgen::JsValue::UNDEFINED, &date)
+            .ok()
+            .and_then(|value| value.as_string())
+            .unwrap_or_else(|| date.to_string().into())
+    })
 }
 
 #[component]
@@ -596,13 +622,15 @@ fn ReadinessCheck(id: String, jobs: RwSignal<Vec<DiagnosticJob>>, latest: bool) 
     };
     let timestamp = move || {
         job.get()
-            .map(|job| checked_time(job.finished_at.unwrap_or(job.created_at)))
+            .map(|job| job.finished_at.unwrap_or(job.created_at))
     };
     view! {
         <div data-testid=if latest { "latest-readiness" } else { "previous-readiness" }>
             <p><strong>{label}</strong>" · "
                 {move || if job.get().is_some_and(|job| job.finished_at.is_some()) { "Last checked: " } else { "Requested: " }}
-                <time datetime=timestamp>{timestamp}</time>
+                <time datetime=move || timestamp().and_then(timestamp_date).map(|date| String::from(date.to_iso_string()))>
+                    {move || timestamp().map(local_time)}
+                </time>
             </p>
             {move || job.get().and_then(|job| job.error).map(|message| view! { <p role="alert" class="error">{message}</p> })}
             <details>
@@ -1394,7 +1422,7 @@ fn import_label(entry: &ImportEntry) -> String {
             job.created_at,
         ),
     };
-    format!("{label} · {state} · {}", checked_time(created))
+    format!("{label} · {state} · {}", local_time(created))
 }
 
 #[component]

@@ -886,6 +886,99 @@ test('midpoint preview progress polls measured and indeterminate phases without 
   await expect(preview).not.toContainText(/NaN|Infinity/);
 });
 
+for (const profile of [
+  {
+    timezoneId: 'America/Los_Angeles', locale: 'en-US',
+    times: [
+      /Mar 7, 2026, 11:30:00 PM GMT-08:00/,
+      /Mar 8, 2026, 1:30:00 AM GMT-08:00/,
+      /Mar 8, 2026, 3:30:00 AM GMT-07:00/,
+    ],
+  },
+  {
+    timezoneId: 'Asia/Tokyo', locale: 'en-GB',
+    times: [
+      /8 Mar 2026, 16:30:00 GMT\+09:00/,
+      /8 Mar 2026, 18:30:00 GMT\+09:00/,
+      /8 Mar 2026, 19:30:00 GMT\+09:00/,
+    ],
+  },
+]) {
+  test(`local timestamps follow browser timezone and locale (${profile.timezoneId})`, async ({ browser }) => {
+    const context = await browser.newContext({ timezoneId: profile.timezoneId, locale: profile.locale });
+    const page = await context.newPage();
+    const instants = ['2026-03-08T07:30:00.000Z', '2026-03-08T09:30:00.000Z', '2026-03-08T10:30:00.000Z'];
+    const seconds = instants.map(instant => Date.parse(instant) / 1000);
+    const diagnostics = seconds.map((timestamp, index) => ({
+      id: randomUUID(), state: index === 0 ? 'queued' : 'failed', created_at: timestamp - (index ? 10 : 0),
+      finished_at: index === 0 ? null : timestamp, error: null, report: null,
+    }));
+    diagnostics.push({ id: randomUUID(), state: 'queued', created_at: 8_640_000_000_001,
+      finished_at: null, error: null, report: null });
+    const probe = {
+      id: randomUUID(), name: 'Local dates.iso', title: 1, angle: 1, state: 'failed',
+      created_at: seconds[2], attempt_id: null, error: null, progress: null,
+      report: { fetched_at: seconds[2], inspection: { metadata: { format: { duration: '73.5' } } } },
+    };
+    const entries = [
+      { item: { kind: 'scan', job: {
+        id: randomUUID(), name: 'Local dates.iso', state: 'failed', created_at: seconds[1],
+        attempt_id: null, report: null, error: null, progress: null,
+      } }, can_archive: true, history: false },
+      { item: { kind: 'probe', job: probe }, can_archive: true, history: false },
+      { item: { kind: 'conversion', job: {
+        id: randomUUID(), probe_job_id: probe.id, state: 'published', created_at: seconds[0],
+        attempt_id: null, video_treatment: 'preserve', phase: null, report: null,
+        error: null, movie_id: null, movie_sha256: null, progress: null,
+      } }, can_archive: true, history: true },
+    ];
+    try {
+      await page.route('**/api/v1/jobs', route => route.fulfill({ json: diagnostics }));
+      await page.route('**/api/v1/movies', route => route.fulfill({ json: { movies: [{
+        id: movieId, title, year: null, description: '', tmdb_id: 7, metadata_expires_at: seconds[0],
+      }] } }));
+      await page.route('**/api/v1/admin/imports?*', route => {
+        const history = new URL(route.request().url()).searchParams.get('history') === 'true';
+        const selected = entries.filter(entry => entry.history === history);
+        return route.fulfill({ json: { entries: selected, total: selected.length, history_count: 1 } });
+      });
+      const jobsResponse = page.waitForResponse(response => response.url().endsWith('/api/v1/jobs'));
+      await login(page, 'e2e-admin');
+      expect(await (await jobsResponse).json()).toEqual(diagnostics);
+      const latest = page.getByTestId('latest-readiness');
+      await expect(latest).toContainText('Requested:');
+      await expect(latest.locator('time')).toHaveText(profile.times[0]);
+      await expect(latest.locator('time')).toHaveAttribute('datetime', instants[0]);
+      const previous = page.getByTestId('previous-checks');
+      await previous.locator(':scope > summary').click();
+      for (const index of [1, 2]) {
+        const check = previous.getByTestId('previous-readiness').nth(index - 1);
+        await expect(check).toContainText('Last checked:');
+        await expect(check.locator('time')).toHaveText(profile.times[index]);
+        await expect(check.locator('time')).toHaveAttribute('datetime', instants[index]);
+      }
+      const invalid = previous.getByTestId('previous-readiness').last().locator('time');
+      await expect(invalid).toHaveText('Unknown time');
+      await expect(invalid).not.toHaveAttribute('datetime');
+      await expect(page.getByText(/^TMDB metadata expires:/)).toContainText(profile.times[0]);
+      for (const [index, entry] of entries.slice(0, 2).entries()) {
+        await expect(page.locator(`[data-testid="attention-row"][data-job-id="${entry.item.job.id}"]`)
+          .locator('summary').first()).toContainText(profile.times[index + 1]);
+      }
+      const history = page.getByTestId('import-history');
+      await history.locator(':scope > summary').click();
+      await expect(history.getByTestId('history-row').locator('summary').first()).toContainText(profile.times[0]);
+      await expandImport(page, probe.id);
+      const probeCard = page.locator(`[data-testid="probe-job"][data-job-id="${probe.id}"]`);
+      await expect(probeCard).toContainText('About 1 min (73.5 s)');
+      await probeCard.getByText('Inspection details (JSON)', { exact: true }).click();
+      expect(JSON.parse(await probeCard.locator('pre').innerText())).toEqual(probe.report);
+    } finally {
+      await context.close();
+    }
+  });
+}
+
 test('compact latest readiness, attention disclosures and demand-loaded older history', async ({ page }) => {
   const timestamp = Math.floor(Date.now() / 1000);
   const readyReport = { tools: ['ffmpeg', 'ffprobe', 'dvdvideo', 'DVD discovery'].map(name => ({
