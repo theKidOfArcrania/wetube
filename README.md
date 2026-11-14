@@ -60,7 +60,7 @@ Unlinked movies do not offer genre lookup; first select TMDB metadata during
 publication review.
 
 Schema 10 adds a shared label catalog and cascading movie assignments. Offline
-`init` upgrades schemas 1–9 after a SQLite-only snapshot; stop both services and
+`init` upgrades schemas 1–10 after a SQLite-only snapshot; stop both services and
 retain their separate media/attempt roots. No media or existing movie metadata
 is changed by this migration.
 
@@ -104,11 +104,28 @@ the worker, and checked again at publication registration. Expired queued metada
 returns to review; an already-publishing expired job fails closed. Provider text
 is removed from successful publication records. Movie assets and playback are
 never removed or made dependent on TMDB. An administrator can explicitly use
-**Refresh TMDB metadata** in the library, including after expiry; refresh replaces
+**Refresh TMDB metadata and poster** in the library, including after expiry; refresh replaces
 the overlay from TMDB and may replace earlier edits. Refresh failure preserves
 the current cache only until its original expiry. There is no automatic refresh.
 
-The operator is responsible for expiring cached provider metadata in **offline
+Linked publication automatically attempts to cache a TMDB poster. The same
+explicit refresh button fetches posters for existing linked movies; no bulk
+refresh or custom uploads are required. Poster failure never blocks publication,
+metadata refresh or playback. Missing, disabled, unavailable or expired artwork
+uses a generic local placeholder. Library thumbnails and player icons use the
+same image, not generated video stills.
+
+Schema 11 adds a private SQLite poster cache shared by TMDB movie ID. The server
+fetches only strictly validated poster paths from the fixed HTTPS image CDN at
+size `w342`, without the API bearer token. JPEG/PNG bytes, decoded dimensions,
+response sizes, concurrency and request duration are bounded; redirects are
+rejected. Browsers request only the authenticated same-origin poster endpoint
+(`no-store`, `nosniff`), never TMDB directly. Reads do not fetch or extend expiry.
+Poster bytes expire 150 days after acquisition and are purged by the existing
+retention sweep; expired metadata also prevents artwork reads. Shared images
+do not belong exclusively to any one movie.
+
+The operator is responsible for expiring cached provider metadata and posters in **offline
 databases, pre-upgrade snapshots and backups**, and for retention while services
 are stopped; online cleanup cannot reach those copies. Delete or sanitize expired
 copies before restoring/using them. Run matching `init` offline for schema upgrades
@@ -342,14 +359,15 @@ their inputs; children retain the ownership lock until they exit.
 ## Upgrade local state
 
 Stop both services before running `wetube-server init` with this release.
-Initialization upgrades supported older schemas (1–9) to schema 10 only after a consistent `VACUUM INTO`
+Initialization upgrades supported older schemas (1–10) to schema 11 only after a consistent `VACUUM INTO`
 snapshot is written and synced in a private `pre-upgrade-UUID` directory under
 the state root. Newer/unknown versions fail closed. Repeating initialization
 does not create another snapshot once the upgrade succeeds.
 
 Schema 6 adds per-user import archive preferences, lifecycle view and indexes;
 schema 7 adds private comparisons, schema 8 adds their nullable progress,
-schema 9 adds expiring TMDB overlays, and schema 10 adds movie labels.
+schema 9 adds expiring TMDB overlays, schema 10 adds movie labels, and schema 11
+adds the bounded private poster cache.
 Existing jobs, reports, media, attempts and earlier progress snapshots are retained.
 Stop **both** services, retain the state/media/attempt roots, run the matching
 `wetube-server --state-dir <state-root> init`, then restart the matching server

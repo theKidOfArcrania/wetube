@@ -34,6 +34,7 @@ use wetube_core::{
 pub mod admission;
 mod labels;
 pub mod metadata;
+mod posters;
 
 const COOKIE_NAME: &str = "wetube_session";
 const SESSION_SECONDS: i64 = 7 * 24 * 60 * 60;
@@ -176,6 +177,7 @@ pub async fn router_with_conversions(
             post(metadata::genres),
         )
         .route("/movies/{id}", get(movie_details))
+        .route("/movies/{id}/poster", get(posters::read))
         .route("/movies/{id}/video", get(video).head(video))
         .route(
             "/movies/{id}/progress",
@@ -459,12 +461,14 @@ async fn movies(
         "SELECT m.id,COALESCE(t.title,m.title) title,
          CASE WHEN t.title IS NOT NULL THEN t.year ELSE m.year END year,
          COALESCE(t.description,m.description) description,
-         s.tmdb_id,s.expires_at metadata_expires_at
+         s.tmdb_id,s.expires_at metadata_expires_at,a.expires_at poster_expires_at
          FROM movies m LEFT JOIN tmdb_metadata s ON s.movie_id=m.id
          LEFT JOIN tmdb_metadata t ON t.movie_id=m.id AND t.expires_at>?
+         LEFT JOIN tmdb_posters a ON a.tmdb_id=t.tmdb_id AND a.expires_at>?
          WHERE m.status = 'ready'
          ORDER BY title COLLATE NOCASE",
     )
+    .bind(now())
     .bind(now())
     .fetch_all(&state.pool)
     .await
@@ -485,6 +489,7 @@ async fn movies(
                     description: row.get("description"),
                     tmdb_id: row.get("tmdb_id"),
                     metadata_expires_at: row.get("metadata_expires_at"),
+                    poster_expires_at: row.get("poster_expires_at"),
                     categories: labels.categories,
                     tags: labels.tags,
                 }
@@ -505,13 +510,14 @@ async fn preview(state: &AppState, id: &str) -> Result<ReadyPreview, HttpError> 
     let row = sqlx::query(
         "SELECT m.id,COALESCE(t.title,m.title) title,
          CASE WHEN t.title IS NOT NULL THEN t.year ELSE m.year END year,
-         COALESCE(t.description,m.description) description,s.tmdb_id,s.expires_at metadata_expires_at,
+         COALESCE(t.description,m.description) description,s.tmdb_id,s.expires_at metadata_expires_at,a.expires_at poster_expires_at,
          p.package_id,p.size_bytes,p.duration_seconds,p.file_identity
          FROM movies m JOIN preview_media p ON p.movie_id=m.id
          LEFT JOIN tmdb_metadata s ON s.movie_id=m.id
          LEFT JOIN tmdb_metadata t ON t.movie_id=m.id AND t.expires_at>?
+         LEFT JOIN tmdb_posters a ON a.tmdb_id=t.tmdb_id AND a.expires_at>?
          WHERE m.id=? AND m.status='ready'",
-    ).bind(now()).bind(id).fetch_optional(&state.pool).await.map_err(internal)?
+    ).bind(now()).bind(now()).bind(id).fetch_optional(&state.pool).await.map_err(internal)?
         .ok_or_else(|| HttpError(StatusCode::NOT_FOUND, "Movie is not available for local preview".into()))?;
     let labels = wetube_backend::labels::for_movie(&state.pool, id)
         .await
@@ -525,6 +531,7 @@ async fn preview(state: &AppState, id: &str) -> Result<ReadyPreview, HttpError> 
                 description: row.get("description"),
                 tmdb_id: row.get("tmdb_id"),
                 metadata_expires_at: row.get("metadata_expires_at"),
+                poster_expires_at: row.get("poster_expires_at"),
                 categories: labels.categories,
                 tags: labels.tags,
             },
@@ -968,6 +975,7 @@ async fn queue_conversion(
 async fn queue_publication(
     State(state): State<AppState>,
     RoutePath(id): RoutePath<String>,
+    provider: Option<axum::Extension<metadata::Tmdb>>,
     headers: HeaderMap,
     Json(request): Json<PublishRequest>,
 ) -> Result<(StatusCode, Json<ConversionJob>), HttpError> {
@@ -1014,6 +1022,10 @@ async fn queue_publication(
         }
     })?
         .ok_or_else(||HttpError(StatusCode::CONFLICT,"Publication requires an unpublished successful conversion and its exact validated hash".into()))?;
+    if let (Some(axum::Extension(client)), Some(source)) = (provider, &request.tmdb) {
+        // Artwork is optional and cannot change the accepted publication.
+        let _ = posters::acquire(&client, &state.pool, source.id, None).await;
+    }
     Ok((StatusCode::ACCEPTED, Json(job)))
 }
 

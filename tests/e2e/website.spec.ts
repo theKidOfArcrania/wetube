@@ -988,7 +988,7 @@ test('TMDB refresh is explicit and survives library polling without blocking loc
     } });
   });
   await login(page, 'e2e-admin');
-  const refresh = page.getByRole('button', { name: 'Refresh TMDB metadata', exact: true });
+  const refresh = page.getByRole('button', { name: 'Refresh TMDB metadata and poster', exact: true });
   await expect(page.getByRole('heading', { name: 'source.iso', exact: true })).toBeVisible();
   await expect(page.getByRole('button', { name: 'Watch source.iso', exact: true })).toBeEnabled();
   expect(requests).toBe(0);
@@ -1003,6 +1003,68 @@ test('TMDB refresh is explicit and survives library polling without blocking loc
   await expect(page.getByRole('heading', { name: 'Refreshed title', exact: true })).toBeVisible();
   await expect(page.getByRole('button', { name: 'Watch Refreshed title', exact: true })).toBeEnabled();
   expect(requests).toBe(2);
+});
+
+test('movie posters use private artwork with generic fallback, explicit refresh and matching player icons', async ({ page }) => {
+  const movie = {
+    id: movieId, title, year: null, description: 'Poster browser fixture',
+    tmdb_id: 7, metadata_expires_at: Math.floor(Date.now() / 1000) + 3600,
+    poster_expires_at: (Math.floor(Date.now() / 1000) + 3600) as number | null,
+    categories: [], tags: [],
+  };
+  let refreshed = false;
+  let refreshes = 0;
+  const imageRequests: string[] = [];
+  const externalRequests: string[] = [];
+  page.on('request', request => {
+    if (new URL(request.url()).origin !== baseURL) externalRequests.push(request.url());
+  });
+  await page.route('**/api/v1/movies', route => route.fulfill({ json: { movies: [movie] } }));
+  await page.route(`**/api/v1/movies/${movieId}/poster?*`, route => {
+    imageRequests.push(route.request().url());
+    return refreshed
+      ? route.fulfill({
+        contentType: 'image/png',
+        body: Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a23sAAAAASUVORK5CYII=', 'base64'),
+        headers: { 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' },
+      })
+      : route.fulfill({ status: 404, body: '' });
+  });
+  await page.route(`**/api/v1/admin/movies/${movieId}/metadata/refresh`, route => {
+    expect(route.request().method()).toBe('POST');
+    expect(route.request().headers()['x-csrf-token']).toBeTruthy();
+    refreshes++;
+    refreshed = true;
+    return route.fulfill({ json: {
+      id: 7, title, year: null, description: movie.description, fetched_at: Math.floor(Date.now() / 1000),
+    } });
+  });
+  await login(page, 'e2e-admin');
+  const card = page.locator('article.movie').filter({ has: page.getByRole('heading', { name: title, exact: true }) });
+  await expect(card.getByRole('img', { name: 'No poster available', exact: true })).toBeVisible();
+  await expect.poll(() => imageRequests.length).toBe(1);
+  expect(refreshes).toBe(0);
+  await card.getByRole('button', { name: 'Refresh TMDB metadata and poster', exact: true }).click();
+  const poster = card.getByRole('img', { name: `Poster for ${title}`, exact: true });
+  await expect(poster).toBeVisible();
+  await expect.poll(() => poster.evaluate(image => (image as HTMLImageElement).naturalWidth)).toBe(1);
+  await expect(card.getByRole('img', { name: 'No poster available', exact: true })).toHaveCount(0);
+  const source = await poster.getAttribute('src');
+  await card.getByRole('button', { name: `Watch ${title}`, exact: true }).click();
+  const pane = page.getByRole('region', { name: `Watch ${title}`, exact: true });
+  const icon = pane.getByRole('img', { name: `Poster for ${title}`, exact: true });
+  await expect(icon).toHaveAttribute('src', source!);
+  await expect(pane.locator('.movie-icon')).toHaveCSS('width', '48px');
+  await expect(page.getByTestId('movie-player')).toBeVisible();
+  await pane.getByRole('button', { name: 'Back to library', exact: true }).click();
+  movie.poster_expires_at = null;
+  await expect(card.getByRole('img', { name: 'No poster available', exact: true })).toBeVisible();
+  const cachedReads = imageRequests.length;
+  movie.poster_expires_at = Math.floor(Date.now() / 1000) + 3600;
+  await expect(card.getByRole('img', { name: `Poster for ${title}`, exact: true })).toBeVisible();
+  await expect.poll(() => imageRequests.length).toBeGreaterThan(cachedReads);
+  expect(refreshes).toBe(1);
+  expect(externalRequests).toEqual([]);
 });
 
 test('live media progress renders measurable, indeterminate, queued, review, failed and terminal stages honestly', async ({ page }) => {

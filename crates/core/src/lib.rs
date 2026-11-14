@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use unicode_normalization::UnicodeNormalization;
 
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
-pub const SCHEMA_VERSION: i64 = 10;
+pub const SCHEMA_VERSION: i64 = 11;
 pub const TMDB_SELECTION_EXPIRED: &str = "TMDB selection expired; search again before publication";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -215,6 +215,8 @@ pub struct Movie {
     pub tmdb_id: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata_expires_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub poster_expires_at: Option<i64>,
     #[serde(default)]
     pub categories: Vec<String>,
     #[serde(default)]

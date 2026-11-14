@@ -93,3 +93,10 @@ pre { max-height: 32rem; overflow: auto; white-space: pre-wrap; overflow-wrap: a
 .stage-track.indeterminate { background: repeating-linear-gradient(110deg, #39404b, #39404b 8px, #657382 8px, #657382 16px); }
 .phase-progress { font-size: .85rem; overflow-wrap: anywhere; }
 .media-progress { margin: 1rem 0; }
+.movie-artwork { position: relative; width: 100%; max-width: 171px; aspect-ratio: 2 / 3; background: #243142; border-radius: .4rem; overflow: hidden; margin-block: .75rem; }
+.movie-artwork img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; background: #243142; }
+.movie-artwork img[hidden] { display: none; }
+.generic-artwork { display: grid; place-items: center; height: 100%; font-size: 3rem; color: #b6c4d6; }
+.generic-artwork[hidden] { display: none; }
+.movie-icon { width: 48px; }
+.movie-icon .generic-artwork { font-size: 1.5rem; }

@@ -23,6 +23,9 @@ pub struct Tmdb {
     base: String,
     slots: Arc<Semaphore>,
     rate: Arc<Mutex<(Instant, usize)>>,
+    pub(crate) images: reqwest::Client,
+    pub(crate) image_base: String,
+    pub(crate) poster_slots: Arc<Semaphore>,
 }
 
 impl Tmdb {
@@ -49,7 +52,7 @@ impl Tmdb {
         Self::new(token.trim(), "https://api.themoviedb.org/3")
     }
 
-    fn new(token: &str, base: &str) -> anyhow::Result<Self> {
+    pub(crate) fn new(token: &str, base: &str) -> anyhow::Result<Self> {
         anyhow::ensure!(
             !token.is_empty() && token.bytes().all(|b| b.is_ascii_graphic()),
             "Invalid TMDB token file"
@@ -71,10 +74,21 @@ impl Tmdb {
             base: base.to_owned(),
             slots: Arc::new(Semaphore::new(2)),
             rate: Arc::new(Mutex::new((Instant::now(), 0))),
+            images: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .connect_timeout(Duration::from_secs(2))
+                .timeout(Duration::from_secs(4))
+                .build()?,
+            image_base: "https://image.tmdb.org/t/p/w342".into(),
+            poster_slots: Arc::new(Semaphore::new(2)),
         })
     }
 
-    async fn fetch(&self, path: &str, parameters: &[(&str, String)]) -> Result<Value, HttpError> {
+    pub(crate) async fn fetch(
+        &self,
+        path: &str,
+        parameters: &[(&str, String)],
+    ) -> Result<Value, HttpError> {
         let _slot = self.slots.try_acquire().map_err(|_| limited())?;
         {
             let mut rate = self.rate.lock().map_err(|_| unavailable())?;
@@ -252,6 +266,7 @@ pub(crate) async fn refresh(
         .await
         .map_err(internal)?;
     transaction.commit().await.map_err(internal)?;
+    let _ = crate::posters::acquire(&client, &state.pool, tmdb_id, Some(&value)).await;
     Ok(Json(metadata))
 }
 

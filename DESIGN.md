@@ -28,6 +28,28 @@ GETs never invoke TMDB. About / Credits bundles the approved logo and current
 reviewed attribution notice locally. Operators own retention of offline databases,
 snapshots/backups and current terms compliance; implementation is not legal approval.
 
+### Movie posters (implemented locally)
+
+Schema 11 stores one bounded validated JPEG/PNG BLOB per TMDB movie ID in private
+SQLite, shared by linked movies. Accepted explicit linked publication attempts
+poster acquisition within a six-second budget; explicit metadata refresh reuses
+its provider response and attempts the poster within the same bounded budget.
+Optional artwork failure cannot undo publication or metadata refresh.
+There are no detached tasks, retries, video stills or uploads. The fixed `w342`
+HTTPS image CDN has a separate unauthenticated client with redirects disabled;
+the bearer token stays on the fixed TMDB API client. Two poster operations may
+run concurrently, under the existing API rate bound.
+
+Authenticated same-origin image reads join the ready movie's current metadata
+association and check both expiries. Reads never contact providers or renew
+retention. Responses are `no-store` and `nosniff`; only decoded and bounded
+JPEG/PNG responses are stored. The existing sweeper deletes artwork after 150
+days. Library responses expose only currently available poster expiry, so normal
+local polling picks up acquisition that finishes after publication, and removes
+expired artwork without any provider requests. Library thumbnails and small
+player icons use the same artwork with a generic local fallback. Future deletion must preserve shared poster entries
+while another movie still references the TMDB ID.
+
 ### Movie categories and tags (implemented locally)
 
 Schema 10 adds a shared catalog keyed by label kind and an NFC-normalized,

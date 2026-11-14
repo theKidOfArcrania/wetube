@@ -54,6 +54,10 @@ pub async fn store(
 }
 
 pub async fn expire(pool: &SqlitePool, now: i64) -> Result<()> {
+    sqlx::query("DELETE FROM tmdb_posters WHERE expires_at<=?")
+        .bind(now)
+        .execute(pool)
+        .await?;
     sqlx::query(
         "UPDATE tmdb_metadata SET title=NULL,year=NULL,description=NULL
          WHERE expires_at<=? AND title IS NOT NULL",

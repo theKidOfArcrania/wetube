@@ -564,14 +564,16 @@ fn LibraryPage(current: Session, session: RwSignal<Option<Session>>) -> impl Int
             </Show>
                     <div class="grid">
                         <For each=move || filtered.get()
-                            key=|movie| (movie.id.clone(), movie.title.clone(), movie.year, movie.description.clone(), movie.metadata_expires_at)
+                            key=|movie| (movie.id.clone(), movie.title.clone(), movie.year, movie.description.clone(), movie.metadata_expires_at, movie.poster_expires_at)
                             children=move |movie| {
                             let watch_label = format!("Watch {}", movie.title);
                             let chosen = movie.clone();
                             let label_id = movie.id.clone();
                             let edit_id = movie.id.clone();
+                            let poster_retry = RwSignal::new(0_u64);
                             view! {
                             <article class="movie">
+                                <MovieArtwork movie=movie.clone() retry=poster_retry/>
                                 <h2>{movie.title}</h2>
                                 <small>{movie.year.map(|year| year.to_string())}</small>
                                 <p>{movie.description}</p>
@@ -596,7 +598,7 @@ fn LibraryPage(current: Session, session: RwSignal<Option<Session>>) -> impl Int
                                 }
                                     disabled=move || signing_out.get()>{watch_label}</button>
                                 {if is_admin && movie.tmdb_id.is_some() {
-                                    Some(view! { <MetadataRefresh movie_id=movie.id expires=movie.metadata_expires_at csrf=csrf movies=movies/> })
+                                    Some(view! { <MetadataRefresh movie_id=movie.id expires=movie.metadata_expires_at csrf=csrf movies=movies poster_retry=poster_retry/> })
                                 } else { None }}
                             </article>
                         }}/>
@@ -639,6 +641,40 @@ fn LibraryPage(current: Session, session: RwSignal<Option<Session>>) -> impl Int
                 <ImportsPanel csrf=csrf movies=movies watch_movie=watch_movie/>
             </Show>
         })}
+    }
+}
+
+#[component]
+fn MovieArtwork(
+    movie: Movie,
+    #[prop(default = false)] icon: bool,
+    #[prop(default = RwSignal::new(0_u64))] retry: RwSignal<u64>,
+) -> impl IntoView {
+    let failed = RwSignal::new(false);
+    let loaded = RwSignal::new(false);
+    let available = movie.tmdb_id.is_some() && movie.poster_expires_at.is_some();
+    let source = format!(
+        "/api/v1/movies/{}/poster?v={}",
+        js_sys::encode_uri_component(&movie.id),
+        movie.poster_expires_at.unwrap_or_default()
+    );
+    view! {
+        <div class=if icon { "movie-artwork movie-icon" } else { "movie-artwork" }>
+            <span class="generic-artwork" role="img" aria-label="No poster available"
+                hidden=move || loaded.get() && !failed.get()>"▧"</span>
+            <For each=move || if available { vec![retry.get()] } else { Vec::new() }
+                key=|revision| *revision
+                children=move |_| {
+                    failed.set(false);
+                    loaded.set(false);
+                    view! {
+                        <img src=source.clone() alt=format!("Poster for {}", movie.title)
+                            loading="lazy" decoding="async" hidden=move || failed.get()
+                            on:load=move |_| loaded.set(true)
+                            on:error=move |_| failed.set(true)/>
+                    }
+                }/>
+        </div>
     }
 }
 
@@ -912,6 +948,7 @@ fn MetadataRefresh(
     expires: Option<i64>,
     csrf: StoredValue<String>,
     movies: RwSignal<Vec<Movie>>,
+    poster_retry: RwSignal<u64>,
 ) -> impl IntoView {
     let scope = admin_scope();
     let library_revision = expect_context::<LibraryRevision>().0;
@@ -935,6 +972,7 @@ fn MetadataRefresh(
             }
             match result {
                 Ok(_) => {
+                    poster_retry.update(|revision| *revision += 1);
                     let revision = library_revision.get_untracked();
                     match admin_get::<Library>(scope, "/api/v1/movies").await {
                         Ok(library) if library_revision.try_get_untracked() == Some(revision) => {
@@ -952,7 +990,7 @@ fn MetadataRefresh(
     };
     view! {
         <p class="subtle">{format!("TMDB metadata expires: {}. Local playback remains available.", expires.map(local_time).unwrap_or_default())}</p>
-        <button class="secondary" disabled=move || busy.get() on:click=refresh>"Refresh TMDB metadata"</button>
+        <button class="secondary" disabled=move || busy.get() on:click=refresh>"Refresh TMDB metadata and poster"</button>
         {move || message.get().map(|message| view! { <p role="alert">{message}</p> })}
     }
 }
@@ -1360,6 +1398,7 @@ fn MoviePlayer(
     view! {
         <section class="panel player-pane" aria-label=pane_label>
             <button class="secondary" on:click=back>"Back to library"</button>
+            <MovieArtwork movie=movie.clone() icon=true/>
             <h2>{movie.title}</h2>
             <small>{movie.year.map(|year| year.to_string())}</small>
             <p class="subtle">{movie.description}</p>
