@@ -540,6 +540,20 @@ async fn media_pipeline(
     if matches!(options.video_treatment, VideoTreatment::Yadif) {
         encode.args(["-vf", wetube_core::YADIF_FILTER]);
     }
+    // FFmpeg emits dangling QuickTime references when every chapter lacks a title.
+    if let Some(chapters) = source["chapters"].as_array() {
+        for (index, chapter) in chapters.iter().enumerate() {
+            if chapter["tags"]["title"]
+                .as_str()
+                .is_none_or(|title| title.trim().is_empty())
+            {
+                encode.args([
+                    format!("-metadata:c:{index}"),
+                    format!("title=Chapter {}", index + 1),
+                ]);
+            }
+        }
+    }
     encode.args(["-f", "mp4", &descriptor(&movie)]);
     if let Some(tracks) = &tracks {
         encode.args([
@@ -1357,19 +1371,28 @@ mod tests {
     #[tokio::test]
     async fn synthetic_media_runs_full_decode_encode_and_validation() -> Result<()> {
         for reject_progress in [false, true] {
-            synthetic_media_case(reject_progress).await?;
+            synthetic_media_case(reject_progress, false).await?;
         }
         Ok(())
     }
 
-    async fn synthetic_media_case(reject_progress: bool) -> Result<()> {
+    #[tokio::test]
+    async fn untitled_chapters_survive_conversion_and_publication() -> Result<()> {
+        synthetic_media_case(false, true).await
+    }
+
+    async fn synthetic_media_case(reject_progress: bool, untitled_chapters: bool) -> Result<()> {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("fixture.mkv");
         let chapters = dir.path().join("chapters.ffmetadata");
         let captions = dir.path().join("captions.srt");
         std::fs::write(
             &chapters,
-            ";FFMETADATA1\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=0\nEND=800\ntitle=Opening\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=800\nEND=1600\ntitle=Ending\n",
+            if untitled_chapters {
+                ";FFMETADATA1\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=0\nEND=800\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=800\nEND=1600\n"
+            } else {
+                ";FFMETADATA1\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=0\nEND=800\ntitle=Opening\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=800\nEND=1600\ntitle=Ending\n"
+            },
         )?;
         std::fs::write(
             &captions,
@@ -1513,6 +1536,19 @@ mod tests {
         assert_eq!(validation["source_decoded_frames"], 50);
         assert_eq!(validation["output_decoded_frames"], 50);
         assert_eq!(validation["movie"]["chapters"].as_array().unwrap().len(), 2);
+        let expected_titles = if untitled_chapters {
+            ["Chapter 1", "Chapter 2"]
+        } else {
+            ["Opening", "Ending"]
+        };
+        for (chapter, title) in validation["movie"]["chapters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .zip(expected_titles)
+        {
+            assert_eq!(chapter["tags"]["title"], title);
+        }
         assert_eq!(
             validation["original_tracks"]["chapters"]
                 .as_array()
