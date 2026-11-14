@@ -299,9 +299,49 @@ test('authenticated media requests support byte ranges and reject missing sessio
   expect(invalid.status()).toBe(416);
 });
 
+test('movie Trash hides new playback, preserves active ranged playback and restores the library', async ({ page, browser }) => {
+  await login(page, 'e2e-admin');
+  const viewer = await browser.newPage();
+  try {
+    await login(viewer, 'e2e-viewer');
+    await expect(viewer.getByRole('button', { name: 'Move to Trash', exact: true })).toHaveCount(0);
+    await viewer.getByRole('button', { name: `Watch ${title}`, exact: true }).click();
+    const video = viewer.getByTestId('movie-player');
+    await expect.poll(() => video.evaluate((element: HTMLVideoElement) => element.readyState)).toBeGreaterThanOrEqual(1);
+    const activeURL = await video.getAttribute('src');
+    expect(activeURL).toContain('?playback=');
+    await page.getByRole('button', { name: 'Move to Trash', exact: true }).click();
+    await expect(page.getByText('Remove from the library?', { exact: false })).toBeVisible();
+    await page.getByRole('button', { name: 'Cancel', exact: true }).click();
+    await expect(page.getByRole('button', { name: `Watch ${title}`, exact: true })).toBeVisible();
+    await page.getByRole('button', { name: 'Move to Trash', exact: true }).click();
+    await page.getByRole('button', { name: 'Confirm move to Trash', exact: true }).click();
+    await expect(page.getByRole('button', { name: `Watch ${title}`, exact: true })).toHaveCount(0);
+    expect((await viewer.request.get(`${baseURL}/api/v1/movies/${movieId}`)).status()).toBe(404);
+    expect((await viewer.request.get(`${baseURL}/api/v1/movies/${movieId}/video`)).status()).toBe(404);
+    const active = await viewer.request.get(`${baseURL}${activeURL}`, { headers: { Range: 'bytes=0-31' } });
+    expect(active.status()).toBe(206);
+    expect((await active.body()).length).toBe(32);
+    expect((await viewer.request.get(`${baseURL}/api/v1/admin/trash`)).status()).toBe(403);
+    await page.getByText('Trash', { exact: true }).click();
+    await expect(page.getByText(/Restore before /)).toBeVisible();
+    await page.reload();
+    await page.getByText('Trash', { exact: true }).click();
+    await page.getByRole('button', { name: 'Restore movie', exact: true }).click();
+    await expect(page.getByRole('button', { name: `Watch ${title}`, exact: true })).toBeVisible();
+    await expect(page.getByText('Trash is empty.', { exact: true })).toBeVisible();
+  } finally {
+    const session = await (await page.request.get(`${baseURL}/api/v1/auth/me`)).json();
+    await page.request.post(`${baseURL}/api/v1/admin/movies/${movieId}/restore`, {
+      headers: { Origin: baseURL, 'x-csrf-token': session.csrf_token },
+    });
+    await viewer.close();
+  }
+});
+
 test('failed resume save still allows returning to the library with a warning', async ({ page }) => {
   await login(page, 'e2e-viewer');
-  await page.route('**/api/v1/movies/*/progress', async route => {
+  await page.route('**/api/v1/movies/*/progress*', async route => {
     if (route.request().method() === 'PUT') {
       await route.fulfill({ status: 500, contentType: 'application/json', body: '{"error":"Injected save failure"}' });
     } else {

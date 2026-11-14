@@ -47,8 +47,17 @@ JPEG/PNG responses are stored. The existing sweeper deletes artwork after 150
 days. Library responses expose only currently available poster expiry, so normal
 local polling picks up acquisition that finishes after publication, and removes
 expired artwork without any provider requests. Library thumbnails and small
-player icons use the same artwork with a generic local fallback. Future deletion must preserve shared poster entries
+player icons use the same artwork with a generic local fallback. Movie deletion preserves shared poster entries
 while another movie still references the TMDB ID.
+
+### Recoverable movie Trash
+
+Schema 12 adds 30-day logical Trash, login-bound two-minute playback leases,
+fixed-file ownership/checksum records, durable purge claims and retained purge history.
+Administrator list, move and restore controls use the existing authentication,
+Origin, CSRF and library-revision protections. The worker alone purges; restore
+never extends metadata/poster expiry. Section 8 specifies the lifecycle and
+legacy native playback compatibility. Existing source-retention gates are unchanged.
 
 ### Movie categories and tags (implemented locally)
 
@@ -663,7 +672,7 @@ media does not erase user progress or manually corrected metadata.
 
 An administrator-confirmed replacement atomically changes the movie's current
 package reference without overwriting package files. Superseded packages enter
-the same seven-day logical trash and active-session protection used for deleted
+the same 30-day logical trash and active-session protection used for deleted
 movies, while the movie and its new package remain visible. New sessions use
 the current package; already-authorized sessions may finish the older one.
 
@@ -672,7 +681,7 @@ users, and deletion; viewers browse and watch. Only administrators create
 accounts and reset passwords; no open registration or email service.
 
 Only administrators can delete published movies. Retain deleted packages in
-seven-day recoverable logical trash before permanent deletion. Hide trashed movies
+30-day recoverable logical trash before permanent deletion. Hide trashed movies
 from normal browsing, preserve their catalog identity/progress for restoration,
 and prevent cleanup while an active playback session still requires the package.
 Trash consumes media capacity and must be included in quota checks.
@@ -681,11 +690,58 @@ Trash is a database flag and purge deadline, not a filesystem move, so existing
 segment URLs remain stable. Block new playback sessions for trashed movies;
 existing authorized sessions may finish. Activity requires an authenticated
 segment request or a playing heartbeat within two minutes; paused/abandoned
-sessions stop renewing. Purge only after the seven-day deadline and expiration
+sessions stop renewing. For ready movies only, the same login may reauthorize
+its movie-bound lease after inactivity or activity-row pruning. Separate bindings
+retain scope until login expiry/revocation or movie purge; expired authorization
+of a trashed or purging movie never revives. Purge only after the 30-day deadline and expiration
 of those sessions. Serialize session authorization and transition to purging
 in the database so a new session cannot race deletion. After purge, an
 authenticated former session receives a media-gone response and an explanation
-in the player. Restoration before purge clears the flag/deadline.
+in the player. Restoration strictly before the 30-day deadline clears the flag/deadline;
+an expired movie cannot be restored even if cleanup has not started.
+
+The local MP4 adapter uses login-bound opaque playback leases: Origin/CSRF-protected
+POST authorizes playback and playing heartbeats, and ranged GETs carry the lease
+in a query parameter. Existing native URLs remain supported for ready movies;
+native clients must adopt leases for subsequent range requests after deletion.
+Already-open responses retain their file descriptor and can finish. Trash and purge
+authorization use SQLite writer transactions. A durable purging claim blocks both
+restore and new/renewed leases across crashes.
+
+Purge targets only recorded, identity-bound published/generated movie and track
+files, never directories, source/staged/archive ISOs, logs, reports, manifests or
+comparison outputs. Original package report directories remain for audit. Shared
+assets and live-job references are checked under the writer lock; generated outputs
+also require exclusivity across legacy/manual publication manifests. The maintenance
+lock owner pins directories, rejects links/traversal/replacements, stages each file
+into a private purge-intent directory, verifies its full identity before unlinking, and syncs
+removal. Persist provenance before unlinking so partial failure/restart is retryable.
+Recovery hashes a previously renamed intent against the attested payload checksum
+outside SQLite's writer lock, then rechecks its full identity under the lock before unlinking.
+Ambiguous legacy ownership or changed content remains pending with a visible error.
+Legacy managed-path inspection precedes payload hashing. Each validated file's
+ownership commits separately, so a later source error cannot force rehashing
+already-attested published files. Absent optional conversion outputs do not block
+published-package purge; unmanaged legacy paths are never followed, and their
+retention is audited. Every admission records the pinned root's canonical location
+as filesystem bytes alongside its identity. Conversion outputs outside the current
+worker's configured scratch location are retained without access only when their
+origin is genuinely manual, with retention noted in purge history. Admission
+persists worker origin from its validated conversion-publication context or an
+existing database conversion-attempt binding, never report claims. Missing or
+different scratch for worker-origin outputs leaves the movie and ownership pending
+with an error and retry deadline; media-only workers cannot permanently retain them
+by mistake. Legacy backfill derives the same origin from database movie/job and
+attempt bindings. Without a prior root checkpoint or present checksum-verified
+generated output, a legacy worker root cannot be established from absence alone.
+Once established, provably absent optional files do not block cleanup. There is no
+silent root rebinding after remounts/path changes. Recorded locations are compared, never
+opened. At the same managed location, root replacement remains an error, and root,
+directory, file and checksum guards still apply before treating an owned path as
+absent or deleting it. Queued work takes priority; real failures back off exponentially
+from one minute to a maximum of one hour.
+Shared private poster BLOBs are removed only when unreferenced or expired.
+Trash restoration does not extend the independent 150-day metadata/poster expiry.
 
 Use a dark, poster-based interface with Continue Watching, Recently Added, and
 genre rows. Search movie titles and descriptions; filter by genre, year, and

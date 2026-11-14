@@ -71,6 +71,10 @@ impl ImportConfig {
         PathBuf::from(format!("/proc/self/fd/{}", self.scratch.as_raw_fd()))
     }
 
+    pub fn output_root(&self) -> Result<wetube_backend::preview::PreviewRoot> {
+        wetube_backend::preview::PreviewRoot::from_directory(self.scratch.try_clone()?)
+    }
+
     pub fn acquire_scratch_lock(&self) -> Result<wetube_backend::lock::MaintenanceLock> {
         wetube_backend::lock::MaintenanceLock::acquire(&self.scratch_path())
     }

@@ -19,3 +19,4 @@ pub fn now() -> i64 {
         .expect("system clock predates Unix epoch")
         .as_secs() as i64
 }
+pub mod trash;

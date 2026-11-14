@@ -308,6 +308,7 @@ async fn admit_inner(
     drop(retained_report);
     // Preservation assets belong to the package, not merely the processing scratch root.
     let mut original_tracks_manifest = Value::Null;
+    let mut tracks_identities = None;
     if has_tracks {
         let tracks_copy = progress.map(|p| p.substep(5, 3, portions));
         let tracks_verification = progress.map(|p| p.substep(5, 4, portions));
@@ -383,6 +384,7 @@ async fn admit_inner(
         );
         original_tracks_manifest =
             json!({"file":"original-tracks.mkv","sha256":digest,"size_bytes":tracks_size});
+        tracks_identities = Some((tracks_identity, copied_identity));
     }
     let manifest = json!({
         "local_preview": true, "production_published": false, "source_cleanup": false,
@@ -425,6 +427,46 @@ async fn admit_inner(
         .bind(now())
         .execute(&mut *transaction)
         .await?;
+    root.record_outputs(&mut transaction, &movie_id, "media", &package)
+        .await?;
+    let scratch = PreviewRoot::open(&pinned_parent.join(".."))?;
+    scratch
+        .record_outputs(&mut transaction, &movie_id, "scratch", &attempt.to_string())
+        .await?;
+    PreviewRoot::verify_recorded_outputs(
+        &mut transaction,
+        &movie_id,
+        "media",
+        &copy_identity,
+        tracks_identities
+            .as_ref()
+            .map(|(_, copied)| copied.as_str()),
+    )
+    .await?;
+    PreviewRoot::verify_recorded_outputs(
+        &mut transaction,
+        &movie_id,
+        "scratch",
+        &before,
+        tracks_identities
+            .as_ref()
+            .map(|(source, _)| source.as_str()),
+    )
+    .await?;
+    PreviewRoot::attest_output_hashes(
+        &mut transaction,
+        &movie_id,
+        &sha256,
+        original_tracks_manifest["sha256"].as_str(),
+    )
+    .await?;
+    PreviewRoot::bind_output_origin(
+        &mut transaction,
+        &movie_id,
+        &attempt.to_string(),
+        job_id.is_some(),
+    )
+    .await?;
     transaction.commit().await?;
     Ok(json!({"movie_id": movie_id, "package_id": package, "local_preview": true}))
 }

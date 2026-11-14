@@ -16,6 +16,7 @@ pub mod probe;
 mod process;
 mod progress;
 pub mod scans;
+pub mod trash;
 
 const OUTPUT_LIMIT: usize = 64 * 1024;
 

@@ -46,7 +46,7 @@ pub async fn initialize(state_dir: &Path) -> Result<()> {
             // This additive migration does not modify registered media. Snapshot
             // SQLite first; operators must retain the separate media/attempt roots.
             anyhow::ensure!(
-                matches!(version.0, 1..=10),
+                matches!(version.0, 1..=11),
                 "unsupported upgrade; requires a complete asset-aware backup"
             );
             let backup = state_dir.join(format!("pre-upgrade-{}", uuid::Uuid::new_v4()));
@@ -93,6 +93,59 @@ pub async fn check_version(pool: &SqlitePool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn trash_upgrades_eleven_with_native_snapshot_and_preserves_catalog() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let pool = open(directory.path(), true).await?;
+        let mut migrations = sqlx::migrate!("./migrations");
+        migrations.migrations = std::borrow::Cow::Owned(
+            migrations
+                .iter()
+                .filter(|m| m.version <= 11)
+                .cloned()
+                .collect(),
+        );
+        migrations.run(&pool).await?;
+        sqlx::query("INSERT INTO movies VALUES('movie','Original',2000,'Description','ready')")
+            .execute(&pool)
+            .await?;
+        sqlx::query(
+            "INSERT INTO tmdb_metadata VALUES('movie',7,'Provider',2001,'Synopsis',1,99999999)",
+        )
+        .execute(&pool)
+        .await?;
+        pool.close().await;
+        initialize(directory.path()).await?;
+        initialize(directory.path()).await?;
+        let pool = connect(directory.path()).await?;
+        check_version(&pool).await?;
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT title FROM movies")
+                .fetch_one(&pool)
+                .await?,
+            "Original"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT tmdb_id FROM tmdb_metadata")
+                .fetch_one(&pool)
+                .await?,
+            7
+        );
+        assert!(crate::trash::list(&pool).await?.is_empty());
+        assert_eq!(
+            std::fs::read_dir(directory.path())?
+                .filter_map(Result::ok)
+                .filter(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("pre-upgrade-"))
+                .count(),
+            1
+        );
+        pool.close().await;
+        Ok(())
+    }
 
     #[tokio::test]
     async fn posters_upgrade_from_ten_preserves_movies_labels_and_snapshots_once() -> Result<()> {

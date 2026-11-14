@@ -25,9 +25,11 @@ This is a runnable local website preview, not a production TrueNAS deployment:
   metadata, with expiring cache and explicit refresh (manual entry always available).
 - Compact latest media readiness, expandable checks, and per-admin import
   archive/restore with collapsed, paginated History; no deletion or retention changes.
+- Administrator movie Trash with 30-day recovery, playback leases and audited,
+  ownership-checked worker cleanup of expired published/generated movie files.
 
 The library starts empty. The complete production publication protocol, captions,
-scheduled backups/restore, and trash are not implemented. Inspection never
+and scheduled backups/restore are not implemented. Inspection never
 modifies or deletes incoming files and does not add movies to the library.
 Automatic ISO deletion remains disabled pending the design's safety gates.
 Docker packaging is intentionally deferred.
@@ -60,9 +62,78 @@ Unlinked movies do not offer genre lookup; first select TMDB metadata during
 publication review.
 
 Schema 10 adds a shared label catalog and cascading movie assignments. Offline
-`init` upgrades schemas 1–10 after a SQLite-only snapshot; stop both services and
+`init` upgrades schemas 1–11 after a SQLite-only snapshot; stop both services and
 retain their separate media/attempt roots. No media or existing movie metadata
 is changed by this migration.
+
+### Movie Trash
+
+Administrators can **Move to Trash**, confirm, then restore a movie from **Trash**
+before its 30-day deadline. Trash is logical: no files move at deletion. The movie
+disappears from everyone's library, search, details and new playback immediately.
+Restoration keeps its identity, saved positions, labels and metadata association;
+metadata and private posters still expire after 150 days, without automatic downloads.
+Recovery ends at the deadline, even when cleanup is waiting for playback or storage.
+
+The single-owner worker automatically purges expired movies when their two-minute
+playback leases have expired. New browser playback uses an authenticated,
+Origin/CSRF-protected `POST /api/v1/movies/{id}/playback`; its opaque `id` is bound
+to the current login. Supply `?playback=<id>` on ranged video requests and progress
+PUTs. Playing clients renew through `POST /api/v1/movies/{id}/playback/{id}` every
+30 seconds. Paused/abandoned clients stop renewing. Ready movies can resume/seek
+after inactivity: their authorization remains bound to the same login and movie,
+even when the expired activity row has been pruned. These bindings disappear on
+login expiry/revocation or movie purge. Expired playback of a trashed movie can
+never revive; its player must return to the library.
+Legacy authenticated `/video` GET/HEAD URLs still work for ready movies. An
+already-open response can finish, but native clients needing subsequent ranges
+after a movie enters Trash must adopt the explicit lease protocol.
+
+Purge removes only identity-bound published movie/track files and exclusively owned
+generated conversion movie/track files. It never deletes original or staged ISOs,
+archive inputs, comparison clips, logs, reports, manifests or attempt directories.
+Reports/manifests remain in the otherwise emptied package directory for audit.
+Shared posters remain cached while another movie references them (or until expiry).
+Unshared poster cache entries are dropped on purge. Live jobs and other movies
+retain their outputs. Unsafe/ambiguous ownership, changed identities, hardlinks or
+storage failures retain an auditable pending purge with an error and safe automatic
+retry, backing off from one minute to at most one hour per movie. Queued work
+takes priority over purge. These failures never report successful removal.
+Keep the original media root available. Recorded scratch locations distinguish a
+different worker configuration from replacement at the same managed location;
+replacement still fails closed, including when recorded files appear absent.
+Conversion origin is recorded from trusted conversion-job publication or an
+existing database attempt binding, not a report's claim. Worker-origin outputs
+remain pending when scratch is missing or differs, including a media-only worker
+without `--scratch-dir`. The movie and ownership stay available for a later safe
+retry with the original root. A path change does not convert worker outputs into
+manual imports or silently rebind their identities.
+
+Only genuinely manual `admit-preview` outputs outside configured scratch are
+intentionally retained without access, including when no scratch is configured.
+Their published files can be purged with an explicit retention note in purge
+history; no arbitrary source root is opened to complete cleanup.
+
+| Generated-output origin and storage | Cleanup policy |
+| --- | --- |
+| Worker; correct recorded root | Strict identity/checksum and exclusivity checks |
+| Worker; no root or a different root | Keep movie/ownership pending; back off and retry |
+| Manual external; no root or a different root | Retain external files, audit retention, finish published cleanup |
+| Either; same managed location replaced | Fail closed; keep pending |
+| Either; optional file provably absent in its established root | Continue safely |
+
+Legacy schema-11 packages require verified admission manifests and published-file
+hashes before ownership is backfilled. Present conversion outputs are considered
+only inside configured managed scratch, with independent identity/checksum checks.
+Already-absent optional outputs do not block cleanup of manual packages or outputs
+with an established root. Legacy worker origin is derived from database movie/job
+and attempt bindings. An unbound worker root with no remaining generated payload
+cannot establish absence and stays pending; a verified ownership checkpoint can
+establish that root on later retries. Manual external files are never accessed or
+deleted, and retention is noted in purge history. Ambiguous or changed assets remain pending for
+operator inspection. Cheap path validation precedes hashing, and each validated
+file's provenance commits separately so later source failures do not rehash
+published gigabytes on every retry. No Python migration is required.
 
 ### Optional TMDB metadata
 
@@ -348,7 +419,7 @@ scratch limits. The admin history shows the latest 20 jobs and their attempt
 IDs; older rows remain in SQLite. An attempt that failed before directory
 creation may have no corresponding directory. Inspect scratch/attempt-ID
 manually, with services stopped, before any operator-managed cleanup. No
-automatic cleanup exists. Failed conversion reports and their output files are
+automatic cleanup of failed attempts exists. Failed conversion reports and their output files are
 not accepted as validated media.
 
 SIGTERM/Ctrl-C drains the worker's current work before releasing ownership,
@@ -359,7 +430,7 @@ their inputs; children retain the ownership lock until they exit.
 ## Upgrade local state
 
 Stop both services before running `wetube-server init` with this release.
-Initialization upgrades supported older schemas (1–10) to schema 11 only after a consistent `VACUUM INTO`
+Initialization upgrades supported older schemas (1–11) to schema 12 only after a consistent `VACUUM INTO`
 snapshot is written and synced in a private `pre-upgrade-UUID` directory under
 the state root. Newer/unknown versions fail closed. Repeating initialization
 does not create another snapshot once the upgrade succeeds.
@@ -367,7 +438,8 @@ does not create another snapshot once the upgrade succeeds.
 Schema 6 adds per-user import archive preferences, lifecycle view and indexes;
 schema 7 adds private comparisons, schema 8 adds their nullable progress,
 schema 9 adds expiring TMDB overlays, schema 10 adds movie labels, and schema 11
-adds the bounded private poster cache.
+adds the bounded private poster cache. Schema 12 adds recoverable movie Trash,
+login-bound playback leases, fixed-file ownership and purge audit history.
 Existing jobs, reports, media, attempts and earlier progress snapshots are retained.
 Stop **both** services, retain the state/media/attempt roots, run the matching
 `wetube-server --state-dir <state-root> init`, then restart the matching server

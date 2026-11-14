@@ -35,6 +35,7 @@ pub mod admission;
 mod labels;
 pub mod metadata;
 mod posters;
+mod trash;
 
 const COOKIE_NAME: &str = "wetube_session";
 const SESSION_SECONDS: i64 = 7 * 24 * 60 * 60;
@@ -179,6 +180,11 @@ pub async fn router_with_conversions(
         .route("/movies/{id}", get(movie_details))
         .route("/movies/{id}/poster", get(posters::read))
         .route("/movies/{id}/video", get(video).head(video))
+        .route("/movies/{id}/playback", post(trash::start))
+        .route("/movies/{id}/playback/{lease}", post(trash::renew))
+        .route("/admin/trash", get(trash::list))
+        .route("/admin/movies/{id}/trash", post(trash::delete))
+        .route("/admin/movies/{id}/restore", post(trash::restore))
         .route(
             "/movies/{id}/progress",
             get(get_progress).put(update_progress),
@@ -507,6 +513,14 @@ struct ReadyPreview {
 }
 
 async fn preview(state: &AppState, id: &str) -> Result<ReadyPreview, HttpError> {
+    preview_with_lease(state, id, false).await
+}
+
+async fn preview_with_lease(
+    state: &AppState,
+    id: &str,
+    leased: bool,
+) -> Result<ReadyPreview, HttpError> {
     let row = sqlx::query(
         "SELECT m.id,COALESCE(t.title,m.title) title,
          CASE WHEN t.title IS NOT NULL THEN t.year ELSE m.year END year,
@@ -516,8 +530,8 @@ async fn preview(state: &AppState, id: &str) -> Result<ReadyPreview, HttpError> 
          LEFT JOIN tmdb_metadata s ON s.movie_id=m.id
          LEFT JOIN tmdb_metadata t ON t.movie_id=m.id AND t.expires_at>?
          LEFT JOIN tmdb_posters a ON a.tmdb_id=t.tmdb_id AND a.expires_at>?
-         WHERE m.id=? AND m.status='ready'",
-    ).bind(now()).bind(now()).bind(id).fetch_optional(&state.pool).await.map_err(internal)?
+         WHERE m.id=? AND (m.status='ready' OR (? AND m.status='trashed'))",
+    ).bind(now()).bind(now()).bind(id).bind(leased).fetch_optional(&state.pool).await.map_err(internal)?
         .ok_or_else(|| HttpError(StatusCode::NOT_FOUND, "Movie is not available for local preview".into()))?;
     let labels = wetube_backend::labels::for_movie(&state.pool, id)
         .await
@@ -575,11 +589,13 @@ async fn update_progress(
     State(state): State<AppState>,
     RoutePath(id): RoutePath<String>,
     headers: HeaderMap,
+    Query(playback): Query<trash::PlaybackQuery>,
     Json(request): Json<UpdatePlaybackProgress>,
 ) -> Result<Json<PlaybackProgress>, HttpError> {
     let current = session(&state, &headers).await?;
     check_csrf(&current, &headers)?;
-    let movie = preview(&state, &id).await?;
+    let leased = trash::has_lease(&state, &headers, &id, &playback).await?;
+    let movie = preview_with_lease(&state, &id, leased).await?;
     if !request.position_seconds.is_finite()
         || request.position_seconds < 0.0
         || request.position_seconds
@@ -593,9 +609,9 @@ async fn update_progress(
     let position_seconds = request.position_seconds.min(movie.details.duration_seconds);
     let result = sqlx::query(
         "INSERT INTO playback_progress (user_id,movie_id,position_seconds,updated_at)
-         SELECT ?,id,?,? FROM movies WHERE id=? AND status='ready'
+         SELECT ?,id,?,? FROM movies WHERE id=? AND (status='ready' OR (? AND status='trashed'))
          ON CONFLICT(user_id,movie_id) DO UPDATE SET position_seconds=excluded.position_seconds,updated_at=excluded.updated_at",
-    ).bind(current.user.id).bind(position_seconds).bind(now()).bind(id)
+    ).bind(current.user.id).bind(position_seconds).bind(now()).bind(id).bind(leased)
         .execute(&state.pool).await.map_err(internal)?;
     if result.rows_affected() != 1 {
         return Err(HttpError(
@@ -656,9 +672,32 @@ async fn video(
     RoutePath(id): RoutePath<String>,
     method: Method,
     headers: HeaderMap,
+    Query(playback): Query<trash::PlaybackQuery>,
 ) -> Result<Response, HttpError> {
     session(&state, &headers).await?;
-    let movie = preview(&state, &id).await?;
+    // Explicit browser leases survive Trash. The legacy native URL remains available
+    // for ready movies only; an already-open response retains its file descriptor.
+    let leased = if let Some(lease) = playback.playback.as_deref() {
+        wetube_backend::trash::authorize(
+            &state.pool,
+            &id,
+            &trash::session_hash(&headers)?,
+            Some(lease),
+            now(),
+        )
+        .await
+        .map_err(internal)?
+        .is_some()
+    } else {
+        false
+    };
+    if playback.playback.is_some() && !leased {
+        return Err(HttpError(
+            StatusCode::NOT_FOUND,
+            "Playback expired; open the movie again if it is available".into(),
+        ));
+    }
+    let movie = preview_with_lease(&state, &id, leased).await?;
     let root = state.media.ok_or_else(|| {
         HttpError(
             StatusCode::SERVICE_UNAVAILABLE,

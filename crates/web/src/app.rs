@@ -546,6 +546,7 @@ fn LibraryPage(current: Session, session: RwSignal<Option<Session>>) -> impl Int
             children=move |movie| view! {
                 <MovieLabelsEditor movie=movie csrf=csrf movies=movies editing=editing_labels/>
             }/>
+        {is_admin.then(|| view! { <TrashPanel csrf=csrf movies=movies/> })}
         <Show when=move || loading.get()>
             <p role="status" class="subtle">"Loading your library..."</p>
         </Show>
@@ -570,6 +571,7 @@ fn LibraryPage(current: Session, session: RwSignal<Option<Session>>) -> impl Int
                             let chosen = movie.clone();
                             let label_id = movie.id.clone();
                             let edit_id = movie.id.clone();
+                            let trash_id = movie.id.clone();
                             let poster_retry = RwSignal::new(0_u64);
                             view! {
                             <article class="movie">
@@ -588,6 +590,7 @@ fn LibraryPage(current: Session, session: RwSignal<Option<Session>>) -> impl Int
                                     }
                                 )}
                                 {is_admin.then(|| view! {
+                                    <TrashButton id=trash_id csrf=csrf movies=movies editing=editing_labels/>
                                     <button class="secondary" disabled=move || editing_labels.get().is_some()
                                         on:click=move |_| editing_labels.set(
                                             movies.get_untracked().into_iter().find(|movie| movie.id == edit_id)
@@ -641,6 +644,127 @@ fn LibraryPage(current: Session, session: RwSignal<Option<Session>>) -> impl Int
                 <ImportsPanel csrf=csrf movies=movies watch_movie=watch_movie/>
             </Show>
         })}
+    }
+}
+
+#[component]
+fn TrashButton(
+    id: String,
+    csrf: StoredValue<String>,
+    movies: RwSignal<Vec<Movie>>,
+    editing: RwSignal<Option<Movie>>,
+) -> impl IntoView {
+    let scope = admin_scope();
+    let id = StoredValue::new(id);
+    let revision = expect_context::<LibraryRevision>().0;
+    let confirming = RwSignal::new(false);
+    let busy = RwSignal::new(false);
+    let error = RwSignal::new(None::<String>);
+    let remove = move |_| {
+        if busy.get_untracked() || editing.get_untracked().is_some() {
+            return;
+        }
+        busy.set(true);
+        spawn_local(async move {
+            let result = admin_post::<bool>(
+                scope,
+                &format!("/api/v1/admin/movies/{}/trash", id.get_value()),
+                &csrf.get_value(),
+                &(),
+            )
+            .await;
+            if busy.try_set(false).is_some() {
+                return;
+            }
+            match result {
+                Ok(_) => {
+                    revision.update(|v| *v += 1);
+                    movies.update(|values| values.retain(|m| m.id != id.get_value()));
+                }
+                Err(message) => error.set(Some(message)),
+            }
+        });
+    };
+    view! {
+        <button class="secondary" disabled=move || busy.get() || editing.get().is_some()
+            on:click=move |_| confirming.set(true)>"Move to Trash"</button>
+        <Show when=move || confirming.get()>
+            <p>"Remove from the library? You can restore it for 30 days. After that, its movie files are permanently deleted. Source ISOs, logs and reports are kept."</p>
+            <button disabled=move || busy.get() on:click=remove>"Confirm move to Trash"</button>
+            <button class="secondary" disabled=move || busy.get() on:click=move |_| confirming.set(false)>"Cancel"</button>
+        </Show>
+        {move || error.get().map(|message| view! { <p role="alert" class="error">{message}</p> })}
+    }
+}
+
+#[component]
+fn TrashPanel(csrf: StoredValue<String>, movies: RwSignal<Vec<Movie>>) -> impl IntoView {
+    let scope = admin_scope();
+    let revision = expect_context::<LibraryRevision>().0;
+    let entries = RwSignal::new(Vec::<wetube_core::TrashMovie>::new());
+    let error = RwSignal::new(None::<String>);
+    let busy = RwSignal::new(false);
+    let mounted = Arc::new(AtomicBool::new(true));
+    let cleanup = mounted.clone();
+    on_cleanup(move || cleanup.store(false, Ordering::Relaxed));
+    spawn_local(async move {
+        while mounted.load(Ordering::Relaxed) {
+            let before = revision.get_untracked();
+            let result =
+                admin_get::<Vec<wetube_core::TrashMovie>>(scope, "/api/v1/admin/trash").await;
+            if !mounted.load(Ordering::Relaxed) {
+                break;
+            }
+            match result {
+                Ok(values) if before == revision.get_untracked() => entries.set(values),
+                Ok(_) => {}
+                Err(message) => error.set(Some(message)),
+            }
+            gloo_timers::future::TimeoutFuture::new(5000).await;
+        }
+    });
+    view! {
+        <details class="panel">
+            <summary>"Trash"</summary>
+            <p class="subtle">"Restore movies within 30 days. Movies awaiting deletion may remain here while playback finishes or cleanup needs attention."</p>
+            <Show when=move || entries.get().is_empty()><p>"Trash is empty."</p></Show>
+            <For each=move || entries.get() key=|entry| (entry.id.clone(),entry.purging,entry.error.clone())
+                children=move |entry| {
+                    let id = StoredValue::new(entry.id);
+                    let expired = entry.purging || entry.purge_after as f64 <= js_sys::Date::now()/1000.0;
+                    let restore = move |_| {
+                        if busy.get_untracked() { return; }
+                        busy.set(true);
+                        error.set(None);
+                        spawn_local(async move {
+                            let result = admin_post::<bool>(scope, &format!("/api/v1/admin/movies/{}/restore",id.get_value()), &csrf.get_value(), &()).await;
+                            if busy.try_set(false).is_some() { return; }
+                            match result {
+                                Ok(_) => {
+                                    revision.update(|v| *v += 1);
+                                    entries.update(|values| values.retain(|entry| entry.id != id.get_value()));
+                                    let before = revision.get_untracked();
+                                    if let Ok(library) = admin_get::<Library>(scope,"/api/v1/movies").await
+                                        && before == revision.get_untracked() {
+                                        movies.set(library.movies);
+                                    }
+                                },
+                                Err(message) => error.set(Some(message)),
+                            }
+                        });
+                    };
+                    view! {
+                        <article>
+                            <h3>{entry.title}</h3>
+                            <p>{if expired { format!("Recovery ended {}. Awaiting permanent deletion.",local_time(entry.purge_after)) }
+                                else { format!("Restore before {}.",local_time(entry.purge_after)) }}</p>
+                            {entry.error.map(|_| view! { <p role="alert" class="error">"Cleanup could not finish. Remaining files are kept for a safe retry. Check worker logs and storage access."</p> })}
+                            <button disabled=move || expired || busy.get() on:click=restore>"Restore movie"</button>
+                        </article>
+                    }
+                }/>
+            {move || error.get().map(|message| view! { <p role="alert" class="error">{message}</p> })}
+        </details>
     }
 }
 
@@ -1294,7 +1418,7 @@ fn MoviePlayer(
         .as_string()
         .unwrap_or_default();
     let movie_url = format!("/api/v1/movies/{id}");
-    let video_url = format!("{movie_url}/video");
+    let video_url = RwSignal::new(String::new());
     let writer = StoredValue::new_local(Rc::new(RefCell::new(ProgressWriter {
         active: true,
         resume_applied: false,
@@ -1334,24 +1458,31 @@ fn MoviePlayer(
             .as_ref()
             .map(|controller| controller.signal());
         let result = async {
-            let Some(signal) = signal else {
+            let Some(signal) = signal.as_ref() else {
                 return Err(
                     "This browser cannot initialize cancellable playback requests.".to_owned(),
                 );
             };
             let response = Request::get(&movie_url)
-                .abort_signal(Some(&signal))
+                .abort_signal(Some(signal))
                 .send()
                 .await
                 .map_err(|error| error.to_string())?;
             let details = decode::<MovieDetails>(response).await?;
             let response = Request::get(&format!("{movie_url}/progress"))
-                .abort_signal(Some(&signal))
+                .abort_signal(Some(signal))
                 .send()
                 .await
                 .map_err(|error| error.to_string())?;
             let progress = decode::<PlaybackProgress>(response).await?;
-            Ok((details, progress))
+            let response = Request::post(&format!("{movie_url}/playback"))
+                .header("x-csrf-token", &csrf.get_value())
+                .abort_signal(Some(signal))
+                .send()
+                .await
+                .map_err(|error| error.to_string())?;
+            let lease = decode::<wetube_core::PlaybackLease>(response).await?;
+            Ok((details, progress, lease))
         }
         .await;
         if !state.borrow().active {
@@ -1359,10 +1490,40 @@ fn MoviePlayer(
         }
         loading.set(false);
         match result {
-            Ok((movie, progress)) => {
+            Ok((movie, progress, lease)) => {
+                video_url.set(format!("{movie_url}/video?playback={}", lease.id));
+                state.borrow_mut().url = format!("{movie_url}/progress?playback={}", lease.id);
                 resume.set(progress.position_seconds);
                 saved.set(Some(progress.position_seconds));
                 details.set(Some(movie));
+                // Ranged media GETs cannot carry CSRF headers. The opaque lease is
+                // bound to this login; only an actively playing element renews it.
+                spawn_local(async move {
+                    loop {
+                        gloo_timers::future::TimeoutFuture::new(30_000).await;
+                        if !state.borrow().active {
+                            break;
+                        }
+                        if let Some(element) = video.get_untracked()
+                            && !element.paused()
+                            && !element.ended()
+                        {
+                            let result =
+                                Request::post(&format!("{movie_url}/playback/{}", lease.id))
+                                    .header("x-csrf-token", &csrf.get_value())
+                                    .abort_signal(signal.as_ref())
+                                    .send()
+                                    .await;
+                            if !state.borrow().active {
+                                break;
+                            }
+                            if !matches!(result, Ok(response) if response.ok()) {
+                                media_error.set(Some("Playback authorization ended. Return to the library to check availability or sign in again.".into()));
+                                break;
+                            }
+                        }
+                    }
+                });
             }
             Err(message) => load_error.set(Some(format!("Unable to load this movie: {message}"))),
         }
@@ -1406,7 +1567,7 @@ fn MoviePlayer(
             {move || load_error.get().map(|message| view! { <p role="alert" class="error">{message}</p> })}
             <Show when=move || details.get().is_some()>
                 <video node_ref=video data-testid="movie-player" controls preload="metadata"
-                    src=video_url.clone() aria-label=player_label.clone()
+                    src=move || video_url.get() aria-label=player_label.clone()
                     on:loadedmetadata=move |_| {
                         let Some(state) = writer.try_get_value() else { return; };
                         if !state.borrow().active || state.borrow().resume_applied {

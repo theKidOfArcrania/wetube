@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use unicode_normalization::UnicodeNormalization;
 
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
-pub const SCHEMA_VERSION: i64 = 11;
+pub const SCHEMA_VERSION: i64 = 12;
 pub const TMDB_SELECTION_EXPIRED: &str = "TMDB selection expired; search again before publication";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -203,6 +203,22 @@ pub struct Session {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ApiError {
     pub error: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct TrashMovie {
+    pub id: String,
+    pub title: String,
+    pub deleted_at: i64,
+    pub purge_after: i64,
+    pub purging: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct PlaybackLease {
+    pub id: String,
+    pub expires_at: i64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

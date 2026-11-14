@@ -201,6 +201,379 @@ async fn login(app: &Router, username: &str) -> (String, String) {
     (cookie, body["csrf_token"].as_str().unwrap().to_owned())
 }
 
+async fn assert_response_status(response: axum::response::Response, expected: StatusCode) {
+    let actual = response.status();
+    if actual != expected {
+        let body = to_bytes(response.into_body(), 8192).await.unwrap();
+        panic!(
+            "expected {expected}, got {actual}: {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+}
+
+#[tokio::test]
+async fn trash_requires_admin_origin_csrf_hides_movies_and_preserves_authorized_ranges() {
+    let fixture = Fixture::new().await;
+    for (name, role) in [
+        ("admin", Role::Admin),
+        ("viewer", Role::Viewer),
+        ("other", Role::Viewer),
+    ] {
+        accounts::create_user(
+            &fixture.pool,
+            name,
+            "a generated preview password".into(),
+            role,
+        )
+        .await
+        .unwrap();
+    }
+    let app = fixture.app().await;
+    let (admin, admin_csrf) = login(&app, "admin").await;
+    let (viewer, viewer_csrf) = login(&app, "viewer").await;
+    let (other, _) = login(&app, "other").await;
+    let admitted = fixture.admit(&fixture.digest).await.unwrap();
+    let id = admitted["movie_id"].as_str().unwrap();
+    let trash = format!("/api/v1/admin/movies/{id}/trash");
+    let restore = format!("/api/v1/admin/movies/{id}/restore");
+    let start = format!("/api/v1/movies/{id}/playback");
+    let video = format!("/api/v1/movies/{id}/video");
+    for (path, method) in [
+        ("/api/v1/admin/trash", "GET"),
+        (trash.as_str(), "POST"),
+        (restore.as_str(), "POST"),
+    ] {
+        assert_eq!(
+            request(&app, method, path, None, None, None, "")
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            request(
+                &app,
+                method,
+                path,
+                Some(&viewer),
+                Some(&viewer_csrf),
+                None,
+                ""
+            )
+            .await
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+    for path in [&trash, &restore, &start] {
+        assert_eq!(
+            request(&app, "POST", path, Some(&admin), None, None, "")
+                .await
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header(header::HOST, "preview.test")
+                    .header(header::ORIGIN, "http://other.test")
+                    .header(header::COOKIE, &admin)
+                    .header("x-csrf-token", &admin_csrf)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+    let response = request(
+        &app,
+        "POST",
+        &start,
+        Some(&viewer),
+        Some(&viewer_csrf),
+        None,
+        "",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let lease: wetube_core::PlaybackLease =
+        serde_json::from_slice(&to_bytes(response.into_body(), 8192).await.unwrap()).unwrap();
+    let leased = format!("{video}?playback={}", lease.id);
+    let renew = format!("{start}/{}", lease.id);
+    // Inactivity may outlast the activity row, but not the login/movie binding.
+    sqlx::query("UPDATE playback_leases SET expires_at=?")
+        .bind(wetube_backend::now() - 1)
+        .execute(&fixture.pool)
+        .await
+        .unwrap();
+    assert_response_status(
+        request(
+            &app,
+            "GET",
+            &leased,
+            Some(&viewer),
+            None,
+            Some("bytes=0-9"),
+            "",
+        )
+        .await,
+        StatusCode::PARTIAL_CONTENT,
+    )
+    .await;
+    sqlx::query("DELETE FROM playback_leases")
+        .execute(&fixture.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        request(
+            &app,
+            "POST",
+            &renew,
+            Some(&viewer),
+            Some(&viewer_csrf),
+            None,
+            ""
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    sqlx::query("DELETE FROM playback_leases")
+        .execute(&fixture.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        request(
+            &app,
+            "GET",
+            &leased,
+            Some(&other),
+            None,
+            Some("bytes=0-9"),
+            ""
+        )
+        .await
+        .status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        request(
+            &app,
+            "GET",
+            &leased,
+            Some(&viewer),
+            None,
+            Some("bytes=0-9"),
+            ""
+        )
+        .await
+        .status(),
+        StatusCode::PARTIAL_CONTENT
+    );
+    // The response opened before Trash can finish even without the explicit browser protocol.
+    let in_flight = request(&app, "GET", &video, Some(&viewer), None, None, "").await;
+    assert_eq!(
+        request(
+            &app,
+            "POST",
+            &trash,
+            Some(&admin),
+            Some(&admin_csrf),
+            None,
+            ""
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    assert!(
+        !to_bytes(in_flight.into_body(), 1024 * 1024)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    for suffix in ["", "/video", "/progress", "/labels", "/poster"] {
+        assert_eq!(
+            request(
+                &app,
+                "GET",
+                &format!("/api/v1/movies/{id}{suffix}"),
+                Some(&viewer),
+                None,
+                None,
+                ""
+            )
+            .await
+            .status(),
+            StatusCode::NOT_FOUND,
+            "{suffix}"
+        );
+    }
+    let response = request(&app, "GET", "/api/v1/movies", Some(&viewer), None, None, "").await;
+    let library: wetube_core::Library =
+        serde_json::from_slice(&to_bytes(response.into_body(), 8192).await.unwrap()).unwrap();
+    assert!(library.movies.is_empty());
+    assert_eq!(
+        request(
+            &app,
+            "POST",
+            &start,
+            Some(&viewer),
+            Some(&viewer_csrf),
+            None,
+            ""
+        )
+        .await
+        .status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        request(
+            &app,
+            "GET",
+            &leased,
+            Some(&other),
+            None,
+            Some("bytes=0-9"),
+            ""
+        )
+        .await
+        .status(),
+        StatusCode::NOT_FOUND
+    );
+    let response = request(
+        &app,
+        "GET",
+        &leased,
+        Some(&viewer),
+        None,
+        Some("bytes=0-9"),
+        "",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        to_bytes(response.into_body(), 1024).await.unwrap().len(),
+        10
+    );
+    let progress = format!("/api/v1/movies/{id}/progress?playback={}", lease.id);
+    assert_eq!(
+        request(
+            &app,
+            "PUT",
+            &progress,
+            Some(&viewer),
+            Some(&viewer_csrf),
+            None,
+            r#"{"position_seconds":0.5}"#
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        request(&app, "POST", &renew, Some(&viewer), None, None, "")
+            .await
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        request(
+            &app,
+            "POST",
+            &renew,
+            Some(&viewer),
+            Some(&viewer_csrf),
+            None,
+            ""
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    sqlx::query("UPDATE playback_leases SET expires_at=?")
+        .bind(wetube_backend::now())
+        .execute(&fixture.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        request(&app, "GET", &leased, Some(&viewer), None, None, "")
+            .await
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    sqlx::query("DELETE FROM playback_leases")
+        .execute(&fixture.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        request(
+            &app,
+            "POST",
+            &renew,
+            Some(&viewer),
+            Some(&viewer_csrf),
+            None,
+            ""
+        )
+        .await
+        .status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        request(&app, "GET", &leased, Some(&viewer), None, None, "")
+            .await
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        request(
+            &app,
+            "POST",
+            &restore,
+            Some(&admin),
+            Some(&admin_csrf),
+            None,
+            ""
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    let progress = request(
+        &app,
+        "GET",
+        &format!("/api/v1/movies/{id}/progress"),
+        Some(&viewer),
+        None,
+        None,
+        "",
+    )
+    .await;
+    assert_eq!(progress.status(), StatusCode::OK);
+    let progress: wetube_core::PlaybackProgress =
+        serde_json::from_slice(&to_bytes(progress.into_body(), 8192).await.unwrap()).unwrap();
+    assert_eq!(progress.position_seconds, 0.5);
+    assert_eq!(
+        request(
+            &app,
+            "GET",
+            &video,
+            Some(&viewer),
+            None,
+            Some("bytes=0-9"),
+            ""
+        )
+        .await
+        .status(),
+        StatusCode::PARTIAL_CONTENT
+    );
+}
+
 #[tokio::test]
 async fn successful_real_media_is_copied_and_unauthorized_ranges_and_progress_are_bounded() {
     let fixture = Fixture::new().await;

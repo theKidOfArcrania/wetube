@@ -193,6 +193,19 @@ async fn run(cli: Cli) -> Result<()> {
                                 .await?;
                         }
                     }
+                    if let Some(media) = &media {
+                        let scratch = imports
+                            .as_ref()
+                            .map(|config| config.output_root())
+                            .transpose()?;
+                        wetube_worker::trash::tick(
+                            &pool,
+                            media,
+                            scratch.as_ref(),
+                            wetube_backend::now(),
+                        )
+                        .await?;
+                    }
                     anyhow::Ok(())
                 };
                 tokio::pin!(work);
