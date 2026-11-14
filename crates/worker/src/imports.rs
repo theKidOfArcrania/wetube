@@ -407,6 +407,9 @@ pub async fn tick(pool: &SqlitePool, config: Arc<ImportConfig>) -> Result<bool> 
     let progress = &recording.progress;
     let staging_progress = progress.clone();
     let result: Result<serde_json::Value> = async {
+        if let Some(scan) = row.try_get::<Option<String>, _>("scan_job_id")? {
+            wetube_backend::simple_imports::validate_scan_authorization(pool, &scan).await?;
+        }
         let staged = tokio::task::spawn_blocking(move || {
             if reuse { revalidate_progress(&stage_config,&staged_probe,Some(&staging_progress)) } else { stage_progress(&stage_config, &name, &expected, &stage_attempt,Some(&staging_progress)) }
         })

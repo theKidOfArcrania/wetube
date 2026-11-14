@@ -1178,6 +1178,205 @@ async fn personal_import_history_validates_lifecycle_permissions_pagination_and_
 }
 
 #[tokio::test]
+async fn simple_import_requires_current_admin_origin_csrf_identity_and_explicit_consent() {
+    let mut fixture = Fixture::new().await;
+    let artifacts = tempfile::tempdir().unwrap();
+    let incoming = artifacts.path().join("incoming");
+    let scratch = artifacts.path().join("scratch");
+    let media = artifacts.path().join("media");
+    std::fs::create_dir(&incoming).unwrap();
+    std::fs::create_dir(&scratch).unwrap();
+    std::fs::create_dir(&media).unwrap();
+    std::fs::write(incoming.join("copy.iso"), b"completed test copy").unwrap();
+    std::fs::File::open(incoming.join("copy.iso"))
+        .unwrap()
+        .sync_all()
+        .unwrap();
+    fixture.app = wetube_server::router_with_conversions(
+        fixture.pool.clone(),
+        ORIGIN,
+        fixture._directory.path(),
+        Some(wetube_backend::incoming::IncomingRoot::open(&incoming).unwrap()),
+        Some(wetube_backend::preview::PreviewRoot::open(&media).unwrap()),
+        Some(&scratch),
+    )
+    .await
+    .unwrap();
+    let (admin, session) = fixture.login("admin").await;
+    let (viewer, viewer_session) = fixture.login("viewer").await;
+    let identity = wetube_backend::incoming::IncomingRoot::open(&incoming)
+        .unwrap()
+        .list()
+        .unwrap()
+        .remove(0)
+        .identity;
+    let body = serde_json::json!({"name":"copy.iso","identity":identity,"copy_complete":true,"accept_preserve":true});
+    let endpoint = "/api/v1/admin/simple-imports";
+    for (cookie, csrf, expected) in [
+        (None, None, StatusCode::UNAUTHORIZED),
+        (
+            Some(viewer.as_str()),
+            Some(viewer_session.csrf_token.as_str()),
+            StatusCode::FORBIDDEN,
+        ),
+        (Some(admin.as_str()), None, StatusCode::FORBIDDEN),
+    ] {
+        assert_eq!(
+            fixture
+                .send("POST", endpoint, &body.to_string(), cookie, csrf)
+                .await
+                .status(),
+            expected
+        );
+    }
+    let cross_origin = Request::builder()
+        .method("POST")
+        .uri(endpoint)
+        .header(header::HOST, "wetube.test")
+        .header(header::ORIGIN, "http://other.test")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::COOKIE, &admin)
+        .header("x-csrf-token", &session.csrf_token)
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    assert_eq!(
+        fixture
+            .app
+            .clone()
+            .oneshot(cross_origin)
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    for (key, value, expected) in [
+        (
+            "copy_complete",
+            serde_json::json!(false),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "accept_preserve",
+            serde_json::json!(false),
+            StatusCode::BAD_REQUEST,
+        ),
+        ("identity", serde_json::json!("stale"), StatusCode::CONFLICT),
+    ] {
+        let mut invalid = body.clone();
+        invalid[key] = value;
+        assert_eq!(
+            fixture
+                .send(
+                    "POST",
+                    endpoint,
+                    &invalid.to_string(),
+                    Some(&admin),
+                    Some(&session.csrf_token)
+                )
+                .await
+                .status(),
+            expected
+        );
+    }
+    let mut forged = body.clone();
+    forged["inspection"] = serde_json::json!({"title":1});
+    assert_eq!(
+        fixture
+            .send(
+                "POST",
+                endpoint,
+                &forged.to_string(),
+                Some(&admin),
+                Some(&session.csrf_token)
+            )
+            .await
+            .status(),
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+    let first = fixture
+        .send(
+            "POST",
+            endpoint,
+            &body.to_string(),
+            Some(&admin),
+            Some(&session.csrf_token),
+        )
+        .await;
+    assert_eq!(first.status(), StatusCode::ACCEPTED);
+    let first: wetube_core::ScanJob =
+        serde_json::from_slice(&to_bytes(first.into_body(), 32768).await.unwrap()).unwrap();
+    let second = fixture
+        .send(
+            "POST",
+            endpoint,
+            &body.to_string(),
+            Some(&admin),
+            Some(&session.csrf_token),
+        )
+        .await;
+    assert_eq!(second.status(), StatusCode::ACCEPTED);
+    let second: wetube_core::ScanJob =
+        serde_json::from_slice(&to_bytes(second.into_body(), 32768).await.unwrap()).unwrap();
+    assert_eq!(first.id, second.id);
+    assert_eq!(first.state, wetube_core::ScanState::Queued);
+    assert!(
+        wetube_backend::probe_jobs::list(&fixture.pool)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        wetube_backend::conversions::list(&fixture.pool)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let advanced = format!("/api/v1/admin/scans/{}/advanced", first.id);
+    assert_eq!(
+        fixture
+            .send("POST", &advanced, "{}", Some(&admin), None)
+            .await
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        fixture
+            .send(
+                "POST",
+                &advanced,
+                "{}",
+                Some(&viewer),
+                Some(&viewer_session.csrf_token)
+            )
+            .await
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        fixture
+            .send(
+                "POST",
+                &advanced,
+                "{}",
+                Some(&admin),
+                Some(&session.csrf_token)
+            )
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    wetube_backend::simple_imports::advance(&fixture.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        wetube_backend::scans::list(&fixture.pool).await.unwrap()[0]
+            .simple_state
+            .as_deref(),
+        Some("advanced")
+    );
+}
+
+#[tokio::test]
 async fn conversion_publication_and_scan_selection_require_admin_csrf_and_bound_review() {
     let mut fixture = Fixture::new().await;
     let artifacts = tempfile::tempdir().unwrap();

@@ -140,7 +140,7 @@ pub(crate) async fn inspect_open_iso(
         "tool_messages": String::from_utf8_lossy(&output.stderr),
         "warnings": [
             "Read-only feasibility inspection, not authorization to import or delete.",
-            "Only the selected title/angle was inspected; main-movie selection is not automatic.",
+            "Only the selected title/angle was inspected; title numbering or longest duration does not prove the main movie.",
             "Chapter timings may be approximate because full-disc preindexing is disabled.",
             "Source metadata checks do not prove copy completion or exclude concurrent SMB writers."
         ],

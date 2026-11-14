@@ -183,8 +183,11 @@ async fn run(cli: Cli) -> Result<()> {
                 let work = async {
                     wetube_worker::tick(&pool).await?;
                     if let Some(config) = &imports {
+                        wetube_backend::simple_imports::advance(&pool).await?;
                         wetube_worker::scans::tick(&pool, config.clone()).await?;
+                        wetube_backend::simple_imports::advance(&pool).await?;
                         wetube_worker::imports::tick(&pool, config.clone()).await?;
+                        wetube_backend::simple_imports::advance(&pool).await?;
                         let compared =
                             wetube_worker::comparisons::tick(&pool, config.clone(), &limits)
                                 .await?;

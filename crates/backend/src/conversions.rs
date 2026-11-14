@@ -41,16 +41,24 @@ pub async fn enqueue(
     user: &str,
     request: &ConversionRequest,
 ) -> Result<Option<ConversionJob>> {
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     let treatment = serde_json::to_value(request.video_treatment)?;
     let row = sqlx::query(
         "INSERT INTO conversion_jobs (id,probe_job_id,requested_by,state,created_at,video_treatment)
          SELECT ?,id,?,'queued',?,? FROM probe_jobs
          WHERE id=? AND state='needs_review' AND attempt_id IS NOT NULL AND report IS NOT NULL
+         AND NOT EXISTS (SELECT 1 FROM scan_jobs s WHERE s.id=probe_jobs.scan_job_id
+                         AND s.simple_state IN ('scan','inspection','conversion'))
          AND NOT EXISTS (SELECT 1 FROM conversion_jobs WHERE probe_job_id=? AND state!='failed')
          ON CONFLICT DO NOTHING RETURNING *"
     ).bind(uuid::Uuid::new_v4().to_string()).bind(user).bind(super::now())
         .bind(treatment.as_str().unwrap()).bind(&request.probe_job_id).bind(&request.probe_job_id)
-        .fetch_optional(pool).await?;
+        .fetch_optional(&mut *tx).await?;
+    if row.is_some() {
+        sqlx::query("UPDATE scan_jobs SET simple_state='manual' WHERE id=(SELECT scan_job_id FROM probe_jobs WHERE id=?) AND simple_state='advanced'")
+            .bind(&request.probe_job_id).execute(&mut *tx).await?;
+    }
+    tx.commit().await?;
     row.as_ref().map(from_row).transpose()
 }
 

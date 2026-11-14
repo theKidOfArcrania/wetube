@@ -1,5 +1,190 @@
 use std::process::Command;
 
+fn fixture_command(command: &mut Command) -> anyhow::Result<()> {
+    let output = command.output()?;
+    anyhow::ensure!(
+        output.status.success(),
+        "DVD fixture command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "integration acceptance requires stable C-backed ctime; strict input identity checks remain enabled"]
+async fn simple_authored_dvd_runs_real_chain_once_and_requires_publication_review()
+-> anyhow::Result<()> {
+    use anyhow::Context;
+    use wetube_backend::{db, incoming::IncomingRoot, simple_imports};
+    use wetube_core::{ConversionState, ScanRequest, SimpleImportRequest};
+    let root = tempfile::tempdir()?;
+    let state = root.path().join("state");
+    let incoming = root.path().join("incoming");
+    let scratch = root.path().join("scratch");
+    let media = root.path().join("media");
+    for path in [&state, &incoming, &scratch, &media] {
+        std::fs::create_dir(path)?;
+    }
+    for (name, seconds) in [("feature", "3"), ("extra", "1")] {
+        fixture_command(
+            Command::new("ffmpeg")
+                .args([
+                    "-hide_banner",
+                    "-nostdin",
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "testsrc2=size=720x480:rate=30000/1001",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "sine=frequency=440:sample_rate=48000",
+                    "-t",
+                    seconds,
+                    "-target",
+                    "ntsc-dvd",
+                    "-aspect",
+                    "4:3",
+                    "-threads",
+                    "2",
+                    "-c:a",
+                    "ac3",
+                    "-b:a",
+                    "192k",
+                    "-ac",
+                    "2",
+                ])
+                .arg(root.path().join(format!("{name}.vob"))),
+        )?;
+    }
+    let xml = root.path().join("dvd.xml");
+    std::fs::write(
+        &xml,
+        format!(
+            "<dvdauthor><vmgm/><titleset><titles><video format=\"ntsc\" aspect=\"4:3\"/><audio format=\"ac3\" lang=\"en\"/><pgc><vob file=\"{}\"/></pgc><pgc><vob file=\"{}\"/></pgc></titles></titleset></dvdauthor>",
+            root.path().join("feature.vob").display(),
+            root.path().join("extra.vob").display()
+        ),
+    )?;
+    let dvd = root.path().join("dvd");
+    fixture_command(
+        Command::new("dvdauthor")
+            .env("VIDEO_FORMAT", "NTSC")
+            .arg("-o")
+            .arg(&dvd)
+            .arg("-x")
+            .arg(xml),
+    )?;
+    fixture_command(
+        Command::new("genisoimage")
+            .args(["-quiet", "-dvd-video", "-o"])
+            .arg(incoming.join("fixture.iso"))
+            .arg(dvd),
+    )?;
+    db::initialize(&state).await?;
+    let pool = db::connect(&state).await?;
+    sqlx::query("INSERT INTO users VALUES('admin','admin','hash','admin')")
+        .execute(&pool)
+        .await?;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let source = IncomingRoot::open(&incoming)?;
+    let (handle, original) = source.open_file("fixture.iso")?;
+    let request = SimpleImportRequest {
+        scan: ScanRequest {
+            name: original.name.clone(),
+            identity: original.identity.clone(),
+            copy_complete: true,
+        },
+        accept_preserve: true,
+    };
+    let queued = simple_imports::enqueue(&pool, "admin", &request)
+        .await?
+        .context("Simple import not queued")?;
+    for _ in 0..2 {
+        fixture_command(
+            Command::new(env!("CARGO_BIN_EXE_wetube-worker"))
+                .arg("--state-dir")
+                .arg(&state)
+                .args(["run", "--once", "--incoming-dir"])
+                .arg(&incoming)
+                .arg("--scratch-dir")
+                .arg(&scratch)
+                .arg("--media-dir")
+                .arg(&media)
+                .args([
+                    "--max-iso-bytes",
+                    "33554432",
+                    "--max-scratch-bytes",
+                    "134217728",
+                    "--max-output-bytes",
+                    "8388608",
+                    "--tool-timeout-secs",
+                    "60",
+                ]),
+        )?;
+    }
+    let scan = wetube_backend::scans::list(&pool).await?.remove(0);
+    let probes = wetube_backend::probe_jobs::list(&pool).await?;
+    let conversions = wetube_backend::conversions::list(&pool).await?;
+    assert_eq!(scan.id, queued.id);
+    assert_eq!(
+        scan.state,
+        wetube_core::ScanState::NeedsReview,
+        "scan error: {:?}",
+        scan.error
+    );
+    assert_eq!(probes.len(), 1);
+    assert_eq!((probes[0].title, probes[0].angle), (1, 1));
+    assert_eq!(
+        probes[0].attempt_id, scan.attempt_id,
+        "reuse the real scan archive"
+    );
+    assert_eq!(
+        conversions.len(),
+        1,
+        "restart must not enqueue a second conversion"
+    );
+    assert_eq!(
+        conversions[0].state,
+        ConversionState::NeedsReview,
+        "conversion error: {:?}; report: {:?}",
+        conversions[0].error,
+        conversions[0].report
+    );
+    assert_eq!(
+        conversions[0].video_treatment,
+        wetube_core::VideoTreatment::Preserve
+    );
+    assert_eq!(scan.simple_state.as_deref(), Some("review"));
+    assert_eq!(
+        simple_imports::enqueue(&pool, "admin", &request)
+            .await?
+            .unwrap()
+            .id,
+        queued.id
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM movies")
+            .fetch_one(&pool)
+            .await?,
+        0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM conversion_jobs WHERE publication IS NOT NULL"
+        )
+        .fetch_one(&pool)
+        .await?,
+        0
+    );
+    assert_eq!(std::fs::read_dir(&media)?.count(), 0);
+    source.verify(&original.name, &handle, &original.identity)?;
+    pool.close().await;
+    Ok(())
+}
+
 #[tokio::test]
 async fn integrated_scan_failure_retains_staged_input_logs_and_no_movies() -> anyhow::Result<()> {
     for reject_progress in [false, true] {

@@ -161,6 +161,7 @@ pub async fn tick(pool: &SqlitePool, config: Arc<super::imports::ImportConfig>) 
     let progress = &recording.progress;
     let staging_progress = progress.clone();
     let result: Result<DvdScanReport> = async {
+        wetube_backend::simple_imports::validate_scan_authorization(pool, &id).await?;
         let staged = tokio::task::spawn_blocking(move || {
             super::imports::stage_progress(
                 &stage_config,

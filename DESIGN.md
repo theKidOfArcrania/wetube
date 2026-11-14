@@ -126,13 +126,31 @@ are closed. A durable scan job makes one verified private copy, discovers the
 available DVD programs and angles, and presents title choices with durations
 and available track information. DVD programs often lack meaningful names;
 the longest program is only a main-feature candidate. Single-angle discs do
-not require a technical angle choice.
+not require a technical angle choice. Simple mode is the default for new work;
+existing manual jobs remain Advanced. An explicit finished-copy confirmation
+and acceptance of Preserve preview warnings authorize scan → actual inspection →
+Preserve conversion only if title 1 is uniquely longest and has angle 1.
+Ties (including title 1 ties), a different longest title, missing angle 1, invalid
+inventory, inspection mismatch or failure require Advanced/manual selection.
+Multiple angles alone do not block angle 1. No filename or TMDB inference is used.
 
 Inspection of the selected program and subsequent conversion reuse that
 checksum-bound staged copy rather than copying the NAS ISO again. Conversion
-requires an explicit video-treatment choice and runs in the bounded,
+requires either that explicit Simple authorization or an Advanced video-treatment choice and runs in the bounded,
 single-worker queue. Source decode, encoding, and complete output validation
 must succeed before the result becomes available for publication review.
+
+Schema 13 adds durable Simple workflow state and linked scan/inspection/conversion
+IDs. Transactional worker-owned continuation is restart-safe and idempotent for a
+confirmed source identity. Interrupted media stages retain existing fail-closed
+recovery; no failed stage retries automatically. Advanced handoff prevents future
+continuation and retains usable results. Matching scans and verified inspections may be reused
+without recopying; existing staged-input hash and strict identity/ctime checks
+remain unchanged. Inspection metadata, selected program, duration and staged
+digest/size/attempt must match the scan before automatic conversion; the worker
+rechecks policy and current administrator authorization at the conversion claim.
+Progress retains the existing separate measured stages, percentages and phase ETA.
+Concurrency remains one with the existing default two codec threads.
 
 Publication is a separate administrator action bound to the validated output
 digest, with reviewed title, year, and description. The worker independently

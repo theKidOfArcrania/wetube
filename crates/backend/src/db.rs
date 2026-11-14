@@ -46,7 +46,7 @@ pub async fn initialize(state_dir: &Path) -> Result<()> {
             // This additive migration does not modify registered media. Snapshot
             // SQLite first; operators must retain the separate media/attempt roots.
             anyhow::ensure!(
-                matches!(version.0, 1..=11),
+                matches!(version.0, 1..=12),
                 "unsupported upgrade; requires a complete asset-aware backup"
             );
             let backup = state_dir.join(format!("pre-upgrade-{}", uuid::Uuid::new_v4()));
@@ -93,6 +93,47 @@ pub async fn check_version(pool: &SqlitePool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn simple_import_upgrades_twelve_without_restarting_existing_manual_jobs() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let pool = open(directory.path(), true).await?;
+        let mut migrations = sqlx::migrate!("./migrations");
+        migrations.migrations = std::borrow::Cow::Owned(
+            migrations
+                .iter()
+                .filter(|migration| migration.version <= 12)
+                .cloned()
+                .collect(),
+        );
+        migrations.run(&pool).await?;
+        sqlx::query("INSERT INTO users VALUES('admin','admin','hash','admin')")
+            .execute(&pool)
+            .await?;
+        sqlx::query("INSERT INTO scan_jobs(id,requested_by,name,source_identity,state,created_at,attempt_id,report) VALUES('manual','admin','old.iso','bound','needs_review',1,'retained','{\"titles\":[]}')").execute(&pool).await?;
+        pool.close().await;
+        initialize(directory.path()).await?;
+        initialize(directory.path()).await?;
+        let pool = connect(directory.path()).await?;
+        check_version(&pool).await?;
+        let scan = crate::scans::list(&pool).await?.remove(0);
+        assert_eq!(scan.simple_state, None);
+        assert_eq!(scan.attempt_id.as_deref(), Some("retained"));
+        crate::simple_imports::advance(&pool).await?;
+        assert!(crate::probe_jobs::list(&pool).await?.is_empty());
+        assert_eq!(
+            std::fs::read_dir(directory.path())?
+                .filter_map(Result::ok)
+                .filter(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("pre-upgrade-"))
+                .count(),
+            1
+        );
+        pool.close().await;
+        Ok(())
+    }
 
     #[tokio::test]
     async fn trash_upgrades_eleven_with_native_snapshot_and_preserves_catalog() -> Result<()> {

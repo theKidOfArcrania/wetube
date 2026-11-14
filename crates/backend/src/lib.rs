@@ -10,6 +10,7 @@ pub mod metadata;
 pub mod preview;
 pub mod probe_jobs;
 pub mod scans;
+pub mod simple_imports;
 
 use std::time::{SystemTime, UNIX_EPOCH};
 

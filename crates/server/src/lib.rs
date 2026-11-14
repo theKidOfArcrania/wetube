@@ -28,7 +28,7 @@ use wetube_core::{
     APP_VERSION, ApiError, ArchiveImport, ConversionJob, ConversionJobs, ConversionRequest,
     DiagnosticJob, ImportPage, IncomingFiles, InspectRequest, JobState, Library, LoginRequest,
     Movie, MovieDetails, PlaybackProgress, ProbeJob, ProbeRequest, PublishRequest, Role, ScanJob,
-    ScanJobs, ScanRequest, Session, SystemStatus, UpdatePlaybackProgress,
+    ScanJobs, ScanRequest, Session, SimpleImportRequest, SystemStatus, UpdatePlaybackProgress,
 };
 
 pub mod admission;
@@ -216,6 +216,8 @@ pub async fn router_with_conversions(
         )
         .route("/admin/conversions/{id}/publish", post(queue_publication))
         .route("/admin/scans", get(scan_jobs).post(queue_scan))
+        .route("/admin/simple-imports", post(queue_simple_import))
+        .route("/admin/scans/{id}/advanced", post(use_advanced_import))
         .route("/admin/scans/{id}/inspect", post(queue_scanned_inspection))
         .fallback(|| async { HttpError(StatusCode::NOT_FOUND, "Unknown API route".into()) });
 
@@ -903,6 +905,70 @@ async fn queue_scan(
 ) -> Result<(StatusCode, Json<ScanJob>), HttpError> {
     let current = admin(&state, &headers).await?;
     check_csrf(&current, &headers)?;
+    validate_scan_source(&state, &request).await?;
+    let job = scans::enqueue(&state.pool, &current.user.id, &request)
+        .await
+        .map_err(internal)?
+        .ok_or_else(|| {
+            HttpError(
+                StatusCode::CONFLICT,
+                "A DVD scan is already queued or running".into(),
+            )
+        })?;
+    Ok((StatusCode::ACCEPTED, Json(job)))
+}
+
+async fn queue_simple_import(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<SimpleImportRequest>,
+) -> Result<(StatusCode, Json<ScanJob>), HttpError> {
+    let current = admin(&state, &headers).await?;
+    check_csrf(&current, &headers)?;
+    conversions_enabled(&state)?;
+    if !request.accept_preserve {
+        return Err(HttpError(
+            StatusCode::BAD_REQUEST,
+            "Accept the Preserve preview treatment before starting Simple import.".into(),
+        ));
+    }
+    validate_scan_source(&state, &request.scan).await?;
+    let job = wetube_backend::simple_imports::enqueue(&state.pool, &current.user.id, &request)
+        .await
+        .map_err(internal)?
+        .ok_or_else(|| {
+            HttpError(
+                StatusCode::CONFLICT,
+                "A DVD scan is already active. Review it before starting another import.".into(),
+            )
+        })?;
+    Ok((StatusCode::ACCEPTED, Json(job)))
+}
+
+async fn use_advanced_import(
+    State(state): State<AppState>,
+    RoutePath(id): RoutePath<String>,
+    headers: HeaderMap,
+) -> Result<Json<ScanJob>, HttpError> {
+    let current = admin(&state, &headers).await?;
+    check_csrf(&current, &headers)?;
+    if Uuid::parse_str(&id).is_err() {
+        return Err(HttpError(StatusCode::BAD_REQUEST, "Invalid scan ID".into()));
+    }
+    let job = wetube_backend::simple_imports::advanced(&state.pool, &id)
+        .await
+        .map_err(internal)?
+        .ok_or_else(|| {
+            HttpError(
+                StatusCode::CONFLICT,
+                "Conversion already queued or import no longer active. Review its current results."
+                    .into(),
+            )
+        })?;
+    Ok(Json(job))
+}
+
+async fn validate_scan_source(state: &AppState, request: &ScanRequest) -> Result<(), HttpError> {
     if !request.copy_complete {
         return Err(HttpError(
             StatusCode::BAD_REQUEST,
@@ -934,16 +1000,7 @@ async fn queue_scan(
             "Input changed; refresh and reconfirm completion".into(),
         ));
     }
-    let job = scans::enqueue(&state.pool, &current.user.id, &request)
-        .await
-        .map_err(internal)?
-        .ok_or_else(|| {
-            HttpError(
-                StatusCode::CONFLICT,
-                "A DVD scan is already queued or running".into(),
-            )
-        })?;
-    Ok((StatusCode::ACCEPTED, Json(job)))
+    Ok(())
 }
 
 async fn queue_scanned_inspection(

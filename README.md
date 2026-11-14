@@ -374,13 +374,22 @@ On this development host, all large ISO, conversion, and publication artifacts
 belong on C:, never in `/tmp` or another Linux staging directory. Small SQLite
 state is separate.
 
-1. Refresh incoming files, select an ordinary non-empty ISO from the root
-   (no recursion/symlinks), acknowledge the completed copy, and choose **Scan DVD**.
-2. Select a discovered DVD title using its duration, chapters, and tracks.
-   The longest program is only a main-feature candidate, not an automatic choice.
-   Choose an angle if the selected program has multiple angles.
-3. Choose **Inspect selected title**. Review its report and warnings, explicitly
+1. Refresh incoming files and select an ordinary non-empty ISO from the root
+   (no recursion/symlinks). Confirm that copying is finished and SMB writers are closed.
+2. **Simple** (the default): acknowledge the preview-treatment warnings and choose
+   **Start Simple import**. The worker performs real DVD discovery and inspection.
+   Only a uniquely longest **title 1** with **angle 1 available** proceeds to
+   Preserve conversion (re-encoding without deinterlacing, not lossless).
+   Multiple angles do not prevent using angle 1. Ties, another longest title,
+   missing angle 1, invalid inventory, failed or mismatched inspection require
+   **Advanced**; no filename or metadata-provider guess is made. Longest duration
+   alone does not establish that the selected program is the main movie.
+3. **Advanced**: choose **Scan DVD**, select a discovered title and available angle,
+   then **Inspect selected title**. Review its report and warnings, explicitly
    select Preserve or Yadif, acknowledge the experimental treatment, and convert.
+   Existing manual jobs stay manual. **Use Advanced for this import** stops future
+   automatic continuation while current discovery/inspection may finish.
+   Ambiguous Simple results remain usable without another copy or scan.
 4. After full decoding and output validation succeed, review the title, optional
    year, description, and warnings. Confirm **Publish to local library** separately.
 5. After publication succeeds, choose **Watch published movie** or open it from
@@ -394,8 +403,10 @@ The worker checks the confirmed source identity, persists a unique attempt ID,
 copies through a pinned read-only descriptor while computing SHA-256, checks
 the source handle and root-relative pathname again, fsyncs, and rehashes the
 private staged bytes. Scan, selected inspection, and conversion reuse the same
-staged input. Successful inspection ends at **Needs review**, never publication
-or cleanup. Conversion fully decodes the source and output, records hashes, and
+staged input. Advanced inspection ends at **Needs review**; authorized Simple
+inspection continues to Preserve conversion only after its policy and
+checksum/report binding gates succeed. Neither inspection publishes or cleans up.
+Conversion fully decodes the source and output, records hashes, and
 retains `movie.mp4`, `original-tracks.mkv`, reports, and logs in the attempt.
 Publication independently verifies the copied package before registration.
 Metadata/content checks
@@ -422,6 +433,21 @@ manually, with services stopped, before any operator-managed cleanup. No
 automatic cleanup of failed attempts exists. Failed conversion reports and their output files are
 not accepted as validated media.
 
+Simple continuation is durable and worker-owned, not dependent on the page
+remaining open. Repeated starts for the same confirmed source return the
+existing Simple workflow; stopped or failed workflows never automatically retry.
+A matching scan or successfully verified title 1 / angle 1 inspection can be
+reused; the normal retained-input rehash/identity guards still apply before
+inspection and conversion. Existing active manual selections, conversions and
+failed inspections remain in Advanced rather than being replaced or retried.
+Manual selections and automatic continuation cannot race to enqueue duplicate work.
+Simple does not authorize publication: output digest, validation review,
+metadata freshness and explicit final publication approval remain required.
+`POST /api/v1/admin/simple-imports` accepts `name`, `identity`, `copy_complete`
+and `accept_preserve`; all existing admin, origin and CSRF checks apply.
+`POST /api/v1/admin/scans/{id}/advanced` hands an active scan/inspection to manual
+review before a conversion has been queued.
+
 SIGTERM/Ctrl-C drains the worker's current work before releasing ownership,
 including blocking copy I/O; allow time for staging and inspection to finish.
 The worker heartbeat continues during active jobs. Force-killed jobs retain
@@ -430,7 +456,7 @@ their inputs; children retain the ownership lock until they exit.
 ## Upgrade local state
 
 Stop both services before running `wetube-server init` with this release.
-Initialization upgrades supported older schemas (1–11) to schema 12 only after a consistent `VACUUM INTO`
+Initialization upgrades supported older schemas (1–12) to schema 13 only after a consistent `VACUUM INTO`
 snapshot is written and synced in a private `pre-upgrade-UUID` directory under
 the state root. Newer/unknown versions fail closed. Repeating initialization
 does not create another snapshot once the upgrade succeeds.
@@ -440,6 +466,7 @@ schema 7 adds private comparisons, schema 8 adds their nullable progress,
 schema 9 adds expiring TMDB overlays, schema 10 adds movie labels, and schema 11
 adds the bounded private poster cache. Schema 12 adds recoverable movie Trash,
 login-bound playback leases, fixed-file ownership and purge audit history.
+Schema 13 adds durable Simple DVD import continuation; existing jobs remain manual.
 Existing jobs, reports, media, attempts and earlier progress snapshots are retained.
 Stop **both** services, retain the state/media/attempt roots, run the matching
 `wetube-server --state-dir <state-root> init`, then restart the matching server
@@ -725,6 +752,41 @@ cargo clippy --package wetube-web --target wasm32-unknown-unknown --locked -- -D
 The workspace separates portable API contracts (crates/core), backend
 persistence/authentication/locking (crates/backend), HTTP/administration
 (crates/server), diagnostics (crates/worker), and browser UI (crates/web).
+
+### Simple DVD import validation
+
+Focused policy, continuation, authorization and native schema-12 upgrade tests:
+
+```sh
+cargo test --workspace simple_ --locked --config 'env.TMPDIR="/mnt/c/TempPrivate"'
+```
+
+The isolated browser control test serves the compiled frontend through mocked
+browser routes. It verifies Advanced handoff, scan-wide sibling exclusion,
+conversion status changes and explicit publication consent without a database,
+server, worker or media fixtures:
+
+```sh
+env TMPDIR=/mnt/c/TempPrivate WETUBE_E2E_ARTIFACTS_DIR=/mnt/c/TempPrivate \
+  npm --prefix tests/e2e test -- --grep 'Simple inspection and conversion controls'
+```
+
+The opt-in authored-DVD test generates only disposable fixtures on C: and runs
+the actual scan, inspection and Preserve conversion through the worker, including
+a second worker invocation to check restart deduplication and separate publication review:
+
+```sh
+cargo test --package wetube-worker --test inspect --locked \
+  --config 'env.TMPDIR="/mnt/c/TempPrivate"' \
+  simple_authored_dvd_runs_real_chain_once_and_requires_publication_review -- --ignored --exact
+```
+
+Acceptance remains blocked on this development host: the authored fixture reached
+real discovery, inspection and Preserve encoding, then the unchanged strict input
+identity guard rejected C-backed ctime drift during encoding (inode, size and
+mtime stayed unchanged). The opt-in test still requires a successful validated
+conversion; it does not accept that failure as success. Real-DVD browser acceptance and
+the existing Trash C-backed-identity / legacy-media-404 blockers remain unproven.
 
 ### Opt-in real-DVD staged inspection test
 

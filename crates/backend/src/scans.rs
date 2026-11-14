@@ -4,6 +4,8 @@ use wetube_core::{InspectRequest, ProbeJob, ScanJob, ScanRequest};
 
 pub fn from_row(row: &SqliteRow) -> Result<ScanJob> {
     Ok(ScanJob {
+        simple_state: row.try_get("simple_state")?,
+        simple_message: row.try_get("simple_message")?,
         progress: row
             .try_get::<Option<String>, _>("progress")?
             .map(|text| serde_json::from_str(&text))
@@ -39,6 +41,8 @@ pub async fn enqueue(
         "INSERT INTO scan_jobs(id,requested_by,name,source_identity,state,created_at)
          SELECT ?,?,?,?,'queued',? WHERE NOT EXISTS
          (SELECT 1 FROM scan_jobs WHERE state IN ('queued','staging','scanning'))
+         AND NOT EXISTS(SELECT 1 FROM scan_jobs WHERE name=? AND source_identity=?
+                        AND simple_state IN ('scan','inspection','conversion'))
          RETURNING *",
     )
     .bind(uuid::Uuid::new_v4().to_string())
@@ -46,6 +50,8 @@ pub async fn enqueue(
     .bind(&request.name)
     .bind(&request.identity)
     .bind(super::now())
+    .bind(&request.name)
+    .bind(&request.identity)
     .fetch_optional(pool)
     .await?;
     row.as_ref().map(from_row).transpose()
@@ -57,14 +63,22 @@ pub async fn inspect(
     id: &str,
     request: &InspectRequest,
 ) -> Result<Option<ProbeJob>> {
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     let scan = sqlx::query("SELECT * FROM scan_jobs WHERE id=? AND state='needs_review'")
         .bind(id)
-        .fetch_optional(pool)
+        .fetch_optional(&mut *tx)
         .await?;
     let Some(scan) = scan else {
         return Ok(None);
     };
     let job = from_row(&scan)?;
+    ensure!(
+        !matches!(
+            job.simple_state.as_deref(),
+            Some("scan" | "inspection" | "conversion")
+        ),
+        "Simple import is active. Select Advanced before making a manual selection."
+    );
     ensure!(
         job.report.as_ref().is_some_and(|report| report
             .titles
@@ -82,6 +96,15 @@ pub async fn inspect(
         .bind(job.attempt_id.as_ref().context("scan has no retained attempt")?)
         .bind(serde_json::json!({"sha256":scan.try_get::<String,_>("sha256")?,"size_bytes":scan.try_get::<i64,_>("size_bytes")?,
             "staged_attempt_id":job.attempt_id}).to_string()).bind(id)
-        .fetch_optional(pool).await?;
+        .fetch_optional(&mut *tx).await?;
+    if row.is_some() {
+        sqlx::query(
+            "UPDATE scan_jobs SET simple_state='manual' WHERE id=? AND simple_state='advanced'",
+        )
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
     row.as_ref().map(super::probe_jobs::from_row).transpose()
 }

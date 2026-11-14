@@ -2,7 +2,7 @@ import { defineConfig } from '@playwright/test';
 
 export default defineConfig({
   testDir: '.',
-  testMatch: 'website.spec.ts',
+  testMatch: ['website.spec.ts', 'import-controls.spec.ts'],
   workers: 1,
   fullyParallel: false,
   timeout: 60_000,

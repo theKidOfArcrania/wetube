@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use unicode_normalization::UnicodeNormalization;
 
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
-pub const SCHEMA_VERSION: i64 = 12;
+pub const SCHEMA_VERSION: i64 = 13;
 pub const TMDB_SELECTION_EXPIRED: &str = "TMDB selection expired; search again before publication";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -546,6 +546,14 @@ pub struct ScanRequest {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct SimpleImportRequest {
+    #[serde(flatten)]
+    pub scan: ScanRequest,
+    pub accept_preserve: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct InspectRequest {
     pub title: u8,
     pub angle: u8,
@@ -579,8 +587,55 @@ pub struct DvdScanReport {
     pub titles: Vec<DvdTitle>,
 }
 
+impl DvdScanReport {
+    pub fn simple_selection(&self) -> Result<(), ValidationError> {
+        let invalid =
+            || ValidationError("Use Advanced: the DVD title inventory is incomplete or invalid.");
+        if self.titles.is_empty() || self.titles.len() > 99 {
+            return Err(invalid());
+        }
+        let mut seen = std::collections::HashSet::new();
+        for title in &self.titles {
+            if !(1..=99).contains(&title.title)
+                || !seen.insert(title.title)
+                || !title.duration_seconds.is_finite()
+                || title.duration_seconds <= 0.0
+                || title.duration_seconds > 86400.0
+                || title.angles.is_empty()
+                || title.angles.iter().any(|angle| !(1..=9).contains(angle))
+            {
+                return Err(invalid());
+            }
+        }
+        let first = self
+            .titles
+            .iter()
+            .find(|title| title.title == 1)
+            .ok_or_else(invalid)?;
+        if !self
+            .titles
+            .iter()
+            .all(|title| title.title == 1 || title.duration_seconds < first.duration_seconds)
+        {
+            return Err(ValidationError(
+                "Use Advanced: title 1 is not uniquely longest. Compare the discovered titles and select the movie.",
+            ));
+        }
+        if !first.angles.contains(&1) {
+            return Err(ValidationError(
+                "Use Advanced: title 1 has no angle 1. Select an available angle.",
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ScanJob {
+    #[serde(default)]
+    pub simple_state: Option<String>,
+    #[serde(default)]
+    pub simple_message: Option<String>,
     #[serde(default)]
     pub progress: Option<MediaProgress>,
     pub id: String,
@@ -628,6 +683,61 @@ pub fn validate_password(password: &str) -> Result<(), ValidationError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn simple_dvd_selection_requires_valid_unique_title_one_and_available_angle_one() {
+        let title = |number, duration, angles| DvdTitle {
+            title: number,
+            duration_seconds: duration,
+            angles,
+            chapter_count: 1,
+            audio_count: 0,
+            subtitle_count: 0,
+            audio_languages: vec![],
+            subtitle_languages: vec![],
+            main_feature_candidate: false,
+        };
+        let report = |titles| DvdScanReport { titles };
+        assert!(
+            report(vec![title(2, 10.0, vec![1]), title(1, 60.0, vec![1, 2])])
+                .simple_selection()
+                .is_ok()
+        );
+        assert!(
+            report(vec![title(1, 60.0, vec![1])])
+                .simple_selection()
+                .is_ok()
+        );
+        for titles in [
+            vec![],
+            vec![title(2, 60.0, vec![1])],
+            vec![title(1, 60.0, vec![1]), title(2, 60.0, vec![1])],
+            vec![title(1, 10.0, vec![1]), title(2, 60.0, vec![1])],
+            vec![
+                title(1, 10.0, vec![1]),
+                title(2, 60.0, vec![1]),
+                title(3, 60.0, vec![1]),
+            ],
+            vec![title(1, 60.0, vec![2])],
+            vec![title(1, 60.0, vec![])],
+            vec![title(1, 60.0, vec![1]), title(1, 30.0, vec![1])],
+            vec![title(0, 60.0, vec![1])],
+        ] {
+            assert!(report(titles).simple_selection().is_err());
+        }
+        for invalid in [0.0, -1.0, f64::NAN, f64::INFINITY, 86401.0] {
+            assert!(
+                report(vec![title(1, invalid, vec![1])])
+                    .simple_selection()
+                    .is_err()
+            );
+            assert!(
+                report(vec![title(1, 60.0, vec![1]), title(2, invalid, vec![1])])
+                    .simple_selection()
+                    .is_err()
+            );
+        }
+    }
 
     fn media_progress() -> MediaProgress {
         MediaProgress {

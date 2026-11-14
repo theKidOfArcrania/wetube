@@ -16,8 +16,8 @@ use wetube_core::{
     InspectRequest, JobState, Library, LoginRequest, MediaProgress, MediaProgressState,
     MediaWorkflow, MetadataMatch, MetadataResults, MetadataSearch, MetadataStatus, Movie,
     MovieDetails, PlaybackProgress, ProbeJob, ProbeState, PublishRequest, Role, ScanJob,
-    ScanRequest, ScanState, Session, SystemStatus, TmdbSource, UpdatePlaybackProgress,
-    VideoTreatment,
+    ScanRequest, ScanState, Session, SimpleImportRequest, SystemStatus, TmdbSource,
+    UpdatePlaybackProgress, VideoTreatment,
 };
 
 async fn decode<T: DeserializeOwned>(response: Response) -> Result<T, String> {
@@ -1626,6 +1626,8 @@ fn ImportsPanel(
     let conversions = RwSignal::new(Vec::<ConversionJob>::new());
     let selected = RwSignal::new(String::new());
     let copy_complete = RwSignal::new(false);
+    let simple = RwSignal::new(true);
+    let accept_preserve = RwSignal::new(false);
     let refreshing = RwSignal::new(false);
     let requesting = RwSignal::new(false);
     let error = RwSignal::new(None::<String>);
@@ -1805,16 +1807,33 @@ fn ImportsPanel(
             identity: file.identity,
             copy_complete: copy_complete.get_untracked(),
         };
+        let simple_request = simple.get_untracked().then(|| SimpleImportRequest {
+            scan: request.clone(),
+            accept_preserve: accept_preserve.get_untracked(),
+        });
+        if simple_request
+            .as_ref()
+            .is_some_and(|request| !request.accept_preserve)
+        {
+            error.set(Some(
+                "Accept the Preserve preview treatment before starting Simple import.".into(),
+            ));
+            return;
+        }
         let token = csrf.get_value();
         requesting.set(true);
         error.set(None);
         spawn_local(async move {
-            let result =
-                admin_post::<ScanJob>(scope, "/api/v1/admin/scans", &token, &request).await;
+            let result = if let Some(request) = simple_request {
+                admin_post::<ScanJob>(scope, "/api/v1/admin/simple-imports", &token, &request).await
+            } else {
+                admin_post::<ScanJob>(scope, "/api/v1/admin/scans", &token, &request).await
+            };
             if requesting.try_update(|busy| *busy = false).is_none() {
                 return;
             }
             copy_complete.set(false);
+            accept_preserve.set(false);
             match result {
                 Ok(job) => {
                     main_cursor.set(None);
@@ -1832,15 +1851,15 @@ fn ImportsPanel(
     view! {
         <section class="panel">
             <div class="toolbar">
-                <h2>"Scan an incoming DVD copy"</h2>
+                <h2>"Import an incoming DVD copy"</h2>
                 <button class="secondary" on:click=move |_| refresh()
                     disabled=move || refreshing.get() || requesting.get()>
                     "Refresh incoming files"
                 </button>
             </div>
             <p class="notice">
-                "Scan a verified private copy to find DVD titles and angles, then choose a title to inspect.
-                 Scanning does not convert, publish or delete anything."
+                "Simple scans and inspects the DVD, then converts with Preserve only when title 1 is uniquely longest
+                 and angle 1 is available. Ties or other selections need Advanced. Neither mode publishes or deletes anything automatically."
             </p>
             {move || incoming.get().map(|list| if !list.configured {
                 view! { <p class="subtle">"DVD scanning is disabled. Ask your administrator to configure incoming copies and private working storage."</p> }.into_any()
@@ -1850,12 +1869,23 @@ fn ImportsPanel(
                 view! { <p class="subtle">"Use finished incoming copies only, never the original archive. Scans wait for a connected, configured worker."</p> }.into_any()
             })}
             <form on:submit=submit>
+                <label for="dvd-import-mode">"DVD import mode"</label>
+                <select id="dvd-import-mode" prop:value=move || if simple.get() { "simple" } else { "advanced" }
+                    disabled=move || requesting.get()
+                    on:change=move |event| {
+                        simple.set(event_target_value(&event) == "simple");
+                        accept_preserve.set(false);
+                    }>
+                    <option value="simple">"Simple — scan, inspect and Preserve"</option>
+                    <option value="advanced">"Advanced — manual title, angle and treatment"</option>
+                </select>
                 <label for="incoming-iso">"Completed ISO copy"</label>
                 <select id="incoming-iso" required
                     prop:value=move || selected.get()
                     on:change=move |event| {
                         selected.set(event_target_value(&event));
                         copy_complete.set(false);
+                        accept_preserve.set(false);
                     }
                     disabled=move || refreshing.get() || requesting.get()>
                     <option value="">"Select an ISO..."</option>
@@ -1872,10 +1902,22 @@ fn ImportsPanel(
                     "I confirm this copy is finished and its SMB writers are closed."
                 </label>
                 <p class="subtle">"Confirmation cannot verify that writers are closed and does not authorize source deletion."</p>
+                <Show when=move || simple.get()>
+                    <p class="notice">"Preserve re-encodes without deinterlacing; it is not lossless.
+                        This preview profile is not approved for production. Original inputs and tracks are kept;
+                        image subtitles and OCR captions are not available for playback.
+                        A longest title is not proof of the main movie. Review the completed conversion before publication."</p>
+                    <label class="confirmation">
+                        <input type="checkbox" required prop:checked=move || accept_preserve.get()
+                            on:change=move |event| accept_preserve.set(event_target_checked(&event))/>
+                        "I accept these warnings and authorize Preserve conversion after a successful Simple scan and inspection."
+                    </label>
+                </Show>
                 <button type="submit" disabled=move || requesting.get() || refreshing.get()
                     || !copy_complete.get() || selected.get().is_empty()
+                    || (simple.get() && !accept_preserve.get())
                     || scans.get().iter().any(|job| matches!(job.state, ScanState::Queued | ScanState::Staging | ScanState::Scanning))>
-                    {move || if requesting.get() { "Queueing scan..." } else { "Scan DVD" }}
+                    {move || if requesting.get() { "Queueing..." } else if simple.get() { "Start Simple import" } else { "Scan DVD" }}
                 </button>
             </form>
             {move || error.get().map(|message| view! { <p role="alert" class="error">{message}</p> })}
@@ -1982,6 +2024,17 @@ fn import_label(entry: &ImportEntry) -> String {
         ImportJob::Scan(job) => (
             format!("DVD scan · {}", job.name),
             match job.state {
+                ScanState::NeedsReview
+                    if matches!(
+                        job.simple_state.as_deref(),
+                        Some("scan" | "inspection" | "conversion")
+                    ) =>
+                {
+                    "Simple import active — worker continues automatically"
+                }
+                ScanState::NeedsReview if job.simple_state.as_deref() == Some("advanced") => {
+                    "Advanced selection required"
+                }
                 ScanState::NeedsReview if entry.can_archive => "Inspection started — scan retained",
                 ScanState::NeedsReview => "Needs review — choose a title",
                 ScanState::Failed => "Failed — inputs retained",
@@ -2074,7 +2127,7 @@ fn ImportRow(
         let (kind, id) = key.get_value();
         match kind.as_str() {
             "scan" => view! { <ScanSelection id=id csrf=csrf scans=scans probes=probes/> }.into_any(),
-            "probe" => view! { <ProbeReview id=id csrf=csrf probes=probes conversions=conversions/> }.into_any(),
+            "probe" => view! { <ProbeReview id=id csrf=csrf scans=scans probes=probes conversions=conversions/> }.into_any(),
             _ => view! { <ConversionReview id=id csrf=csrf jobs=conversions movies=movies watch_movie=watch_movie/> }.into_any(),
         }
     };
@@ -2106,9 +2159,99 @@ fn ImportRow(
 }
 
 #[component]
+fn AdvancedImportAction(
+    scan_id: String,
+    csrf: StoredValue<String>,
+    scans: RwSignal<Vec<ScanJob>>,
+) -> impl IntoView {
+    let scan_id = StoredValue::new(scan_id);
+    let busy = RwSignal::new(false);
+    let error = RwSignal::new(None::<String>);
+    let scope = admin_scope();
+    let use_advanced = move |_| {
+        if busy.get_untracked() {
+            return;
+        }
+        busy.set(true);
+        error.set(None);
+        spawn_local(async move {
+            let result = admin_post::<ScanJob>(
+                scope,
+                &format!("/api/v1/admin/scans/{}/advanced", scan_id.get_value()),
+                &csrf.get_value(),
+                &(),
+            )
+            .await;
+            if busy.try_update(|busy| *busy = false).is_none() {
+                return;
+            }
+            match result {
+                Ok(job) => scans.update(|scans| {
+                    if let Some(existing) = scans.iter_mut().find(|existing| existing.id == job.id)
+                    {
+                        *existing = job;
+                    }
+                }),
+                Err(message) => error.set(Some(message)),
+            }
+        });
+    };
+    view! {
+        <button class="secondary" disabled=move || busy.get() on:click=use_advanced>"Use Advanced for this import"</button>
+        {move || error.get().map(|message| view! { <p role="alert" class="error">{message}</p> })}
+    }
+}
+
+fn conversion_review_status(state: Option<ConversionState>) -> &'static str {
+    match state {
+        Some(ConversionState::Queued) => "Conversion queued — waiting for worker.",
+        Some(ConversionState::Converting) => "Conversion running — not published.",
+        Some(ConversionState::NeedsReview) => {
+            "Conversion complete — review validation and metadata, then approve publication separately."
+        }
+        Some(ConversionState::QueuedPublication) => "Publication queued after explicit approval.",
+        Some(ConversionState::Publishing) => "Publication in progress.",
+        Some(ConversionState::Published) => "Published to the local library.",
+        Some(ConversionState::Failed) => {
+            "Conversion failed — inputs and reports retained. Review the conversion error."
+        }
+        None => "Simple conversion status is unavailable here. Review its conversion job.",
+    }
+}
+
+#[component]
+fn SimpleProbeContinuation(
+    attempt: Option<String>,
+    csrf: StoredValue<String>,
+    scans: RwSignal<Vec<ScanJob>>,
+    probes: RwSignal<Vec<ProbeJob>>,
+    conversions: RwSignal<Vec<ConversionJob>>,
+) -> impl IntoView {
+    let attempt = StoredValue::new(attempt);
+    view! {
+        {move || scans.get().into_iter().find(|scan| scan.attempt_id == attempt.get_value()).map(|scan| {
+            if scan.simple_state.as_deref() == Some("conversion") {
+                view! {
+                    <p role="status">{move || conversion_review_status(conversions.get().iter()
+                        .find(|job| probes.get().iter().any(|probe| probe.id == job.probe_job_id
+                            && probe.attempt_id == attempt.get_value() && probe.title == 1 && probe.angle == 1))
+                        .map(|job| job.state))}</p>
+                }.into_any()
+            } else {
+                view! {
+                    <p role="status">"Simple inspection continues on the worker. Use Advanced to make manual selections."</p>
+                    <AdvancedImportAction scan_id=scan.id csrf=csrf scans=scans/>
+                }.into_any()
+            }
+        })}
+    }
+}
+
+#[component]
 fn ProbeReview(
     id: String,
     csrf: StoredValue<String>,
+    scans: RwSignal<Vec<ScanJob>>,
     probes: RwSignal<Vec<ProbeJob>>,
     conversions: RwSignal<Vec<ConversionJob>>,
 ) -> impl IntoView {
@@ -2118,6 +2261,7 @@ fn ProbeReview(
             key=|job| (job.id.clone(), job.state)
             children=move |job| {
                 let job_id = StoredValue::new(job.id.clone());
+                let job_attempt = StoredValue::new(job.attempt_id.clone());
                 let label = match job.state {
                     ProbeState::Queued => "Queued",
                     ProbeState::Staging => "Copying and verifying private input",
@@ -2140,7 +2284,14 @@ fn ProbeReview(
                         })}
                         {inspection_summary(&job)}
                         {(job.state == ProbeState::NeedsReview).then(|| view! {
-                            <ProbeConversion probe_id=job.id.clone() csrf=csrf conversions=conversions/>
+                            <Show when=move || !scans.get().iter().any(|scan| scan.attempt_id == job_attempt.get_value()
+                                && matches!(scan.simple_state.as_deref(), Some("scan" | "inspection" | "conversion")))
+                                fallback=move || view! {
+                                    <SimpleProbeContinuation attempt=job_attempt.get_value()
+                                        csrf=csrf scans=scans probes=probes conversions=conversions/>
+                                }>
+                                <ProbeConversion probe_id=job_id.get_value() csrf=csrf conversions=conversions/>
+                            </Show>
                         })}
                         {job.attempt_id.map(|attempt| view! { <p class="attempt">"Attempt: "{attempt}</p> })}
                         {job.error.map(|message| view! { <p class="error">{message}</p> })}
@@ -2207,8 +2358,13 @@ fn ScanSelection(
     let error = RwSignal::new(None::<String>);
     let scope = admin_scope();
     let ready = move || {
-        scan.get()
-            .is_some_and(|scan| scan.state == ScanState::NeedsReview)
+        scan.get().is_some_and(|scan| {
+            scan.state == ScanState::NeedsReview
+                && !matches!(
+                    scan.simple_state.as_deref(),
+                    Some("scan" | "inspection" | "conversion")
+                )
+        })
     };
     let valid_selection = move || {
         selected_title.get().is_some_and(|title| {
@@ -2275,7 +2431,14 @@ fn ScanSelection(
                     ScanState::Queued => "Scan queued — waiting for worker",
                     ScanState::Staging => "Copying and verifying the ISO",
                     ScanState::Scanning => "Finding DVD titles and angles",
-                    ScanState::NeedsReview => "Scan complete — select a title for inspection",
+                    ScanState::NeedsReview => match scan.simple_state.as_deref() {
+                        Some("scan") => "Scan complete — checking Simple selection",
+                        Some("inspection") => "Simple import — inspecting title 1 / angle 1",
+                        Some("conversion") => "Simple import — Preserve conversion queued or running",
+                        Some("advanced") => "Advanced selection required — retained results are ready",
+                        Some("review") => "Conversion complete — review and publication approval required",
+                        _ => "Scan complete — select a title for inspection",
+                    },
                     ScanState::Failed => "Scan failed — ISO, reports and logs retained",
                 };
                 view! {
@@ -2291,8 +2454,14 @@ fn ScanSelection(
                     <p class="attempt">"Scan job: "{scan.id}</p>
                     {scan.attempt_id.map(|attempt| view! { <p class="attempt">"Attempt: "{attempt}</p> })}
                     {scan.error.map(|message| view! { <p role="alert" class="error">{message}</p> })}
+                    {scan.simple_message.map(|message| view! { <p role="status" class="notice">{message}</p> })}
                 }
             })}
+            <Show when=move || scan.get().is_some_and(|scan| matches!(scan.simple_state.as_deref(), Some("scan" | "inspection")))>
+                <p class="subtle">"The worker continues without this page open. Completed stages and reports are retained.
+                    Use Advanced to stop automatic continuation and make manual selections; current scanning or inspection may finish."</p>
+                <AdvancedImportAction scan_id=id.get_value() csrf=csrf scans=scans/>
+            </Show>
             <Show when=ready>
                 <p class="field-help">"DVD titles are numbered programs: features, trailers or extras.
                     Neither title 1 nor the longest title is always the main feature. Review before choosing."</p>
@@ -2592,7 +2761,10 @@ fn ProbeConversion(
                 </button>
             </form>
             {move || (submitted.get() || existing()).then(|| view! {
-                <p role="status" class="subtle">"Conversion queued or already exists. Review it below; publication requires separate approval."</p>
+                <p role="status" class="subtle">{move || conversions.get().iter()
+                    .find(|job| job.probe_job_id == probe_id.get_value())
+                    .map_or("Conversion request submitted. Refresh its status before retrying.",
+                        |job| conversion_review_status(Some(job.state)))}</p>
             })}
             {move || error.get().map(|message| view! { <p role="alert" class="error">{message}</p> })}
         </div>

@@ -65,6 +65,7 @@ pub async fn tick(
     let progress = &recording.progress;
     let result: Result<()> = async {
         if job.state == wetube_core::ConversionState::Converting {
+            wetube_backend::simple_imports::validate_conversion(pool, &job.id).await?;
             let probe = sqlx::query("SELECT * FROM probe_jobs WHERE id=? AND state='needs_review'")
                 .bind(&job.probe_job_id).fetch_one(pool).await?;
             let probe = probe_jobs::from_row(&probe)?;
@@ -107,6 +108,77 @@ pub async fn tick(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn simple_claim_gate_failure_is_retained_without_media_work_or_worker_failure()
+    -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let state = directory.path().join("state");
+        let incoming = directory.path().join("incoming");
+        let scratch = directory.path().join("scratch");
+        let media = directory.path().join("media");
+        for path in [&state, &incoming, &media] {
+            std::fs::create_dir(path)?;
+        }
+        wetube_backend::db::initialize(&state).await?;
+        let pool = wetube_backend::db::connect(&state).await?;
+        sqlx::query("INSERT INTO users VALUES('admin','admin','hash','viewer')")
+            .execute(&pool)
+            .await?;
+        sqlx::query("INSERT INTO scan_jobs(id,requested_by,name,source_identity,state,created_at,simple_state,simple_requested_by) VALUES('scan','admin','fixture.iso','bound','needs_review',1,'conversion','admin')")
+            .execute(&pool).await?;
+        sqlx::query("INSERT INTO probe_jobs(id,requested_by,name,source_identity,title,angle,state,created_at,scan_job_id,attempt_id,report) VALUES('probe','admin','fixture.iso','bound',1,1,'needs_review',1,'scan','retained','{}')")
+            .execute(&pool).await?;
+        sqlx::query("INSERT INTO conversion_jobs(id,probe_job_id,requested_by,state,created_at,video_treatment) VALUES('conversion','probe','admin','queued',1,'preserve')")
+            .execute(&pool).await?;
+        sqlx::query(
+            "UPDATE scan_jobs SET simple_probe_id='probe',simple_conversion_id='conversion'",
+        )
+        .execute(&pool)
+        .await?;
+        wetube_backend::simple_imports::advance(&pool).await?;
+        let config = Arc::new(super::super::imports::ImportConfig::open(
+            &incoming,
+            &scratch,
+            1024,
+            1024 * 1024,
+            Duration::from_secs(30),
+        )?);
+        let media = PreviewRoot::open(&media)?;
+        assert!(
+            tick(
+                &pool,
+                config,
+                &media,
+                &Limits {
+                    timeout: Duration::from_secs(30),
+                    threads: 2,
+                    max_output_bytes: 1024 * 1024,
+                }
+            )
+            .await?
+        );
+        let job = conversions::list(&pool).await?.remove(0);
+        assert_eq!(job.state, wetube_core::ConversionState::Failed);
+        assert!(
+            job.error
+                .unwrap()
+                .contains("authorization or workflow changed")
+        );
+        assert_eq!(
+            std::fs::read_dir(scratch)?.count(),
+            0,
+            "no encoding attempt or output is created after a gate failure"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM movies")
+                .fetch_one(&pool)
+                .await?,
+            0
+        );
+        pool.close().await;
+        Ok(())
+    }
 
     #[tokio::test]
     async fn interrupted_work_is_retained_failed_and_never_registered() -> Result<()> {

@@ -361,6 +361,7 @@ test('failed resume save still allows returning to the library with a warning', 
 
 test('admin diagnostics and ISO scanning retain failed input without publication', async ({ page }) => {
   await login(page, 'e2e-admin');
+  await page.getByLabel('DVD import mode', { exact: true }).selectOption('advanced');
   await expect(page.getByText('Worker connected', { exact: true })).toBeVisible();
   await page.getByRole('button', { name: 'Check again', exact: true }).click();
   await expect.poll(async () => {
@@ -1655,6 +1656,7 @@ test('archive and restore persist across reload without hiding another administr
 test('real DVD scan, selected inspection, conversion, publication and playback preserve inputs', async ({ page }) => {
   test.setTimeout(120_000);
   await login(page, 'e2e-admin');
+  await page.getByLabel('DVD import mode', { exact: true }).selectOption('advanced');
   const original = (await (await page.request.get(`${baseURL}/api/v1/admin/incoming`)).json()).files.find(file => file.name === 'browser-valid.iso');
   const originalHash = command('sha256sum', [dvdIncomingFile]).split(/\s+/, 1)[0];
   await page.getByRole('button', { name: 'Refresh incoming files', exact: true }).click();
