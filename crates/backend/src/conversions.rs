@@ -74,6 +74,9 @@ pub async fn publish(
                 .all(|byte| byte.is_ascii_hexdigit()),
         "publication requires confirmation and valid metadata/hash"
     );
+    if let Some(source) = &request.tmdb {
+        super::metadata::validate_selection(source, super::now())?;
+    }
     let row = sqlx::query(
         "UPDATE conversion_jobs SET state='queued_publication',phase='queued_publication',publication=?
          WHERE id=? AND state='needs_review' AND movie_sha256=? RETURNING *"
@@ -115,6 +118,7 @@ mod tests {
             description: "".into(),
             movie_sha256: "b".repeat(64),
             confirm: true,
+            tmdb: None,
         };
         assert!(
             publish(&pool, &job.id, &publication)

@@ -32,6 +32,7 @@ use wetube_core::{
 };
 
 pub mod admission;
+pub mod metadata;
 
 const COOKIE_NAME: &str = "wetube_session";
 const SESSION_SECONDS: i64 = 7 * 24 * 60 * 60;
@@ -176,6 +177,12 @@ pub async fn router_with_conversions(
         .route("/jobs", get(jobs))
         .route("/jobs/diagnostics", post(queue_diagnostics))
         .route("/admin/incoming", get(incoming_files))
+        .route("/admin/metadata", get(metadata::status))
+        .route("/admin/metadata/search", post(metadata::search))
+        .route(
+            "/admin/movies/{id}/metadata/refresh",
+            post(metadata::refresh),
+        )
         .route("/admin/imports", get(imports))
         .route("/admin/imports/{kind}/{id}/archive", post(archive_import))
         .route("/admin/probes", get(probes).post(queue_probe))
@@ -440,9 +447,16 @@ async fn movies(
 ) -> Result<Json<Library>, HttpError> {
     session(&state, &headers).await?;
     let rows = sqlx::query(
-        "SELECT id, title, year, description FROM movies WHERE status = 'ready'
+        "SELECT m.id,COALESCE(t.title,m.title) title,
+         CASE WHEN t.title IS NOT NULL THEN t.year ELSE m.year END year,
+         COALESCE(t.description,m.description) description,
+         s.tmdb_id,s.expires_at metadata_expires_at
+         FROM movies m LEFT JOIN tmdb_metadata s ON s.movie_id=m.id
+         LEFT JOIN tmdb_metadata t ON t.movie_id=m.id AND t.expires_at>?
+         WHERE m.status = 'ready'
          ORDER BY title COLLATE NOCASE",
     )
+    .bind(now())
     .fetch_all(&state.pool)
     .await
     .map_err(internal)?;
@@ -454,6 +468,8 @@ async fn movies(
                 title: row.get("title"),
                 year: row.get("year"),
                 description: row.get("description"),
+                tmdb_id: row.get("tmdb_id"),
+                metadata_expires_at: row.get("metadata_expires_at"),
             })
             .collect(),
     }))
@@ -468,9 +484,15 @@ struct ReadyPreview {
 
 async fn preview(state: &AppState, id: &str) -> Result<ReadyPreview, HttpError> {
     let row = sqlx::query(
-        "SELECT m.id,m.title,m.year,m.description,p.package_id,p.size_bytes,p.duration_seconds,p.file_identity
-         FROM movies m JOIN preview_media p ON p.movie_id=m.id WHERE m.id=? AND m.status='ready'",
-    ).bind(id).fetch_optional(&state.pool).await.map_err(internal)?
+        "SELECT m.id,COALESCE(t.title,m.title) title,
+         CASE WHEN t.title IS NOT NULL THEN t.year ELSE m.year END year,
+         COALESCE(t.description,m.description) description,s.tmdb_id,s.expires_at metadata_expires_at,
+         p.package_id,p.size_bytes,p.duration_seconds,p.file_identity
+         FROM movies m JOIN preview_media p ON p.movie_id=m.id
+         LEFT JOIN tmdb_metadata s ON s.movie_id=m.id
+         LEFT JOIN tmdb_metadata t ON t.movie_id=m.id AND t.expires_at>?
+         WHERE m.id=? AND m.status='ready'",
+    ).bind(now()).bind(id).fetch_optional(&state.pool).await.map_err(internal)?
         .ok_or_else(|| HttpError(StatusCode::NOT_FOUND, "Movie is not available for local preview".into()))?;
     Ok(ReadyPreview {
         details: MovieDetails {
@@ -479,6 +501,8 @@ async fn preview(state: &AppState, id: &str) -> Result<ReadyPreview, HttpError> 
                 title: row.get("title"),
                 year: row.get("year"),
                 description: row.get("description"),
+                tmdb_id: row.get("tmdb_id"),
+                metadata_expires_at: row.get("metadata_expires_at"),
             },
             duration_seconds: row.get("duration_seconds"),
         },
@@ -945,7 +969,26 @@ async fn queue_publication(
             "Confirm reviewed output, hash, and valid movie metadata".into(),
         ));
     }
-    let job = conversions::publish(&state.pool,&id,&request).await.map_err(internal)?
+    let invalid_selection = || {
+        HttpError(
+            StatusCode::CONFLICT,
+            wetube_core::TMDB_SELECTION_EXPIRED.into(),
+        )
+    };
+    if let Some(source) = &request.tmdb {
+        wetube_backend::metadata::validate_selection(source, now())
+            .map_err(|_| invalid_selection())?;
+    }
+    let job = conversions::publish(&state.pool,&id,&request).await.map_err(|error| {
+        // The authoritative backend check can cross the 24-hour boundary
+        // after the HTTP precheck; that is still an actionable conflict.
+        if request.tmdb.as_ref().is_some_and(|source|
+            wetube_backend::metadata::validate_selection(source, now()).is_err()) {
+            invalid_selection()
+        } else {
+            internal(error)
+        }
+    })?
         .ok_or_else(||HttpError(StatusCode::CONFLICT,"Publication requires an unpublished successful conversion and its exact validated hash".into()))?;
     Ok((StatusCode::ACCEPTED, Json(job)))
 }

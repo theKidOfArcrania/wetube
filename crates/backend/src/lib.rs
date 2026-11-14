@@ -5,6 +5,7 @@ pub mod db;
 pub mod import_history;
 pub mod incoming;
 pub mod lock;
+pub mod metadata;
 pub mod preview;
 pub mod probe_jobs;
 pub mod scans;

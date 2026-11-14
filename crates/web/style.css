@@ -7,7 +7,10 @@
 }
 * { box-sizing: border-box; }
 body { margin: 0; }
-header, main { max-width: 1160px; margin: auto; padding: 1.5rem; }
+header, main, footer { max-width: 1160px; margin: auto; padding: 1.5rem; }
+footer { border-top: 1px solid #30323d; font-size: .85rem; }
+.metadata-lookup { border-bottom: 1px solid #444958; padding-bottom: 1rem; margin-bottom: 1rem; }
+.metadata-lookup article { margin-top: 1rem; }
 header { display: flex; align-items: center; justify-content: space-between; gap: 1rem; }
 .brand { color: #ff626b; font-size: 1.7rem; font-weight: 850; letter-spacing: -.06em; }
 .subtle, small { color: #a7abb9; }

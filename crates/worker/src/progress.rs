@@ -79,6 +79,7 @@ impl Recording {
             "scan_jobs" => "UPDATE scan_jobs SET progress=? WHERE id=?",
             "probe_jobs" => "UPDATE probe_jobs SET progress=? WHERE id=?",
             "conversion_jobs" => "UPDATE conversion_jobs SET progress=? WHERE id=?",
+            "comparison_jobs" => "UPDATE comparison_jobs SET progress=? WHERE id=?",
             _ => unreachable!("fixed progress table"),
         };
         let progress = Progress(Arc::new(Mutex::new(Current {

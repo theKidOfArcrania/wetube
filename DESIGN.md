@@ -6,6 +6,28 @@ record agreed choices; proposals and deferred items are not deployment approvals
 
 This design was reviewed before application implementation.
 
+### Optional TMDB review metadata (implemented locally)
+
+Administrator-only, same-origin, CSRF-protected POSTs may search the fixed TMDB
+API or explicitly refresh a linked ready movie. The server alone reads a private
+token file, gated by operator acceptance of current provider terms. Search sends
+only deliberately entered text/year and fixed API options, never filenames/media.
+Responses, result count, request duration, concurrency and rate are bounded;
+redirects and operator-supplied endpoints are not allowed. Failures are sanitized.
+Selecting a match explicitly fills editable publication metadata and resets
+consent. Digest-bound publication remains separate; manual metadata remains valid.
+
+Provider text is an expiring 150-day overlay, never embedded in media manifests
+or reports. Local filename fallback and media survive expiry/provider outages.
+Selection freshness is limited to 24 hours; publication checks cache lifetime
+at queue execution and final atomic registration. Successful linked publication
+clears its duplicate metadata JSON. Expiry scrubs provider text (including queued,
+failed and interrupted publications); conditional SQL avoids erasing new reviews
+or refreshed overlays. Source IDs remain for explicit administrator refresh.
+GETs never invoke TMDB. About / Credits bundles the approved logo and current
+reviewed attribution notice locally. Operators own retention of offline databases,
+snapshots/backups and current terms compliance; implementation is not legal approval.
+
 ### Current local website test milestone
 
 The local preview supports login, library search, authenticated progressive
@@ -114,6 +136,15 @@ under private scratch, never static media. Playback requires administrator
 authentication, an unchanged inspection and validated file identity through a
 pinned no-symlink root, including byte ranges. Failures/restarts retain partial
 artifacts unregistered and never advance readiness or touch originals.
+
+Schema 8 adds optional persisted comparison progress, reusing the existing
+one-second best-effort recorder, bounded FFmpeg progress capture and segmented UI.
+Its stages are ISO checksum revalidation (bytes), shared extraction/validation,
+sequential Preserve and Yadif encode/validation (media seconds), then finalization.
+Metadata, clip hashing and durability work are explicitly indeterminate subphases.
+Terminal state, not progress, completes the bar or permits playback; recovery
+retains the last snapshot without resuming its clock. Upgrade only after draining
+and stopping both services, with the normal SQLite snapshot and retained asset roots.
 
 On this development host, incoming files are in /mnt/share/staging. ISO staging
 is exclusively in /mnt/c/TempPrivate/website-staging; new prepared media belongs

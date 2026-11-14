@@ -11,8 +11,9 @@ use wetube_core::{
     ApiError, ArchiveImport, ComparisonJob, ConversionJob, ConversionRequest, ConversionState,
     DiagnosticJob, DiagnosticReport, ImportEntry, ImportJob, ImportPage, IncomingFiles,
     InspectRequest, JobState, Library, LoginRequest, MediaProgress, MediaProgressState,
-    MediaWorkflow, Movie, MovieDetails, PlaybackProgress, ProbeJob, ProbeState, PublishRequest,
-    Role, ScanJob, ScanRequest, ScanState, Session, SystemStatus, UpdatePlaybackProgress,
+    MediaWorkflow, MetadataMatch, MetadataResults, MetadataSearch, MetadataStatus, Movie,
+    MovieDetails, PlaybackProgress, ProbeJob, ProbeState, PublishRequest, Role, ScanJob,
+    ScanRequest, ScanState, Session, SystemStatus, TmdbSource, UpdatePlaybackProgress,
     VideoTreatment,
 };
 
@@ -231,6 +232,11 @@ pub fn App() -> impl IntoView {
                 }
             }}
         </main>
+        <footer>
+                <h2>"About / Credits"</h2>
+                <img src="/tmdb.svg" width="90" alt="TMDB"/>
+                <p>"This application uses TMDB and the TMDB APIs but is not endorsed, certified, or otherwise approved by TMDB."</p>
+        </footer>
     }
 }
 
@@ -315,6 +321,18 @@ fn LibraryPage(current: Session, session: RwSignal<Option<Session>>) -> impl Int
     let error = RwSignal::new(None::<String>);
     let query = RwSignal::new(String::new());
     let requesting = RwSignal::new(false);
+    let filtered = Signal::derive(move || {
+        let needle = query.get().to_lowercase();
+        movies
+            .get()
+            .into_iter()
+            .filter(|movie| {
+                format!("{} {}", movie.title, movie.description)
+                    .to_lowercase()
+                    .contains(&needle)
+            })
+            .collect::<Vec<_>>()
+    });
     let mounted = Arc::new(AtomicBool::new(true));
     let cleanup = mounted.clone();
     on_cleanup(move || cleanup.store(false, Ordering::Relaxed));
@@ -424,31 +442,26 @@ fn LibraryPage(current: Session, session: RwSignal<Option<Session>>) -> impl Int
             <input aria-label="Search your library" placeholder="Search titles and descriptions"
                 type="search" bind:value=query/>
         </div>
-        {move || {
-            if loading.get() {
-                return view! { <p role="status" class="subtle">"Loading your library..."</p> }.into_any();
-            }
-            let needle = query.get().to_lowercase();
-            let filtered = movies.get().into_iter()
-                .filter(|movie| format!("{} {}", movie.title, movie.description).to_lowercase().contains(&needle))
-                .collect::<Vec<_>>();
-            if filtered.is_empty() {
-                view! {
+        <Show when=move || loading.get()>
+            <p role="status" class="subtle">"Loading your library..."</p>
+        </Show>
+        <Show when=move || !loading.get()>
+            <Show when=move || filtered.get().is_empty()>
                     <section class="empty">
-                        <h2>{if needle.is_empty() { "A home for your DVD collection" } else { "No matching movies" }}</h2>
+                        <h2>{move || if query.get().is_empty() { "A home for your DVD collection" } else { "No matching movies" }}</h2>
                         <p class="subtle">
-                            {if needle.is_empty() {
+                            {move || if query.get().is_empty() {
                                 "No movies are published yet. An administrator must inspect, convert, validate and explicitly publish a movie before it appears here."
                             } else {
                                 "Try a different title or description."
                             }}
                         </p>
                     </section>
-                }.into_any()
-            } else {
-                view! {
+            </Show>
                     <div class="grid">
-                        {filtered.into_iter().map(|movie| {
+                        <For each=move || filtered.get()
+                            key=|movie| (movie.id.clone(), movie.title.clone(), movie.year, movie.description.clone(), movie.metadata_expires_at)
+                            children=move |movie| {
                             let watch_label = format!("Watch {}", movie.title);
                             let chosen = movie.clone();
                             view! {
@@ -460,12 +473,13 @@ fn LibraryPage(current: Session, session: RwSignal<Option<Session>>) -> impl Int
                                     watch_movie.run(chosen.clone());
                                 }
                                     disabled=move || signing_out.get()>{watch_label}</button>
+                                {if is_admin && movie.tmdb_id.is_some() {
+                                    Some(view! { <MetadataRefresh movie_id=movie.id expires=movie.metadata_expires_at csrf=csrf movies=movies/> })
+                                } else { None }}
                             </article>
-                        }}).collect_view()}
+                        }}/>
                     </div>
-                }.into_any()
-            }
-        }}
+        </Show>
         </Show>
         {move || error.get().map(|message| view! { <p role="alert" class="error">{message}</p> })}
         {is_admin.then(|| view! {
@@ -503,6 +517,52 @@ fn LibraryPage(current: Session, session: RwSignal<Option<Session>>) -> impl Int
                 <ImportsPanel csrf=csrf movies=movies watch_movie=watch_movie/>
             </Show>
         })}
+    }
+}
+
+#[component]
+fn MetadataRefresh(
+    movie_id: String,
+    expires: Option<i64>,
+    csrf: StoredValue<String>,
+    movies: RwSignal<Vec<Movie>>,
+) -> impl IntoView {
+    let scope = admin_scope();
+    let busy = RwSignal::new(false);
+    let message = RwSignal::new(None::<String>);
+    let url = StoredValue::new(format!(
+        "/api/v1/admin/movies/{}/metadata/refresh",
+        js_sys::encode_uri_component(&movie_id)
+    ));
+    let refresh = move |_| {
+        if busy.get_untracked() {
+            return;
+        }
+        busy.set(true);
+        message.set(None);
+        spawn_local(async move {
+            let result =
+                admin_post::<MetadataMatch>(scope, &url.get_value(), &csrf.get_value(), &()).await;
+            if busy.try_update(|busy| *busy = false).is_none() {
+                return;
+            }
+            match result {
+                Ok(_) => match admin_get::<Library>(scope, "/api/v1/movies").await {
+                    Ok(library) => {
+                        let _ = movies.try_set(library.movies);
+                    }
+                    Err(error) => {
+                        let _ = message.try_set(Some(error));
+                    }
+                },
+                Err(error) => message.set(Some(error)),
+            }
+        });
+    };
+    view! {
+        <p class="subtle">{format!("TMDB metadata expires: {}. Local playback remains available.", expires.map(checked_time).unwrap_or_default())}</p>
+        <button class="secondary" disabled=move || busy.get() on:click=refresh>"Refresh TMDB metadata"</button>
+        {move || message.get().map(|message| view! { <p role="alert">{message}</p> })}
     }
 }
 
@@ -1773,13 +1833,15 @@ fn ComparisonPreview(probe_id: String, csrf: StoredValue<String>) -> impl IntoVi
                 (short titles use their shorter duration). Reuses the verified private staged ISO, without another NAS copy
                 or full-film encode. DVD timing is approximate; this is not motion detection.
                 H.264/AAC previews are not lossless and do not validate the full title/disc or authorize publication."</p>
-            <button type="button" on:click=submit disabled=move || !loaded.get() || loading.get()
-                || job.get().is_some_and(|job| job.state != JobState::Failed)>
-                "Generate Preserve vs Yadif preview"
-            </button>
-            <button type="button" on:click=move |_| refresh() disabled=move || loading.get()>
-                "Refresh comparison status"
-            </button>
+            <div class="probe-options">
+                <button type="button" on:click=submit disabled=move || !loaded.get() || loading.get()
+                    || job.get().is_some_and(|job| job.state != JobState::Failed)>
+                    "Generate Preserve vs Yadif preview"
+                </button>
+                <button type="button" on:click=move |_| refresh() disabled=move || loading.get()>
+                    "Refresh comparison status"
+                </button>
+            </div>
             {move || job.get().map(|job| {
                 let ready = job.state == JobState::Succeeded;
                 let timing = job.report.as_ref().map(|report| format!(
@@ -1787,6 +1849,12 @@ fn ComparisonPreview(probe_id: String, csrf: StoredValue<String>) -> impl IntoVi
                     report["requested_start_seconds"].as_f64().unwrap_or(0.0),
                     report["requested_duration_seconds"].as_f64().unwrap_or(0.0)));
                 view! {
+                    <MediaJobProgress workflow=MediaWorkflow::Comparison progress=job.progress state=match job.state {
+                        JobState::Queued => MediaProgressState::Queued,
+                        JobState::Running => MediaProgressState::Active,
+                        JobState::Succeeded => MediaProgressState::Complete,
+                        JobState::Failed => MediaProgressState::Failed,
+                    }/>
                     <p role="status">{match job.state {
                         JobState::Queued => "Comparison queued — waiting for worker.",
                         JobState::Running => "Generating and decoding both comparison clips...",
@@ -1954,6 +2022,184 @@ fn publication_metadata(
     Ok((title, year, description))
 }
 
+fn metadata_clock() -> f64 {
+    web_sys::window()
+        .and_then(|window| window.performance())
+        .map_or(f64::NAN, |performance| performance.now() / 1000.0)
+}
+
+fn metadata_is_fresh(received_at: f64) -> bool {
+    (0.0..86400.0).contains(&(metadata_clock() - received_at))
+}
+
+#[derive(Clone)]
+struct MetadataSelection {
+    source: TmdbSource,
+    received_at: f64,
+}
+
+#[component]
+fn MetadataLookup(
+    csrf: StoredValue<String>,
+    title: RwSignal<String>,
+    year: RwSignal<String>,
+    description: RwSignal<String>,
+    source: RwSignal<Option<MetadataSelection>>,
+    confirmed: RwSignal<bool>,
+    disabled: Signal<bool>,
+) -> impl IntoView {
+    let scope = admin_scope();
+    let configured = RwSignal::new(false);
+    let query = RwSignal::new(String::new());
+    let search_year = RwSignal::new(String::new());
+    let searching = RwSignal::new(false);
+    let results = RwSignal::new(Vec::<(MetadataMatch, f64)>::new());
+    let message = RwSignal::new(None::<String>);
+    Effect::new(move |_| {
+        if source
+            .get()
+            .is_some_and(|selection| !metadata_is_fresh(selection.received_at))
+        {
+            results.set(Vec::new());
+        }
+    });
+    spawn_local(async move {
+        let result = admin_get::<MetadataStatus>(scope, "/api/v1/admin/metadata").await;
+        if configured.try_get_untracked().is_none() {
+            return;
+        }
+        match result {
+            Ok(status) => {
+                configured.set(status.configured);
+                if !status.configured {
+                    message.set(Some(
+                        "TMDB lookup is disabled; manual entry is available.".into(),
+                    ));
+                }
+            }
+            Err(_) => message.set(Some(
+                "Metadata lookup is unavailable; manual entry is available.".into(),
+            )),
+        }
+    });
+    let search = move |event: web_sys::SubmitEvent| {
+        event.prevent_default();
+        if disabled.get_untracked() || searching.get_untracked() || !configured.get_untracked() {
+            return;
+        }
+        let year = search_year.get_untracked();
+        let year = if year.trim().is_empty() {
+            None
+        } else {
+            match year.trim().parse::<i32>() {
+                Ok(year) if (1888..=2100).contains(&year) => Some(year),
+                _ => {
+                    message.set(Some("Enter a year from 1888 to 2100.".into()));
+                    return;
+                }
+            }
+        };
+        let query = query.get_untracked().trim().to_owned();
+        if query.is_empty() || query.len() > 256 || query.chars().any(char::is_control) {
+            message.set(Some("Enter a search title (1–256 UTF-8 bytes).".into()));
+            return;
+        }
+        searching.set(true);
+        results.set(Vec::new());
+        message.set(None);
+        spawn_local(async move {
+            let result = admin_post::<MetadataResults>(
+                scope,
+                "/api/v1/admin/metadata/search",
+                &csrf.get_value(),
+                &MetadataSearch { query, year },
+            )
+            .await;
+            if searching
+                .try_update(|searching| *searching = false)
+                .is_none()
+            {
+                return;
+            }
+            match result {
+                Ok(response) => {
+                    if response.movies.is_empty() {
+                        message.set(Some(
+                            "No matches; try another search or enter metadata manually.".into(),
+                        ));
+                    }
+                    // Browser time is only a local elapsed-time hint. The server
+                    // independently validates the unchanged fetched_at at publish.
+                    let received_at = metadata_clock();
+                    results.set(
+                        response
+                            .movies
+                            .into_iter()
+                            .map(|movie| (movie, received_at))
+                            .collect(),
+                    );
+                }
+                Err(error) => message.set(Some(error)),
+            }
+        });
+    };
+    view! {
+        <section class="metadata-lookup">
+            <h4>"Optional TMDB lookup"</h4>
+            <p class="subtle">"Only the search title and optional year you enter are sent to TMDB by the server.
+                No filename, ISO or media is uploaded. Choose a result explicitly, then edit and review.
+                TMDB metadata expires after 150 days; library refresh is administrator-initiated."</p>
+            <form on:submit=search>
+                <label>"Search TMDB title"<input maxlength="256" required bind:value=query
+                    disabled=move || disabled.get() || searching.get() || !configured.get()/></label>
+                <label>"Search TMDB year (optional)"<input type="number" min="1888" max="2100" bind:value=search_year
+                    disabled=move || disabled.get() || searching.get() || !configured.get()/></label>
+                <button type="submit" disabled=move || disabled.get() || searching.get() || !configured.get()>
+                    {move || if searching.get() { "Searching TMDB..." } else { "Search TMDB" }}
+                </button>
+            </form>
+            {move || message.get().map(|message| view! { <p role="status">{message}</p> })}
+            {move || results.get().into_iter().map(|(matched, received_at)| {
+                let label = format!("{} ({})", matched.title, matched.year.map(|year| year.to_string()).unwrap_or_else(|| "year unknown".into()));
+                view! {
+                    <article>
+                        <strong>{label}</strong>
+                        <p>{matched.description.clone()}</p>
+                        <button type="button" disabled=move || disabled.get() || searching.get()
+                            on:click=move |_| {
+                                if disabled.get_untracked() || searching.get_untracked() { return; }
+                                if !metadata_is_fresh(received_at) {
+                                    message.set(Some("Search result expired; search again.".into()));
+                                    return;
+                                }
+                                title.set(matched.title.clone());
+                                year.set(matched.year.map(|year| year.to_string()).unwrap_or_default());
+                                description.set(matched.description.clone());
+                                source.set(Some(MetadataSelection {
+                                    source: TmdbSource { id: matched.id, fetched_at: matched.fetched_at },
+                                    received_at,
+                                }));
+                                confirmed.set(false);
+                            }>"Use this match"</button>
+                    </article>
+                }
+            }).collect_view()}
+            <Show when=move || source.get().is_some()>
+                <p class="subtle">"Selected TMDB metadata remains editable. Confirm publication separately within 24 hours."</p>
+                <button type="button" class="secondary" disabled=move || disabled.get()
+                    on:click=move |_| {
+                        if disabled.get_untracked() { return; }
+                        source.set(None);
+                        title.set(String::new());
+                        year.set(String::new());
+                        description.set(String::new());
+                        confirmed.set(false);
+                    }>"Clear TMDB selection for manual entry"</button>
+            </Show>
+        </section>
+    }
+}
+
 #[component]
 fn ConversionReview(
     id: String,
@@ -1968,6 +2214,22 @@ fn ConversionReview(
     let year = RwSignal::new(String::new());
     let description = RwSignal::new(String::new());
     let confirmed = RwSignal::new(false);
+    let tmdb = RwSignal::new(None::<MetadataSelection>);
+    let clock = RwSignal::new(metadata_clock());
+    let timer = StoredValue::new_local(Some(gloo_timers::callback::Interval::new(
+        30_000,
+        move || {
+            let _ = clock.try_set(metadata_clock());
+        },
+    )));
+    on_cleanup(move || {
+        let _ = timer.try_update_value(|timer| timer.take());
+    });
+    let fresh = move || {
+        let _ = clock.get();
+        tmdb.get()
+            .is_none_or(|selection| metadata_is_fresh(selection.received_at))
+    };
     let busy = RwSignal::new(false);
     let submitted = RwSignal::new(false);
     let watching = RwSignal::new(false);
@@ -1984,6 +2246,7 @@ fn ConversionReview(
             && !busy.get()
             && !submitted.get()
             && publication_metadata(title.get(), year.get(), description.get()).is_ok()
+            && fresh()
     };
     Effect::new(move |previous: Option<Option<String>>| {
         let hash = job.get().and_then(|job| validated_hash(&job));
@@ -2012,6 +2275,16 @@ fn ConversionReview(
             ));
             return;
         }
+        if tmdb
+            .get_untracked()
+            .is_some_and(|selection| !metadata_is_fresh(selection.received_at))
+        {
+            confirmed.set(false);
+            error.set(Some(
+                "TMDB selection expired; search again or clear it for manual entry.".into(),
+            ));
+            return;
+        }
         let (title, year, description) = match publication_metadata(
             title.get_untracked(),
             year.get_untracked(),
@@ -2029,6 +2302,7 @@ fn ConversionReview(
             description,
             movie_sha256,
             confirm: true,
+            tmdb: tmdb.get_untracked().map(|selection| selection.source),
         };
         let url = format!(
             "/api/v1/admin/conversions/{}/publish",
@@ -2050,7 +2324,17 @@ fn ConversionReview(
                     confirmed.set(false);
                     update_conversion(jobs, job);
                 }
-                Err(message) => error.set(Some(message)),
+                Err(message) => {
+                    if message == wetube_core::TMDB_SELECTION_EXPIRED {
+                        confirmed.set(false);
+                        tmdb.update(|selection| {
+                            if let Some(selection) = selection {
+                                selection.received_at = f64::NEG_INFINITY;
+                            }
+                        });
+                    }
+                    error.set(Some(message));
+                }
             }
         });
     };
@@ -2164,6 +2448,12 @@ fn ConversionReview(
                         The worker rechecks this job's validated movie digest.
                         Publishing adds experimental playback to this local library only — not production approval.
                         Original tracks stay retained; image subtitles and OCR captions are not available for playback."</p>
+                    <MetadataLookup csrf=csrf title=title year=year description=description
+                        source=tmdb confirmed=confirmed
+                        disabled=Signal::derive(move || busy.get() || submitted.get() || !ready())/>
+                    <Show when=move || !fresh()>
+                        <p role="alert">"TMDB selection expired; search again or clear it for manual entry."</p>
+                    </Show>
                     <form on:submit=publish>
                         <label>"Movie title"<input required maxlength="512" bind:value=title
                             on:input=move |_| confirmed.set(false)

@@ -46,7 +46,7 @@ pub async fn initialize(state_dir: &Path) -> Result<()> {
             // This additive migration does not modify registered media. Snapshot
             // SQLite first; operators must retain the separate media/attempt roots.
             anyhow::ensure!(
-                matches!(version.0, 1..=6),
+                matches!(version.0, 1..=8),
                 "unsupported upgrade; requires a complete asset-aware backup"
             );
             let backup = state_dir.join(format!("pre-upgrade-{}", uuid::Uuid::new_v4()));
@@ -95,7 +95,56 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn comparison_upgrade_retains_schema_six_reviews_and_personal_history() -> Result<()> {
+    async fn metadata_upgrade_from_eight_preserves_local_movies_and_snapshots_once() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let pool = open(directory.path(), true).await?;
+        let mut migrations = sqlx::migrate!("./migrations");
+        migrations.migrations = std::borrow::Cow::Owned(
+            migrations
+                .iter()
+                .filter(|migration| migration.version <= 8)
+                .cloned()
+                .collect(),
+        );
+        migrations.run(&pool).await?;
+        sqlx::query(
+            "INSERT INTO movies VALUES ('movie','Manual title',1999,'Manual description','ready')",
+        )
+        .execute(&pool)
+        .await?;
+        pool.close().await;
+        initialize(directory.path()).await?;
+        initialize(directory.path()).await?;
+        let pool = connect(directory.path()).await?;
+        let row = sqlx::query("SELECT * FROM movies WHERE id='movie'")
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(row.get::<String, _>("title"), "Manual title");
+        assert_eq!(row.get::<i32, _>("year"), 1999);
+        assert_eq!(row.get::<String, _>("description"), "Manual description");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM tmdb_metadata")
+                .fetch_one(&pool)
+                .await?,
+            0
+        );
+        assert_eq!(
+            std::fs::read_dir(directory.path())?
+                .filter_map(Result::ok)
+                .filter(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("pre-upgrade-"))
+                .count(),
+            1
+        );
+        pool.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn comparison_progress_upgrade_retains_schema_seven_jobs_reviews_and_personal_history()
+    -> Result<()> {
         let directory = tempfile::tempdir()?;
         let migrations = tempfile::tempdir()?;
         for (name, sql) in [
@@ -123,6 +172,10 @@ mod tests {
                 "0006_import_history.sql",
                 include_str!("../migrations/0006_import_history.sql"),
             ),
+            (
+                "0007_comparisons.sql",
+                include_str!("../migrations/0007_comparisons.sql"),
+            ),
         ] {
             std::fs::write(migrations.path().join(name), sql)?;
         }
@@ -138,6 +191,9 @@ mod tests {
             VALUES ('scan','admin','count.iso','bound','needs_review',1,'retained-scan','{\"titles\":[]}')").execute(&pool).await?;
         sqlx::query("INSERT INTO probe_jobs(id,requested_by,name,source_identity,title,angle,state,created_at,scan_job_id,attempt_id,report)
             VALUES ('probe','admin','count.iso','bound',1,1,'needs_review',1,'scan','retained-scan','{\"sha256\":\"retained\"}')").execute(&pool).await?;
+        sqlx::query("INSERT INTO comparison_jobs(id,probe_job_id,requested_by,state,created_at,probe_report,title,angle,attempt_id,report)
+            SELECT 'comparison',id,'admin','succeeded',1,report,title,angle,'retained-comparison','{\"status\":\"succeeded\"}'
+            FROM probe_jobs WHERE id='probe'").execute(&pool).await?;
         sqlx::query(
             "INSERT INTO import_preferences(user_id,kind,job_id,archived)
             VALUES ('admin','scan','scan',1)",
@@ -165,7 +221,18 @@ mod tests {
             sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM comparison_jobs")
                 .fetch_one(&pool)
                 .await?,
-            0
+            1
+        );
+        let comparison = crate::comparisons::latest(&pool, "probe").await?.unwrap();
+        assert_eq!(comparison.state, wetube_core::JobState::Succeeded);
+        assert_eq!(
+            comparison.attempt_id.as_deref(),
+            Some("retained-comparison")
+        );
+        assert!(comparison.progress.is_none());
+        assert_eq!(
+            comparison.report,
+            Some(serde_json::json!({"status":"succeeded"}))
         );
         pool.close().await;
         Ok(())

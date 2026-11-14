@@ -59,6 +59,12 @@ enum Command {
         media_dir: Option<PathBuf>,
         #[arg(long, env = "WETUBE_SCRATCH_DIR", requires = "media_dir")]
         scratch_dir: Option<PathBuf>,
+        /// Server-only TMDB API Read Access Token; never pass the token itself.
+        #[arg(long, env = "WETUBE_TMDB_TOKEN_FILE", requires = "tmdb_accept_terms")]
+        tmdb_token_file: Option<PathBuf>,
+        /// Operator accepts the current TMDB terms and attribution/retention duties.
+        #[arg(long, env = "WETUBE_TMDB_ACCEPT_TERMS")]
+        tmdb_accept_terms: bool,
     },
     /// Admit an operator-confirmed experimental MP4 for LOCAL preview; stop services first.
     AdmitPreview {
@@ -157,7 +163,13 @@ async fn main() -> Result<()> {
             incoming_dir,
             media_dir,
             scratch_dir,
+            tmdb_token_file,
+            tmdb_accept_terms,
         } => {
+            anyhow::ensure!(
+                tmdb_token_file.is_none() || tmdb_accept_terms,
+                "TMDB requires explicit operator acceptance of its current terms"
+            );
             let _services = ServiceLock::acquire(&cli.state_dir, false)?;
             anyhow::ensure!(
                 static_dir.join("index.html").is_file(),
@@ -172,8 +184,8 @@ async fn main() -> Result<()> {
                 .as_deref()
                 .map(wetube_backend::preview::PreviewRoot::open)
                 .transpose()?;
-            let app = wetube_server::router_with_conversions(
-                pool,
+            let mut app = wetube_server::router_with_conversions(
+                pool.clone(),
                 &origin,
                 &static_dir,
                 incoming,
@@ -181,13 +193,33 @@ async fn main() -> Result<()> {
                 scratch_dir.as_deref(),
             )
             .await?;
+            if let Some(path) = tmdb_token_file {
+                app = app.layer(axum::Extension(
+                    wetube_server::metadata::Tmdb::from_token_file(&path)?,
+                ));
+            }
+            wetube_backend::metadata::expire(&pool, wetube_backend::now()).await?;
             let listener = tokio::net::TcpListener::bind(bind)
                 .await
                 .context("bind HTTP listener")?;
             println!("WeTube listening on {bind}; configured origin: {origin}");
-            axum::serve(listener, app)
+            let maintenance = tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+                loop {
+                    interval.tick().await;
+                    if let Err(error) =
+                        wetube_backend::metadata::expire(&pool, wetube_backend::now()).await
+                    {
+                        tracing::error!(%error, "metadata expiry cleanup failed");
+                    }
+                }
+            });
+            let result = axum::serve(listener, app)
                 .with_graceful_shutdown(shutdown())
-                .await?;
+                .await;
+            maintenance.abort();
+            let _ = maintenance.await;
+            result?;
         }
         Command::AdmitPreview {
             report,

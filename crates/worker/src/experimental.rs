@@ -1618,6 +1618,7 @@ mod tests {
             &pool,
             &job.id,
             &wetube_core::PublishRequest {
+                tmdb: None,
                 title: "Verified fixture".into(),
                 year: Some(2026),
                 description: "Generated media".into(),

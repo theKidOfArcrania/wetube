@@ -28,6 +28,7 @@ pub async fn recover(pool: &SqlitePool) -> Result<()> {
     // package is deliberately not retried or made ready.
     sqlx::query("UPDATE conversion_jobs SET state='failed',error='Worker interrupted. All attempts/packages retained; no automatic retry or publication.' WHERE state IN ('converting','publishing')")
         .execute(pool).await?;
+    wetube_backend::metadata::expire(pool, wetube_backend::now()).await?;
     Ok(())
 }
 
@@ -38,6 +39,7 @@ pub async fn tick(
     limits: &Limits,
 ) -> Result<bool> {
     limits.validate()?;
+    wetube_backend::metadata::expire(pool, wetube_backend::now()).await?;
     let row = sqlx::query(
         "UPDATE conversion_jobs SET state=CASE state WHEN 'queued' THEN 'converting' ELSE 'publishing' END,
          phase=CASE state WHEN 'queued' THEN 'revalidating_input' ELSE 'publishing' END,
@@ -75,6 +77,9 @@ pub async fn tick(
                 .bind(digest).bind(&job.id).execute(pool).await?;
         } else {
             let publication: PublishRequest = serde_json::from_str(&row.try_get::<String,_>("publication")?)?;
+            if let Some(source) = &publication.tmdb {
+                ensure!(wetube_backend::metadata::expires_at(source)? > wetube_backend::now(), "Movie metadata expired; review metadata again.");
+            }
             ensure!(publication.confirm && Some(&publication.movie_sha256) == job.movie_sha256.as_ref(), "publication confirmation/hash missing");
             let attempt = uuid::Uuid::parse_str(job.attempt_id.as_deref().context("missing successful attempt")?)?;
             let report = config.scratch_path().join(attempt.to_string()).join("report.json");

@@ -19,14 +19,72 @@ This is a runnable local website preview, not a production TrueNAS deployment:
   from the same inspected staged ISO, before committing to a full conversion.
 - Preserved original audio/image-subtitle sidecars and retained failed attempts.
 - Live, persisted media-phase progress with labeled stage-based workflow bars.
+- Optional administrator TMDB search, explicit selection and editable publication
+  metadata, with expiring cache and explicit refresh (manual entry always available).
 - Compact latest media readiness, expandable checks, and per-admin import
   archive/restore with collapsed, paginated History; no deletion or retention changes.
 
 The library starts empty. The complete production publication protocol, captions,
-TMDB, scheduled backups/restore, and trash are not implemented. Inspection never
+scheduled backups/restore, and trash are not implemented. Inspection never
 modifies or deletes incoming files and does not add movies to the library.
 Automatic ISO deletion remains disabled pending the design's safety gates.
 Docker packaging is intentionally deferred.
+
+### Optional TMDB metadata
+
+Disabled by default. Before enabling, the operator must review and accept the
+[current TMDB terms](https://www.themoviedb.org/api-terms-of-use) and
+[API FAQ](https://developer.themoviedb.org/docs/faq), obtain an API **Read Access
+Token**, and privately provision a server-readable token file (restrict access,
+for example mode `0600`). Never put a real token in source, shell arguments,
+browser configuration, logs, or this repository. Add to `wetube-server serve`:
+
+```sh
+--tmdb-token-file /private/path/tmdb-token --tmdb-accept-terms
+```
+
+Equivalent environment configuration is `WETUBE_TMDB_TOKEN_FILE` and
+`WETUBE_TMDB_ACCEPT_TERMS=true`. Only the server reads the file. Restart the
+server after rotating it; no credential is sent to browsers. Normal library,
+playback and configuration GETs never contact TMDB.
+
+In conversion review, type a search title and optional year deliberately.
+Only that text/year plus fixed API options reach TMDB; filenames, ISO contents
+and media never do. Search does not select a result or publish anything.
+**Use this match** fills editable title/year/description and clears publication
+confirmation. Review/edit, then separately confirm publication against the
+validated digest. The server enforces selection freshness using its fetch timestamp;
+browser elapsed-time hints do not require synchronized clocks.
+If the server rejects an expired selection (for example after laptop sleep),
+publication confirmation and old matches are cleared; search again or clear the
+selection for manual entry. Rejection never queues publication automatically.
+Selections must be used within 24 hours; clearing a selection
+clears its fields for manual entry. Disabled/offline lookup does not block manual
+publication.
+
+Linked provider metadata (including administrator edits to a selected match)
+expires **150 days after fetching**, not after publication. It is an overlay:
+the local source filename remains the fallback title, with empty year/description.
+Expiry is enforced on reads, scrubbed on server startup/every 60 seconds and by
+the worker, and checked again at publication registration. Expired queued metadata
+returns to review; an already-publishing expired job fails closed. Provider text
+is removed from successful publication records. Movie assets and playback are
+never removed or made dependent on TMDB. An administrator can explicitly use
+**Refresh TMDB metadata** in the library, including after expiry; refresh replaces
+the overlay from TMDB and may replace earlier edits. Refresh failure preserves
+the current cache only until its original expiry. There is no automatic refresh.
+
+The operator is responsible for expiring cached provider metadata in **offline
+databases, pre-upgrade snapshots and backups**, and for retention while services
+are stopped; online cleanup cannot reach those copies. Delete or sanitize expired
+copies before restoring/using them. Run matching `init` offline for schema upgrades
+after stopping both services and retaining media/attempt roots separately.
+
+About / Credits contains the current reviewed attribution notice and the approved
+TMDB logo, bundled locally (no third-party browser requests). Logo source:
+[official blue-long SVG](https://www.themoviedb.org/assets/v4/logos/v2/blue_long_2-9665a76b1ae401a510ec1e0ca40ddcb3b0cfe45f1d51b77a308fea0845885648.svg).
+This implements the reviewed requirements, not legal approval or a claim of
+live-provider acceptance; automated validation uses a deterministic mock provider.
 
 A separate opt-in `import_dvd` Rust example exercises experimental conversion
 and full decoding without enabling the production pipeline; see below.
@@ -75,6 +133,13 @@ decoding from the film's beginning. Logs and requested-window/source/result
 metadata are retained in a fresh private scratch attempt. Both clips are fully
 decoded and fingerprinted before administrator-only, authenticated range playback.
 
+Comparison progress uses the same persisted, stage-based bars as full conversions:
+measured bytes while revalidating the ISO, then media timestamps for extraction,
+shared-source decoding, and each sequential encode/decode. Metadata, short clip
+hashes, syncing and finalization are indeterminate. Phase estimates are not a
+total-workflow ETA; failed/interrupted jobs show only the last recorded observation.
+Optional telemetry never authorizes readiness or fails a comparison.
+
 Comparisons share the existing single serialized worker, with sequential treatment
 encodes. They are considered before the next queued full conversion, never
 preempting work already running. There is at most one active comparison per probe,
@@ -86,8 +151,9 @@ Scratch quota/free-space checks also apply. Failed/interrupted files stay
 unregistered for operator review; restart marks running comparisons failed.
 Clips are never placed in the public static directory or library.
 
-Schema 7 adds comparison jobs. Stop both services before the normal `init`
-migration; it takes a SQLite-only snapshot and retains all schema-6 jobs,
+Schema 8 adds nullable comparison progress to schema 7's comparison jobs.
+Let active work finish, then stop both services before the normal `init`
+migration; it takes a SQLite-only snapshot and retains all existing jobs,
 review selections, preferences, staged files, and media in place. Retain the
 separate scratch/media roots; the snapshot is not an asset backup.
 
@@ -242,14 +308,15 @@ their inputs; children retain the ownership lock until they exit.
 ## Upgrade local state
 
 Stop both services before running `wetube-server init` with this release.
-Initialization upgrades supported older schemas (1–5) to schema 6 only after a consistent `VACUUM INTO`
+Initialization upgrades supported older schemas (1–7) to schema 8 only after a consistent `VACUUM INTO`
 snapshot is written and synced in a private `pre-upgrade-UUID` directory under
 the state root. Newer/unknown versions fail closed. Repeating initialization
 does not create another snapshot once the upgrade succeeds.
 
 Schema 6 adds per-user import archive preferences, lifecycle view and indexes;
-existing jobs, reports, media and attempts are unchanged. Schema 5's nullable
-progress snapshots are retained. Stop **both** services, retain the state/media/attempt roots, run the matching
+schema 7 adds private comparisons, and schema 8 adds their nullable progress.
+Existing jobs, reports, media, attempts and earlier progress snapshots are retained.
+Stop **both** services, retain the state/media/attempt roots, run the matching
 `wetube-server --state-dir <state-root> init`, then restart the matching server
 and worker with the same roots and rebuilt frontend. Existing jobs have no
 historical telemetry; interrupted jobs still fail closed and retain their last

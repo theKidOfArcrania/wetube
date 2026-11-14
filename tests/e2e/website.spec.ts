@@ -490,6 +490,210 @@ test('scanned title and angle choices gate conversion and explicit publication t
   await expect(page.getByTestId('movie-player')).toBeVisible();
 });
 
+for (const clockSkew of [0, -5_000, 2 * 86_400_000]) {
+  test(`TMDB metadata lookup requires explicit selection and editable digest-bound publication (browser clock ${clockSkew}ms)`, async ({ page }) => {
+    await page.addInitScript(({ offset }) => {
+      const now = Date.now.bind(Date);
+      Date.now = () => now() + offset;
+    }, { offset: clockSkew });
+    const id = randomUUID();
+    const digest = 'd'.repeat(64);
+    const fetchedAt = Math.floor(Date.now() / 1000);
+    const conversion = {
+      id, probe_job_id: randomUUID(), state: 'needs_review', created_at: fetchedAt,
+      attempt_id: randomUUID(), video_treatment: 'preserve', phase: 'awaiting_review',
+      error: null, movie_id: null, movie_sha256: digest,
+      report: { status: 'verified_experimental_output', movie_sha256: digest, warnings: [] },
+    };
+    let published = false;
+    let searches = 0;
+    await page.route('**/api/v1/admin/imports?*', route => {
+      const history = new URL(route.request().url()).searchParams.get('history') === 'true';
+      const entries = history ? [] : [{ item: { kind: 'conversion', job: conversion }, can_archive: false, history: false }];
+      return route.fulfill({ json: { entries, total: entries.length, history_count: 0 } });
+    });
+    await page.route('**/api/v1/admin/metadata', route => route.fulfill({ json: { configured: true } }));
+    await page.route('**/api/v1/admin/metadata/search', async route => {
+      searches++;
+      expect(route.request().method()).toBe('POST');
+      expect(route.request().headers()['x-csrf-token']).toBeTruthy();
+      const request = route.request().postDataJSON();
+      expect(Object.keys(request).sort()).toEqual(['query', 'year']);
+      if (request.query === 'offline') {
+        return route.fulfill({ status: 502, json: { error: 'TMDB is unavailable. Try again later or enter metadata manually.' } });
+      }
+      if (request.query === 'none') return route.fulfill({ json: { movies: [] } });
+      expect(request).toEqual({ query: 'Monte Cristo', year: 2002 });
+      await new Promise(resolve => setTimeout(resolve, 300));
+      return route.fulfill({ json: { movies: [
+        { id: 1, title: 'The Count of Monte Cristo', year: 1934, description: 'First adaptation', fetched_at: fetchedAt },
+        { id: 2, title: 'The Count of Monte Cristo', year: 2002, description: 'Selected synopsis', fetched_at: fetchedAt },
+      ] } });
+    });
+    await page.route(`**/api/v1/admin/conversions/${id}/publish`, route => {
+      expect(route.request().postDataJSON()).toEqual({
+        title: 'My reviewed title', year: 2002, description: 'Edited synopsis',
+        movie_sha256: digest, confirm: true, tmdb: { id: 2, fetched_at: fetchedAt },
+      });
+      expect(route.request().headers()['x-csrf-token']).toBeTruthy();
+      published = true;
+      return route.fulfill({ status: 202, json: { ...conversion, state: 'queued_publication' } });
+    });
+    await login(page, 'e2e-admin');
+    await expandImport(page, id);
+    const card = page.locator(`[data-testid="conversion-job"][data-job-id="${id}"]`);
+    const titleField = card.getByRole('textbox', { name: 'Movie title', exact: true });
+    const description = card.getByRole('textbox', { name: 'Description', exact: true });
+    const search = card.getByRole('textbox', { name: 'Search TMDB title', exact: true });
+    const searchYear = card.getByRole('spinbutton', { name: 'Search TMDB year (optional)', exact: true });
+    const searchButton = card.getByRole('button', { name: 'Search TMDB', exact: true });
+    const confirmation = card.getByRole('checkbox', { name: /I reviewed the validated conversion/ });
+    const publish = card.getByRole('button', { name: 'Publish to local library', exact: true });
+    await titleField.fill('Manual fallback');
+    await confirmation.check();
+    await search.fill('offline');
+    await searchButton.click();
+    await expect(card.getByText('TMDB is unavailable. Try again later or enter metadata manually.')).toBeVisible();
+    await expect(titleField).toHaveValue('Manual fallback');
+    await expect(publish).toBeEnabled();
+    await search.fill('none');
+    await searchButton.click();
+    await expect(card.getByText('No matches; try another search or enter metadata manually.')).toBeVisible();
+    await search.fill('Monte Cristo');
+    await searchYear.fill('2002');
+    await searchButton.click();
+    await titleField.fill('Edited while searching');
+    await expect(card.getByRole('button', { name: 'Use this match', exact: true })).toHaveCount(2);
+    await expect(titleField).toHaveValue('Edited while searching');
+    expect(published).toBe(false);
+    await card.getByRole('button', { name: 'Use this match', exact: true }).nth(1).click();
+    await expect(titleField).toHaveValue('The Count of Monte Cristo');
+    await expect(confirmation).not.toBeChecked();
+    await expect(publish).toBeDisabled();
+    await card.getByRole('button', { name: 'Clear TMDB selection for manual entry' }).click();
+    await expect(titleField).toHaveValue('');
+    await expect(description).toHaveValue('');
+    await card.getByRole('button', { name: 'Use this match', exact: true }).nth(1).click();
+    await confirmation.check();
+    await titleField.fill('My reviewed title');
+    await expect(confirmation).not.toBeChecked();
+    await description.fill('Edited synopsis');
+    await confirmation.check();
+    await page.waitForResponse(response => response.url().includes('/api/v1/admin/imports?') && response.request().method() === 'GET');
+    await expect(titleField).toHaveValue('My reviewed title');
+    await expect(description).toHaveValue('Edited synopsis');
+    await expect(confirmation).toBeChecked();
+    await publish.click();
+    await expect.poll(() => published).toBe(true);
+    expect(searches).toBe(3);
+    const logo = page.getByRole('img', { name: 'TMDB', exact: true });
+    await expect(logo).toHaveAttribute('src', '/tmdb.svg');
+    await expect(page.getByText('This application uses TMDB and the TMDB APIs but is not endorsed, certified, or otherwise approved by TMDB.')).toBeVisible();
+  });
+}
+
+test('TMDB stale publication rejection clears consent and matches and permits manual entry', async ({ page }) => {
+  const id = randomUUID();
+  const digest = 'e'.repeat(64);
+  const fetchedAt = Math.floor(Date.now() / 1000);
+  const conversion = {
+    id, probe_job_id: randomUUID(), state: 'needs_review', created_at: fetchedAt,
+    attempt_id: randomUUID(), video_treatment: 'preserve', phase: 'awaiting_review',
+    error: null, movie_id: null, movie_sha256: digest,
+    report: { status: 'verified_experimental_output', movie_sha256: digest, warnings: [] },
+  };
+  let attempts = 0;
+  await page.route('**/api/v1/admin/imports?*', route => {
+    const history = new URL(route.request().url()).searchParams.get('history') === 'true';
+    const entries = history ? [] : [{ item: { kind: 'conversion', job: conversion }, can_archive: false, history: false }];
+    return route.fulfill({ json: { entries, total: entries.length, history_count: 0 } });
+  });
+  await page.route('**/api/v1/admin/metadata', route => route.fulfill({ json: { configured: true } }));
+  await page.route('**/api/v1/admin/metadata/search', route => route.fulfill({ json: { movies: [
+    { id: 7, title: 'Synthetic match', year: 2002, description: 'Synthetic synopsis', fetched_at: fetchedAt },
+  ] } }));
+  await page.route(`**/api/v1/admin/conversions/${id}/publish`, route => {
+    const body = route.request().postDataJSON();
+    expect(route.request().headers()['x-csrf-token']).toBeTruthy();
+    attempts++;
+    if (attempts === 1) {
+      expect(body.tmdb).toEqual({ id: 7, fetched_at: fetchedAt });
+      return route.fulfill({ status: 409, json: { error: 'TMDB selection expired; search again before publication' } });
+    }
+    expect(body).toEqual({
+      title: 'Manual recovery', year: null, description: '',
+      movie_sha256: digest, confirm: true,
+    });
+    return route.fulfill({ status: 202, json: { ...conversion, state: 'queued_publication' } });
+  });
+  await login(page, 'e2e-admin');
+  await expandImport(page, id);
+  const card = page.locator(`[data-testid="conversion-job"][data-job-id="${id}"]`);
+  const searchButton = card.getByRole('button', { name: 'Search TMDB', exact: true });
+  const confirmation = card.getByRole('checkbox', { name: /I reviewed the validated conversion/ });
+  const publish = card.getByRole('button', { name: 'Publish to local library', exact: true });
+  await card.getByRole('textbox', { name: 'Search TMDB title', exact: true }).fill('Synthetic search');
+  await searchButton.click();
+  await card.getByRole('button', { name: 'Use this match', exact: true }).click();
+  await confirmation.check();
+  await publish.click();
+  await expect(card.getByText('TMDB selection expired; search again before publication', { exact: true })).toBeVisible();
+  await expect(confirmation).not.toBeChecked();
+  await expect(publish).toBeDisabled();
+  await expect(card.getByRole('button', { name: 'Use this match', exact: true })).toHaveCount(0);
+  await expect(searchButton).toBeEnabled();
+  expect(attempts).toBe(1);
+  await card.getByRole('button', { name: 'Clear TMDB selection for manual entry', exact: true }).click();
+  await card.getByRole('textbox', { name: 'Movie title', exact: true }).fill('Manual recovery');
+  await confirmation.check();
+  await publish.click();
+  await expect.poll(() => attempts).toBe(2);
+});
+
+test('TMDB refresh is explicit and survives library polling without blocking local playback', async ({ page }) => {
+  const movie = {
+    id: movieId, title: 'source.iso', year: null as number | null, description: '',
+    tmdb_id: 7, metadata_expires_at: Math.floor(Date.now() / 1000) - 1,
+  };
+  let requests = 0;
+  let releaseRefresh!: () => void;
+  const heldRefresh = new Promise<void>(resolve => { releaseRefresh = resolve; });
+  await page.route('**/api/v1/movies', route => route.fulfill({ json: { movies: [movie] } }));
+  await page.route(`**/api/v1/admin/movies/${movieId}/metadata/refresh`, async route => {
+    expect(route.request().method()).toBe('POST');
+    expect(route.request().headers()['x-csrf-token']).toBeTruthy();
+    requests++;
+    if (requests === 1) {
+      return route.fulfill({ status: 502, json: { error: 'TMDB is unavailable. Try again later or enter metadata manually.' } });
+    }
+    await heldRefresh;
+    movie.title = 'Refreshed title';
+    movie.year = 2002;
+    movie.description = 'Refreshed synthetic synopsis';
+    movie.metadata_expires_at = Math.floor(Date.now() / 1000) + 150 * 86400;
+    return route.fulfill({ json: {
+      id: 7, title: movie.title, year: movie.year, description: movie.description,
+      fetched_at: Math.floor(Date.now() / 1000),
+    } });
+  });
+  await login(page, 'e2e-admin');
+  const refresh = page.getByRole('button', { name: 'Refresh TMDB metadata', exact: true });
+  await expect(page.getByRole('heading', { name: 'source.iso', exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Watch source.iso', exact: true })).toBeEnabled();
+  expect(requests).toBe(0);
+  await refresh.click();
+  await expect(page.getByText('TMDB is unavailable. Try again later or enter metadata manually.')).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Watch source.iso', exact: true })).toBeEnabled();
+  await refresh.click();
+  await expect.poll(() => requests).toBe(2);
+  await page.waitForResponse(response => response.url().endsWith('/api/v1/movies') && response.request().method() === 'GET');
+  await expect(refresh).toBeDisabled();
+  releaseRefresh();
+  await expect(page.getByRole('heading', { name: 'Refreshed title', exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Watch Refreshed title', exact: true })).toBeEnabled();
+  expect(requests).toBe(2);
+});
+
 test('live media progress renders measurable, indeterminate, queued, review, failed and terminal stages honestly', async ({ page }) => {
   const now = () => Math.floor(Date.now() / 1000);
   const scan = {
@@ -583,6 +787,103 @@ test('live media progress renders measurable, indeterminate, queued, review, fai
   scan.state = 'needs_review';
   await expandImport(page, scan.id);
   await expect(scanCard.getByRole('progressbar', { name: 'Discover DVD', exact: true })).toHaveAttribute('aria-valuenow', '100');
+});
+
+test('midpoint preview progress polls measured and indeterminate phases without implying readiness', async ({ page }) => {
+  const now = () => Math.floor(Date.now() / 1000);
+  const probe = {
+    id: randomUUID(), name: 'Preview progress.iso', title: 1, angle: 1, state: 'needs_review',
+    created_at: now(), attempt_id: randomUUID(), error: null,
+    report: { sha256: 'a'.repeat(64), inspection: { warnings: [], metadata: {
+      format: { duration: '120' }, streams: [
+        { codec_type: 'video', codec_name: 'mpeg2video', width: 720, height: 480 },
+      ],
+    } } },
+  };
+  const job = {
+    id: randomUUID(), probe_job_id: probe.id, state: 'queued', created_at: now(),
+    attempt_id: null, report: null, error: null as string | null,
+    progress: null as null | Record<string, unknown>,
+  };
+  await page.route('**/api/v1/admin/imports?*', route => {
+    const history = new URL(route.request().url()).searchParams.get('history') === 'true';
+    return route.fulfill({ json: { entries: history ? [] : [
+      { item: { kind: 'probe', job: probe }, can_archive: false },
+    ], total: history ? 0 : 1, history_count: 0 } });
+  });
+  let submitted = false;
+  await page.route(`**/api/v1/admin/probes/${probe.id}/comparison`, route => {
+    if (route.request().method() === 'POST') {
+      submitted = true;
+      return route.fulfill({ status: 202, json: job });
+    }
+    return route.fulfill({ json: submitted ? job : null });
+  });
+  await login(page, 'e2e-admin');
+  await expandImport(page, probe.id);
+  const preview = page.getByTestId('comparison-preview');
+  const generate = preview.getByRole('button', { name: 'Generate Preserve vs Yadif preview', exact: true });
+  const refresh = preview.getByRole('button', { name: 'Refresh comparison status', exact: true });
+  await expect(generate).toBeEnabled();
+  const generateBox = (await generate.boundingBox())!;
+  const refreshBox = (await refresh.boundingBox())!;
+  const verticalGap = refreshBox.y - (generateBox.y + generateBox.height);
+  const horizontalGap = refreshBox.x - (generateBox.x + generateBox.width);
+  expect(Math.max(verticalGap, horizontalGap)).toBeGreaterThan(4);
+  await generate.click();
+  await expect(preview.getByRole('progressbar')).toHaveCount(8);
+  await expect(preview.locator('.phase-progress')).toHaveText('Queued — waiting for worker.');
+  await expect(generate).toBeDisabled();
+  await expect(preview.locator('video')).toHaveCount(0);
+  job.state = 'running';
+  job.progress = {
+    workflow: 'comparison', stage: 0, phase: 'Revalidating retained input checksum',
+    elapsed_seconds: 10, completed_units: 25, total_units: 100, unit: 'bytes', updated_at: now(),
+  };
+  const revalidate = preview.getByRole('progressbar', { name: 'Revalidate input', exact: true });
+  await expect(revalidate).toHaveAttribute('aria-valuenow', '25');
+  await expect(preview.locator('.phase-progress')).toContainText('2.5 bytes/s · estimated 30s remaining');
+  for (const [stage, name] of [
+    [1, 'Extract shared sample'], [2, 'Validate shared sample'], [3, 'Encode Preserve'],
+    [4, 'Validate Preserve'], [5, 'Encode Yadif'], [6, 'Validate Yadif'],
+  ] as const) {
+    job.progress = { ...job.progress, stage, phase: name, completed_units: 5, total_units: 10,
+      unit: 'media seconds', updated_at: now() };
+    const bar = preview.getByRole('progressbar', { name, exact: true });
+    await expect(bar).toHaveAttribute('aria-valuenow', '50');
+    await expect(preview.locator('.phase-progress')).toContainText('0.5 media seconds/s');
+    await expect(preview.locator('video')).toHaveCount(0);
+  }
+  job.progress = { ...job.progress, phase: 'Reading decode-yadif metadata', completed_units: null,
+    total_units: null, updated_at: now() };
+  const validate = preview.getByRole('progressbar', { name: 'Validate Yadif', exact: true });
+  await expect(validate).not.toHaveAttribute('aria-valuenow');
+  await expect(preview.locator('.phase-progress')).toContainText('indeterminate');
+  await expect(preview.locator('.phase-progress')).not.toContainText('remaining');
+  job.progress = { ...job.progress, completed_units: 5, total_units: 10, updated_at: now() - 60 };
+  await expect(preview.locator('.phase-progress')).toContainText('last recorded; not live');
+  await expect(preview.locator('.phase-progress')).not.toContainText('remaining');
+  job.state = 'failed';
+  job.error = 'Injected validation failure; artifacts retained.';
+  job.progress.updated_at = now();
+  await expect(preview.getByRole('alert')).toContainText('Injected validation failure');
+  await expect(validate).toHaveAttribute('aria-valuenow', '50');
+  await expect(preview.locator('.phase-progress')).toContainText('last recorded; not live');
+  await expect(preview.locator('.phase-progress')).not.toContainText('remaining');
+  await expect(preview.locator('video')).toHaveCount(0);
+  await expect(generate).toBeEnabled();
+  job.state = 'running';
+  job.error = null;
+  job.progress = { ...job.progress, stage: 7, phase: 'Finalizing comparison report',
+    completed_units: null, total_units: null, updated_at: now() };
+  await refresh.click();
+  const finalize = preview.getByRole('progressbar', { name: 'Finalize comparison', exact: true });
+  await expect(finalize).not.toHaveAttribute('aria-valuenow');
+  job.state = 'succeeded';
+  await expect(preview.locator('.phase-progress')).toHaveText('Workflow complete.');
+  await expect(finalize).toHaveAttribute('aria-valuenow', '100');
+  await expect(preview.locator('video')).toHaveCount(2);
+  await expect(preview).not.toContainText(/NaN|Infinity/);
 });
 
 test('compact latest readiness, attention disclosures and demand-loaded older history', async ({ page }) => {
@@ -866,10 +1167,15 @@ async function compareInspectedProgram(page: Page, probeId: string) {
       return current?.state;
     }, { timeout: 45_000 }).toBe('succeeded');
     const current = await (await page.request.get(path)).json();
+    expect(current.progress.workflow).toBe('comparison');
+    expect(current.progress.stage).toBe(7);
+    expect(current.progress.total_units).toBeNull();
     expect(current.report.preserve.decoded_frames).toBe(current.report.yadif.decoded_frames);
     expect(current.report.yadif.filter).toBe('yadif=mode=send_frame:parity=auto:deint=all');
     expect(current.report.preserve.filter).toBeNull();
     await expect(comparison.locator('video')).toHaveCount(2);
+    await expect(comparison.locator('.phase-progress')).toHaveText('Workflow complete.');
+    await expect(comparison.getByRole('progressbar', { name: 'Finalize comparison', exact: true })).toHaveAttribute('aria-valuenow', '100');
     for (const treatment of ['preserve', 'yadif']) {
       const url = `${baseURL}/api/v1/admin/comparisons/${current.id}/${treatment}/video`;
       const range = await page.request.get(url, { headers: { Range: 'bytes=0-31' } });

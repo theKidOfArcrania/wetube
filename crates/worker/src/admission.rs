@@ -3,7 +3,7 @@ use crate::progress::Progress;
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use sqlx::SqlitePool;
+use sqlx::{Row, SqlitePool};
 use std::{
     fs::{File, OpenOptions},
     io::{Read, Seek, Write},
@@ -402,13 +402,7 @@ async fn admit_inner(
         progress.stage(6, "Durably registering verified package", None, "");
     }
     let mut transaction = pool.begin().await?;
-    sqlx::query("INSERT INTO movies (id,title,year,description,status) VALUES (?,?,?,?,'ready')")
-        .bind(&movie_id)
-        .bind(options.title.trim())
-        .bind(options.year)
-        .bind(options.description)
-        .execute(&mut *transaction)
-        .await?;
+    register_movie(&mut transaction, job_id, &movie_id, &options).await?;
     sqlx::query("INSERT INTO preview_media VALUES (?,?,?,?,?,?,?)")
         .bind(&movie_id)
         .bind(&package)
@@ -419,11 +413,171 @@ async fn admit_inner(
         .bind(now())
         .execute(&mut *transaction)
         .await?;
-    if let Some(id) = job_id {
-        let updated = sqlx::query("UPDATE conversion_jobs SET state='published',phase='published',movie_id=? WHERE id=? AND state='publishing'")
-            .bind(&movie_id).bind(id).execute(&mut *transaction).await?;
-        ensure!(updated.rows_affected() == 1, "publication ownership lost");
-    }
     transaction.commit().await?;
     Ok(json!({"movie_id": movie_id, "package_id": package, "local_preview": true}))
+}
+
+async fn register_movie(
+    connection: &mut sqlx::SqliteConnection,
+    job_id: Option<&str>,
+    movie_id: &str,
+    options: &Admission<'_>,
+) -> Result<()> {
+    let linked = if let Some(id) = job_id {
+        let row = sqlx::query(
+            "SELECT c.publication,p.name FROM conversion_jobs c JOIN probe_jobs p ON p.id=c.probe_job_id
+             WHERE c.id=? AND c.state='publishing'",
+        ).bind(id).fetch_one(&mut *connection).await?;
+        let publication: wetube_core::PublishRequest =
+            serde_json::from_str(&row.try_get::<String, _>("publication")?)?;
+        if let Some(source) = publication.tmdb {
+            ensure!(
+                wetube_backend::metadata::expires_at(&source)? > now(),
+                "Movie metadata expired; review metadata again."
+            );
+            Some((
+                row.get::<String, _>("name"),
+                wetube_core::MetadataMatch {
+                    id: source.id,
+                    fetched_at: source.fetched_at,
+                    title: publication.title,
+                    year: publication.year,
+                    description: publication.description,
+                },
+            ))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    sqlx::query("INSERT INTO movies (id,title,year,description,status) VALUES (?,?,?,?,'ready')")
+        .bind(movie_id)
+        .bind(
+            linked
+                .as_ref()
+                .map_or(options.title.trim(), |(name, _)| name.as_str()),
+        )
+        .bind(if linked.is_some() { None } else { options.year })
+        .bind(if linked.is_some() {
+            ""
+        } else {
+            options.description
+        })
+        .execute(&mut *connection)
+        .await?;
+    if let Some((_, metadata)) = &linked {
+        wetube_backend::metadata::store(connection, movie_id, metadata).await?;
+    }
+    if let Some(id) = job_id {
+        let updated = sqlx::query("UPDATE conversion_jobs SET state='published',phase='published',movie_id=?,publication=CASE WHEN json_extract(publication,'$.tmdb') IS NOT NULL THEN NULL ELSE publication END WHERE id=? AND state='publishing'")
+            .bind(movie_id).bind(id).execute(connection).await?;
+        ensure!(updated.rows_affected() == 1, "publication ownership lost");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wetube_core::{PublishRequest, TmdbSource};
+
+    #[tokio::test]
+    async fn metadata_registration_is_atomic_expiry_checked_and_keeps_provider_text_out_of_fallback()
+    -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        wetube_backend::db::initialize(directory.path()).await?;
+        let pool = wetube_backend::db::connect(directory.path()).await?;
+        let fetched_at = now();
+        sqlx::query("INSERT INTO users VALUES('admin','admin','hash','admin')")
+            .execute(&pool)
+            .await?;
+        for id in ["linked", "expired"] {
+            sqlx::query("INSERT INTO probe_jobs(id,requested_by,name,source_identity,title,angle,state,created_at) VALUES(?,'admin','source.iso','bound',1,1,'needs_review',1)").bind(id).execute(&pool).await?;
+            let publication = PublishRequest {
+                title: "Reviewed provider title".into(),
+                year: Some(2002),
+                description: "Edited provider text".into(),
+                movie_sha256: "a".repeat(64),
+                confirm: true,
+                tmdb: Some(TmdbSource {
+                    id: 7,
+                    fetched_at: if id == "expired" {
+                        fetched_at - wetube_backend::metadata::CACHE_SECONDS
+                    } else {
+                        fetched_at
+                    },
+                }),
+            };
+            sqlx::query("INSERT INTO conversion_jobs(id,probe_job_id,requested_by,state,created_at,video_treatment,publication) VALUES(?,?,'admin','publishing',1,'preserve',?)")
+                .bind(id).bind(id).bind(serde_json::to_string(&publication)?).execute(&pool).await?;
+        }
+        let options = Admission {
+            report: Path::new("unused"),
+            title: "Manual title",
+            year: Some(1999),
+            description: "Manual description",
+            movie_sha256: "unused",
+            max_bytes: 1,
+            timeout: Duration::from_secs(1),
+        };
+        let mut transaction = pool.begin().await?;
+        assert!(
+            register_movie(&mut transaction, Some("expired"), "expired-movie", &options)
+                .await
+                .is_err()
+        );
+        transaction.rollback().await?;
+        let mut transaction = pool.begin().await?;
+        register_movie(&mut transaction, Some("linked"), "rollback-movie", &options).await?;
+        transaction.rollback().await?;
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM movies")
+                .fetch_one(&pool)
+                .await?,
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM tmdb_metadata")
+                .fetch_one(&pool)
+                .await?,
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT state FROM conversion_jobs WHERE id='linked'")
+                .fetch_one(&pool)
+                .await?,
+            "publishing"
+        );
+        let mut transaction = pool.begin().await?;
+        register_movie(&mut transaction, Some("linked"), "movie", &options).await?;
+        register_movie(&mut transaction, None, "manual", &options).await?;
+        transaction.commit().await?;
+        let row = sqlx::query("SELECT m.title,m.year,m.description,t.title provider_title,t.description provider_description,t.fetched_at FROM movies m JOIN tmdb_metadata t ON t.movie_id=m.id WHERE m.id='movie'").fetch_one(&pool).await?;
+        assert_eq!(row.get::<String, _>("title"), "source.iso");
+        assert!(row.get::<Option<i32>, _>("year").is_none());
+        assert_eq!(row.get::<String, _>("description"), "");
+        assert_eq!(
+            row.get::<String, _>("provider_title"),
+            "Reviewed provider title"
+        );
+        assert_eq!(
+            row.get::<String, _>("provider_description"),
+            "Edited provider text"
+        );
+        assert_eq!(row.get::<i64, _>("fetched_at"), fetched_at);
+        let row = sqlx::query("SELECT * FROM conversion_jobs WHERE id='linked'")
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(row.get::<String, _>("state"), "published");
+        assert!(row.get::<Option<String>, _>("publication").is_none());
+        let row = sqlx::query("SELECT * FROM movies WHERE id='manual'")
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(row.get::<String, _>("title"), "Manual title");
+        assert_eq!(row.get::<i32, _>("year"), 1999);
+        assert_eq!(row.get::<String, _>("description"), "Manual description");
+        pool.close().await;
+        Ok(())
+    }
 }

@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
-pub const SCHEMA_VERSION: i64 = 7;
+pub const SCHEMA_VERSION: i64 = 9;
+pub const TMDB_SELECTION_EXPIRED: &str = "TMDB selection expired; search again before publication";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", content = "job", rename_all = "snake_case")]
@@ -37,6 +38,7 @@ pub enum MediaWorkflow {
     Inspect,
     Reinspect,
     Conversion,
+    Comparison,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -55,6 +57,16 @@ impl MediaWorkflow {
             Self::Scan => &["Copy input", "Verify input", "Discover DVD"],
             Self::Inspect => &["Copy input", "Verify input", "Inspect program"],
             Self::Reinspect => &["Revalidate input", "Inspect program"],
+            Self::Comparison => &[
+                "Revalidate input",
+                "Extract shared sample",
+                "Validate shared sample",
+                "Encode Preserve",
+                "Validate Preserve",
+                "Encode Yadif",
+                "Validate Yadif",
+                "Finalize comparison",
+            ],
             Self::Conversion => &[
                 "Revalidate input",
                 "Decode source",
@@ -172,6 +184,10 @@ pub struct Movie {
     pub title: String,
     pub year: Option<i32>,
     pub description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tmdb_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata_expires_at: Option<i64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -313,6 +329,8 @@ pub struct ComparisonJob {
     pub attempt_id: Option<String>,
     pub report: Option<serde_json::Value>,
     pub error: Option<String>,
+    #[serde(default)]
+    pub progress: Option<MediaProgress>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -342,6 +360,41 @@ pub struct PublishRequest {
     pub description: String,
     pub movie_sha256: String,
     pub confirm: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tmdb: Option<TmdbSource>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TmdbSource {
+    pub id: i64,
+    pub fetched_at: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetadataSearch {
+    pub query: String,
+    pub year: Option<i32>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct MetadataMatch {
+    pub id: i64,
+    pub title: String,
+    pub year: Option<i32>,
+    pub description: String,
+    pub fetched_at: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct MetadataResults {
+    pub movies: Vec<MetadataMatch>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct MetadataStatus {
+    pub configured: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

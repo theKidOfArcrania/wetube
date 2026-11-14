@@ -14,6 +14,9 @@ pub fn from_row(row: &SqliteRow) -> Result<ComparisonJob> {
             .map(|report| serde_json::from_str(&report))
             .transpose()?,
         error: row.try_get("error")?,
+        progress: row
+            .try_get::<Option<String>, _>("progress")?
+            .and_then(|value| serde_json::from_str(&value).ok()),
     })
 }
 

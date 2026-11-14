@@ -16,6 +16,142 @@ const ORIGIN: &str = "http://wetube.test";
 const PASSWORD: &str = "a household test password";
 
 #[tokio::test]
+async fn metadata_routes_require_admin_origin_csrf_and_allow_disabled_manual_fallback() {
+    let fixture = Fixture::new().await;
+    let (admin, session) = fixture.login("admin").await;
+    let (viewer, viewer_session) = fixture.login("viewer").await;
+    let search = "/api/v1/admin/metadata/search";
+    let refresh = "/api/v1/admin/movies/unknown/metadata/refresh";
+    for path in [search, refresh] {
+        for (cookie, csrf, expected) in [
+            (None, None, StatusCode::UNAUTHORIZED),
+            (
+                Some(viewer.as_str()),
+                Some(viewer_session.csrf_token.as_str()),
+                StatusCode::FORBIDDEN,
+            ),
+            (Some(admin.as_str()), None, StatusCode::FORBIDDEN),
+            (
+                Some(admin.as_str()),
+                Some(session.csrf_token.as_str()),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+        ] {
+            assert_eq!(
+                fixture
+                    .send(
+                        "POST",
+                        path,
+                        r#"{"query":"Deliberate title","year":2001}"#,
+                        cookie,
+                        csrf
+                    )
+                    .await
+                    .status(),
+                expected
+            );
+        }
+        let response = fixture
+            .app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header(header::HOST, "wetube.test")
+                    .header(header::ORIGIN, "http://evil.test")
+                    .header(header::COOKIE, &admin)
+                    .header("x-csrf-token", &session.csrf_token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"query":"Title","year":null}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+    for query in [
+        serde_json::json!({"query":"","year":null}),
+        serde_json::json!({"query":"x".repeat(257),"year":null}),
+        serde_json::json!({"query":"x\nbad","year":null}),
+        serde_json::json!({"query":"Title","year":1600}),
+    ] {
+        assert_eq!(
+            fixture
+                .send(
+                    "POST",
+                    search,
+                    &query.to_string(),
+                    Some(&admin),
+                    Some(&session.csrf_token)
+                )
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+    for (cookie, status) in [
+        (None, StatusCode::UNAUTHORIZED),
+        (Some(viewer.as_str()), StatusCode::FORBIDDEN),
+    ] {
+        assert_eq!(
+            fixture
+                .send("GET", "/api/v1/admin/metadata", "", cookie, None)
+                .await
+                .status(),
+            status
+        );
+    }
+    let response = fixture
+        .send("GET", "/api/v1/admin/metadata", "", Some(&admin), None)
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 1024).await.unwrap()).unwrap();
+    assert_eq!(body, serde_json::json!({"configured":false}));
+}
+
+#[tokio::test]
+async fn metadata_expiry_falls_back_on_reads_even_before_cleanup_without_affecting_movies() {
+    let fixture = Fixture::new().await;
+    let (viewer, _) = fixture.login("viewer").await;
+    let now = wetube_backend::now();
+    sqlx::query("INSERT INTO movies VALUES('movie','local.iso',NULL,'','ready')")
+        .execute(&fixture.pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO tmdb_metadata VALUES('movie',7,'Provider title',2001,'Provider text',?,?)",
+    )
+    .bind(now)
+    .bind(now + 60)
+    .execute(&fixture.pool)
+    .await
+    .unwrap();
+    for (expires, title, year, description) in [
+        (now + 60, "Provider title", Some(2001), "Provider text"),
+        (now, "local.iso", None, ""),
+    ] {
+        sqlx::query("UPDATE tmdb_metadata SET expires_at=?")
+            .bind(expires)
+            .execute(&fixture.pool)
+            .await
+            .unwrap();
+        let response = fixture
+            .send("GET", "/api/v1/movies", "", Some(&viewer), None)
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let library: wetube_core::Library =
+            serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
+        let movie = &library.movies[0];
+        assert_eq!(movie.title, title);
+        assert_eq!(movie.year, year);
+        assert_eq!(movie.description, description);
+        assert_eq!(movie.tmdb_id, Some(7));
+    }
+}
+
+#[tokio::test]
 async fn comparison_jobs_are_private_deduplicated_snapshot_bound_and_range_pinned() {
     use serde_json::json;
     use wetube_core::{ComparisonJob, JobState};
@@ -102,6 +238,50 @@ async fn comparison_jobs_are_private_deduplicated_snapshot_bound_and_range_pinne
     let job: ComparisonJob =
         serde_json::from_slice(&to_bytes(response.into_body(), 32768).await.unwrap()).unwrap();
     assert_eq!(job.state, JobState::Queued);
+    assert!(job.progress.is_none());
+    let mut legacy = serde_json::to_value(&job).unwrap();
+    legacy.as_object_mut().unwrap().remove("progress");
+    assert!(
+        serde_json::from_value::<ComparisonJob>(legacy)
+            .unwrap()
+            .progress
+            .is_none()
+    );
+    let progress = wetube_core::MediaProgress {
+        workflow: wetube_core::MediaWorkflow::Comparison,
+        stage: 3,
+        phase: "Encoding Preserve".into(),
+        elapsed_seconds: 4.0,
+        completed_units: Some(2.0),
+        total_units: Some(10.0),
+        unit: "media seconds".into(),
+        updated_at: wetube_backend::now(),
+    };
+    sqlx::query("UPDATE comparison_jobs SET progress=? WHERE id=?")
+        .bind(serde_json::to_string(&progress).unwrap())
+        .bind(&job.id)
+        .execute(&fixture.pool)
+        .await
+        .unwrap();
+    let response = fixture.send("GET", &path, "", Some(&admin), None).await;
+    let observed: ComparisonJob =
+        serde_json::from_slice(&to_bytes(response.into_body(), 32768).await.unwrap()).unwrap();
+    assert_eq!(observed.progress, Some(progress));
+    assert_eq!(
+        observed.state,
+        JobState::Queued,
+        "telemetry cannot make media ready"
+    );
+    sqlx::query("UPDATE comparison_jobs SET progress='invalid optional snapshot' WHERE id=?")
+        .bind(&job.id)
+        .execute(&fixture.pool)
+        .await
+        .unwrap();
+    let response = fixture.send("GET", &path, "", Some(&admin), None).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let observed: ComparisonJob =
+        serde_json::from_slice(&to_bytes(response.into_body(), 32768).await.unwrap()).unwrap();
+    assert!(observed.progress.is_none());
     assert_eq!(
         fixture
             .send("POST", &path, "", Some(&admin), Some(&session.csrf_token))
@@ -854,6 +1034,30 @@ async fn conversion_publication_and_scan_selection_require_admin_csrf_and_bound_
         .execute(&fixture.pool)
         .await
         .unwrap();
+    for fetched_at in [wetube_backend::now() - 86401, wetube_backend::now() + 3600] {
+        let mut stale = publication.clone();
+        stale["tmdb"] = serde_json::json!({"id":7,"fetched_at":fetched_at});
+        let response = fixture
+            .send(
+                "POST",
+                &publish_path,
+                &stale.to_string(),
+                Some(&admin),
+                Some(&session.csrf_token),
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body: wetube_core::ApiError =
+            serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(body.error, wetube_core::TMDB_SELECTION_EXPIRED);
+        let stored: (String, Option<String>) =
+            sqlx::query_as("SELECT state,publication FROM conversion_jobs WHERE id=?")
+                .bind(&job.id)
+                .fetch_one(&fixture.pool)
+                .await
+                .unwrap();
+        assert_eq!(stored, ("needs_review".into(), None));
+    }
     for (field, value) in [
         ("confirm", serde_json::json!(false)),
         ("title", serde_json::json!(" ")),

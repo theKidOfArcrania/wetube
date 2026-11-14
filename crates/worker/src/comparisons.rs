@@ -7,7 +7,7 @@ use std::{
     io::{Seek, SeekFrom, Write},
     os::{
         fd::AsRawFd,
-        unix::fs::{DirBuilderExt, OpenOptionsExt},
+        unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
     },
     path::Path,
     process::Stdio,
@@ -16,6 +16,9 @@ use std::{
 };
 use tokio::process::Command;
 use wetube_backend::{comparisons, incoming::identity, probe_jobs};
+use wetube_core::MediaWorkflow;
+
+use super::progress::{Progress, Recording};
 
 const SOURCE_CAP: u64 = 256 * 1024 * 1024;
 const CLIP_CAP: u64 = 32 * 1024 * 1024;
@@ -91,6 +94,29 @@ fn open(path: &Path) -> Result<File> {
     Ok(file)
 }
 
+fn verify_shared_source(file: &File, before: &std::fs::Metadata) -> Result<()> {
+    let after = file.metadata()?;
+    let describe = |metadata: &std::fs::Metadata| {
+        format!(
+            "dev={} ino={} size={} mtime={}.{:09} ctime={}.{:09}",
+            metadata.dev(),
+            metadata.ino(),
+            metadata.len(),
+            metadata.mtime(),
+            metadata.mtime_nsec(),
+            metadata.ctime(),
+            metadata.ctime_nsec()
+        )
+    };
+    ensure!(
+        identity(before) == identity(&after),
+        "shared source sample changed: before [{}]; after [{}]",
+        describe(before),
+        describe(&after)
+    );
+    Ok(())
+}
+
 fn output(command: &mut Command, file: &File, cap: u64, format: &str) -> Result<()> {
     ensure!(
         unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFD, 0) } != -1,
@@ -126,15 +152,17 @@ async fn run(
     phase: &str,
     timeout: Duration,
     seek: bool,
+    progress: &Progress,
 ) -> Result<Value> {
     let stdout = create(&directory.join(format!("{phase}.stdout.txt")))?;
     let stderr = create(&directory.join(format!("{phase}.stderr.txt")))?;
-    let result = super::process::run_logged(
+    let result = super::process::run_logged_progress(
         command,
         timeout,
         LOG_CAP,
         stdout.try_clone()?,
         stderr.try_clone()?,
+        Some(progress),
     )
     .await;
     stdout.sync_all()?;
@@ -196,7 +224,7 @@ async fn metadata(file: &File, timeout: Duration) -> Result<Value> {
     Ok(serde_json::from_slice(&result.stdout)?)
 }
 
-fn progress(bytes: &str) -> Result<(u64, f64)> {
+fn decoded_progress(bytes: &str) -> Result<(u64, f64)> {
     let mut frames = None;
     let mut seconds = None;
     let mut ended = false;
@@ -224,9 +252,14 @@ async fn validate(
     directory: &Path,
     phase: &str,
     timeout: Duration,
+    progress: &Progress,
+    stage: usize,
+    duration: f64,
 ) -> Result<(Value, u64, f64)> {
     let before = identity(&file.metadata()?);
+    progress.stage(stage, &format!("Reading {phase} metadata"), None, "");
     let metadata = metadata(file, timeout).await?;
+    progress.stage(stage, phase, Some(duration), "media seconds");
     let mut command = ffmpeg(2);
     input(&mut command, file)?;
     command.args([
@@ -246,8 +279,8 @@ async fn validate(
         "null",
         "-",
     ]);
-    let result = run(&mut command, directory, phase, timeout, false).await?;
-    let (frames, seconds) = progress(result.as_str().context("missing decode progress")?)?;
+    let result = run(&mut command, directory, phase, timeout, false, progress).await?;
+    let (frames, seconds) = decoded_progress(result.as_str().context("missing decode progress")?)?;
     ensure!(
         identity(&file.metadata()?) == before,
         "clip changed during validation"
@@ -260,6 +293,7 @@ async fn generate(
     probe: &wetube_core::ProbeJob,
     attempt: &str,
     limits: &super::conversions::Limits,
+    progress: &Progress,
 ) -> Result<Value> {
     let directory = config.scratch_path().join(attempt);
     std::fs::DirBuilder::new().mode(0o700).create(&directory)?;
@@ -277,7 +311,8 @@ async fn generate(
     let result: Result<()> = async {
         let cfg = config.clone();
         let selected = probe.clone();
-        let staged = tokio::task::spawn_blocking(move || super::imports::revalidate_progress(&cfg, &selected, None)).await??;
+        let revalidation = progress.clone();
+        let staged = tokio::task::spawn_blocking(move || super::imports::revalidate_progress(&cfg, &selected, Some(&revalidation))).await??;
         report["input_sha256"] = json!(staged.sha256);
         report["input_identity"] = json!(staged.identity);
         report["input_size_bytes"] = json!(staged.size_bytes);
@@ -294,6 +329,7 @@ async fn generate(
         config.require_capacity(SOURCE_CAP + 2 * cap + 32 * 1024 * 1024)?;
         let timeout = limits.timeout.min(Duration::from_secs(180));
         staged.verify()?;
+        progress.stage(1, "Extracting shared midpoint sample", Some(length), "media seconds");
         let source = create(&directory.join("source.mkv"))?;
         let mut command = ffmpeg(limits.threads);
         command.args(["-f", "dvdvideo", "-title", &probe.title.to_string(),
@@ -306,16 +342,18 @@ async fn generate(
             "-sn", "-dn", "-map_metadata", "-1", "-map_chapters", "-1", "-c:v", "ffv1",
             "-threads", &limits.threads.to_string(), "-fps_mode", "passthrough",
             "-enc_time_base:v", "filter", "-c:a", "pcm_s16le",
-            "-af", "aresample=async=1:first_pts=0"]);
+            "-af", "aresample=async=1:first_pts=0", "-progress", "pipe:1"]);
         output(&mut command, &source, SOURCE_CAP, "matroska")?;
-        report["seek"] = run(&mut command, &directory, "extract", timeout, start > 0.0).await?;
+        report["seek"] = run(&mut command, &directory, "extract", timeout, start > 0.0, progress).await?;
+        progress.stage(1, "Syncing shared sample", None, "");
         source.sync_all()?;
         drop(source);
         staged.verify()?;
         let source = open(&directory.join("source.mkv"))?;
-        let source_identity = identity(&source.metadata()?);
-        let (source_metadata, frames, seconds) = validate(&source, &directory, "source-decode", timeout).await?;
+        let source_before = source.metadata()?;
+        let (source_metadata, frames, seconds) = validate(&source, &directory, "source-decode", timeout, progress, 2, length).await?;
         ensure!((seconds - length).abs() <= 0.25, "source sample truncated or wrong duration");
+        progress.stage(2, "Hashing validated shared sample", None, "");
         let mut hash_file = source.try_clone()?;
         report["source_sha256"] = json!(super::experimental::bounded_hash_progress(&mut hash_file,
             source.metadata()?.len(), timeout, None)?);
@@ -323,7 +361,9 @@ async fn generate(
         report["source_decoded_frames"] = json!(frames);
         report["source_decoded_seconds"] = json!(seconds);
         for treatment in ["preserve", "yadif"] {
-            ensure!(identity(&source.metadata()?) == source_identity, "shared source sample changed");
+            let stage = if treatment == "preserve" { 3 } else { 5 };
+            progress.stage(stage, &format!("Encoding {treatment}"), Some(seconds), "media seconds");
+            verify_shared_source(&source, &source_before)?;
             let movie = create(&directory.join(format!("{treatment}.mp4")))?;
             let mut command = ffmpeg(limits.threads);
             command.args(["-protocol_whitelist", "file,pipe"]);
@@ -332,16 +372,17 @@ async fn generate(
                 "-map_chapters", "-1", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
                 "-pix_fmt", "yuv420p", "-threads", &limits.threads.to_string(), "-fps_mode", "passthrough",
                 "-enc_time_base:v", "filter", "-c:a", "aac", "-ac", "2", "-b:a", "192k",
-                "-movflags", "+faststart"]);
+                "-movflags", "+faststart", "-progress", "pipe:1"]);
             if treatment == "yadif" { command.args(["-vf", wetube_core::YADIF_FILTER]); }
             output(&mut command, &movie, cap, "mp4")?;
-            run(&mut command, &directory, &format!("encode-{treatment}"), timeout, false).await?;
+            run(&mut command, &directory, &format!("encode-{treatment}"), timeout, false, progress).await?;
+            progress.stage(stage, &format!("Syncing {treatment}"), None, "");
             movie.sync_all()?;
             drop(movie);
             let mut movie = open(&directory.join(format!("{treatment}.mp4")))?;
             let before = identity(&movie.metadata()?);
             let (metadata, output_frames, output_seconds) = validate(&movie, &directory,
-                &format!("decode-{treatment}"), timeout).await?;
+                &format!("decode-{treatment}"), timeout, progress, stage + 1, seconds).await?;
             ensure!(frames == output_frames && (seconds - output_seconds).abs() <= 0.15,
                 "comparison output lost frames or duration");
             let streams = metadata["streams"].as_array().context("missing output streams")?;
@@ -359,13 +400,15 @@ async fn generate(
                 }
             }
             let size = movie.metadata()?.len();
+            progress.stage(stage + 1, &format!("Hashing validated {treatment}"), None, "");
             let digest = super::experimental::bounded_hash_progress(&mut movie, size, timeout, None)?;
             ensure!(identity(&movie.metadata()?) == before && size < cap, "clip changed or reached its byte limit");
             report[treatment] = json!({"metadata":metadata,"decoded_frames":output_frames,
                 "decoded_seconds":output_seconds,"size_bytes":size,"sha256":digest,"file_identity":before,
                 "filter":if treatment == "yadif" {Some(wetube_core::YADIF_FILTER)} else {None}});
         }
-        ensure!(identity(&source.metadata()?) == source_identity, "shared source sample changed");
+        progress.stage(7, "Finalizing comparison report", None, "");
+        verify_shared_source(&source, &source_before)?;
         staged.verify()?;
         Ok(())
     }.await;
@@ -396,6 +439,13 @@ pub async fn tick(
         return Ok(false);
     };
     let job = comparisons::from_row(&row)?;
+    let recording = Recording::start(
+        pool,
+        "comparison_jobs",
+        &job.id,
+        MediaWorkflow::Comparison,
+        0,
+    );
     let result: Result<Value> = async {
         let probe = sqlx::query(
             "SELECT * FROM probe_jobs WHERE id=? AND state='needs_review'
@@ -412,6 +462,7 @@ pub async fn tick(
             &probe_jobs::from_row(&probe)?,
             job.attempt_id.as_deref().context("no attempt")?,
             limits,
+            &recording.progress,
         )
         .await
     }
@@ -437,12 +488,216 @@ pub async fn tick(
     .bind(&job.id)
     .execute(pool)
     .await?;
+    recording.finish().await;
     Ok(true)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_sample_guard_preserves_strict_identity_and_diagnoses_metadata_changes() -> Result<()>
+    {
+        let file = tempfile::NamedTempFile::new()?;
+        std::fs::write(file.path(), b"sample")?;
+        let source = open(file.path())?;
+        let before = source.metadata()?;
+        verify_shared_source(&source, &before)?;
+        std::fs::write(file.path(), b"changed sample")?;
+        let error = verify_shared_source(&source, &before)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("before [dev=") && error.contains("after [dev="));
+        assert!(error.contains("size=6") && error.contains("size=14"));
+        assert!(error.contains(" ino=") && error.contains(" mtime=") && error.contains(" ctime="));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn comparison_revalidation_failure_retains_measured_progress_without_authorizing_clips()
+    -> Result<()> {
+        for reject_progress in [false, true] {
+            let root = tempfile::tempdir()?;
+            let incoming = root.path().join("incoming");
+            let scratch = root.path().join("scratch");
+            let state = root.path().join("state");
+            std::fs::create_dir(&incoming)?;
+            std::fs::create_dir(&state)?;
+            let config = Arc::new(super::super::imports::ImportConfig::open(
+                &incoming,
+                &scratch,
+                1024,
+                1024,
+                Duration::from_secs(5),
+            )?);
+            wetube_backend::db::initialize(&state).await?;
+            let pool = wetube_backend::db::connect(&state).await?;
+            sqlx::query("INSERT INTO users VALUES ('admin','admin','hash','admin')")
+                .execute(&pool)
+                .await?;
+            let staged = uuid::Uuid::new_v4().to_string();
+            std::fs::create_dir(scratch.join(&staged))?;
+            std::fs::write(scratch.join(&staged).join("input.iso"), b"changed")?;
+            let report = json!({"size_bytes":7,"sha256":"incorrect","staged_attempt_id":staged});
+            sqlx::query("INSERT INTO probe_jobs(id,requested_by,name,source_identity,title,angle,state,created_at,attempt_id,report)
+                VALUES ('probe','admin','test.iso','bound',1,1,'needs_review',1,?,?)")
+                .bind(&staged).bind(report.to_string()).execute(&pool).await?;
+            let queued = comparisons::enqueue(&pool, "admin", "probe")
+                .await?
+                .unwrap();
+            assert!(queued.progress.is_none());
+            if reject_progress {
+                sqlx::query("CREATE TRIGGER reject_progress BEFORE UPDATE OF progress ON comparison_jobs BEGIN SELECT RAISE(FAIL,'injected telemetry failure'); END")
+                    .execute(&pool).await?;
+            }
+            assert!(
+                tick(
+                    &pool,
+                    config,
+                    &super::super::conversions::Limits {
+                        timeout: Duration::from_secs(5),
+                        threads: 2,
+                        max_output_bytes: CLIP_CAP,
+                    }
+                )
+                .await?
+            );
+            let failed = comparisons::latest(&pool, "probe").await?.unwrap();
+            assert_eq!(failed.state, wetube_core::JobState::Failed);
+            assert!(
+                failed
+                    .error
+                    .as_deref()
+                    .unwrap()
+                    .contains("checksum mismatch")
+            );
+            if reject_progress {
+                assert!(failed.progress.is_none());
+            } else {
+                let progress = failed.progress.as_ref().unwrap();
+                assert_eq!(progress.workflow, MediaWorkflow::Comparison);
+                assert_eq!(progress.stage, 0);
+                assert_eq!(progress.completed_units, Some(7.0));
+                assert_eq!(progress.total_units, Some(7.0));
+                assert_eq!(progress.rate_and_eta(), None);
+                sqlx::query("UPDATE comparison_jobs SET state='running' WHERE id=?")
+                    .bind(&queued.id)
+                    .execute(&pool)
+                    .await?;
+                recover(&pool).await?;
+                let interrupted = comparisons::latest(&pool, "probe").await?.unwrap();
+                assert_eq!(interrupted.state, wetube_core::JobState::Failed);
+                assert_eq!(interrupted.progress, failed.progress);
+            }
+            let attempt = scratch.join(failed.attempt_id.unwrap());
+            assert!(attempt.join("comparison.json").is_file());
+            assert!(!attempt.join("preserve.mp4").exists());
+            assert_eq!(
+                std::fs::read(scratch.join(&staged).join("input.iso"))?,
+                b"changed"
+            );
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM movies")
+                    .fetch_one(&pool)
+                    .await?,
+                0
+            );
+            pool.close().await;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn comparison_capture_and_validation_propagate_real_media_timestamps() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let pool = SqlitePool::connect("sqlite::memory:").await?;
+        sqlx::query("CREATE TABLE comparison_jobs(id TEXT,state TEXT,progress TEXT)")
+            .execute(&pool)
+            .await?;
+        sqlx::query("INSERT INTO comparison_jobs VALUES ('test','running',NULL)")
+            .execute(&pool)
+            .await?;
+        let recording = Recording::start(
+            &pool,
+            "comparison_jobs",
+            "test",
+            MediaWorkflow::Comparison,
+            1,
+        );
+        recording.progress.stage(
+            1,
+            "Extracting shared midpoint sample",
+            Some(1.0),
+            "media seconds",
+        );
+        let file = create(&directory.path().join("sample.mkv"))?;
+        let mut command = ffmpeg(2);
+        command.args([
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=160x90:rate=24",
+            "-t",
+            "1",
+            "-c:v",
+            "ffv1",
+            "-progress",
+            "pipe:1",
+        ]);
+        output(&mut command, &file, SOURCE_CAP, "matroska")?;
+        run(
+            &mut command,
+            directory.path(),
+            "extract",
+            Duration::from_secs(10),
+            false,
+            &recording.progress,
+        )
+        .await?;
+        recording.finish().await;
+        let read = || async {
+            let json: String = sqlx::query_scalar("SELECT progress FROM comparison_jobs")
+                .fetch_one(&pool)
+                .await?;
+            anyhow::Ok(serde_json::from_str::<wetube_core::MediaProgress>(&json)?)
+        };
+        let extracted = read().await?;
+        assert_eq!(extracted.stage, 1);
+        assert!(extracted.completed_units.unwrap() > 0.8);
+        assert!(extracted.fraction().unwrap() < 1.0);
+        let recording = Recording::start(
+            &pool,
+            "comparison_jobs",
+            "test",
+            MediaWorkflow::Comparison,
+            2,
+        );
+        let (_, frames, seconds) = validate(
+            &file,
+            directory.path(),
+            "source-decode",
+            Duration::from_secs(10),
+            &recording.progress,
+            2,
+            1.0,
+        )
+        .await?;
+        recording.finish().await;
+        let decoded = read().await?;
+        assert_eq!(decoded.stage, 2);
+        assert_eq!(decoded.completed_units, Some(seconds));
+        assert_eq!(frames, 24);
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT state FROM comparison_jobs")
+                .fetch_one(&pool)
+                .await?,
+            "running"
+        );
+        pool.close().await;
+        Ok(())
+    }
+
     #[test]
     fn midpoint_short_and_untrusted_seek_results() {
         assert_eq!(
