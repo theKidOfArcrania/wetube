@@ -18,7 +18,7 @@ This is a runnable local website preview, not a production TrueNAS deployment:
 - Administrator-only, approximately centered 10-second Preserve/Yadif comparisons
   from the same inspected staged ISO, before committing to a full conversion.
 - Preserved original audio/image-subtitle sidecars and retained failed attempts.
-- Live, persisted media-phase progress with labeled stage-based workflow bars.
+- Live, persisted media-phase progress with stage-based bars and estimated phase countdowns.
 - Optional administrator TMDB search, explicit selection and editable publication
   metadata, with expiring cache and explicit refresh (manual entry always available).
 - Compact latest media readiness, expandable checks, and per-admin import
@@ -347,10 +347,15 @@ Archive/restore requires admin, exact Origin, CSRF, and an atomic current-state
 eligibility check. No archive operation modifies job state or deletes files.
 
 Progress bars count workflow stages, not equal amounts of work or remaining
-time. Only measurable current phases show percentage, elapsed, average rate and
-estimated phase remainder. DVD discovery/metadata inspection are indeterminate;
-review waits and stale/failed observations have no live ETA. Publication includes
-separate copy, decode and checksum phases for the movie and preservation assets.
+time. Measured percentages hold through telemetry gaps. Estimated phase time
+counts down between advancing measurements, which may revise the estimate.
+If it runs out, the phase waits for an updated estimate, never claims completion.
+Unknown phases have no ETA. After about ten seconds without a worker heartbeat,
+observations are marked not live with no countdown; queued, review and failed
+jobs also have no live ETA. Conversion input revalidation and publication use
+fixed portions for sequential substeps, retaining completed portions during
+unmeasured checks. Publication includes movie copy, independent validation and
+checksum verification, plus preservation copy and verification only when present.
 Current phase fills are capped at 99% until validation advances the stage;
 only durable job state establishes completion/readiness. Progress stdout logs
 retain at most the initial 2 MiB per tool; final validation uses a bounded 2 MiB

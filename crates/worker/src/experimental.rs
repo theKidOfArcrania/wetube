@@ -1066,7 +1066,7 @@ pub(crate) async fn convert(
         let staged_config = config.clone();
         let staged_probe = probe.clone();
         phase(Some((pool, &job.id, progress)), "revalidating_input").await?;
-        let staging_progress = progress.clone();
+        let staging_progress = progress.substep(0, 0, 2);
         let mut staged = tokio::task::spawn_blocking(move || {
             super::imports::revalidate_progress(
                 &staged_config,
@@ -1092,7 +1092,9 @@ pub(crate) async fn convert(
                 .context("output overflow")?,
         )?;
         staged.verify()?;
-        progress.stage(0, "Reinspecting checksum-bound program", None, "");
+        progress
+            .substep(0, 1, 2)
+            .stage(0, "Reinspecting checksum-bound program", None, "");
         let inspection =
             super::probe::inspect_open_iso(&staged.path, &staged.file, probe.title, probe.angle)
                 .await?;
@@ -1531,6 +1533,32 @@ mod tests {
                 .fetch_one(&telemetry)
                 .await?,
             "converting"
+        );
+        let recording = crate::progress::Recording::start(
+            &telemetry,
+            "conversion_jobs",
+            "generated",
+            wetube_core::MediaWorkflow::Conversion,
+            5,
+        );
+        let validation_progress = recording.progress.substep(5, 1, 5);
+        validation_progress.stage(5, "Inspecting published copy", None, "");
+        crate::preview::validate_progress(
+            &open_input(&dir.path().join("movie.mp4"))?,
+            &json!({"validation": &validation}),
+            Duration::from_secs(30),
+            Some(&validation_progress),
+        )
+        .await?;
+        recording.finish().await;
+        let snapshot: String = sqlx::query_scalar("SELECT progress FROM conversion_jobs")
+            .fetch_one(&telemetry)
+            .await?;
+        let snapshot: wetube_core::MediaProgress = serde_json::from_str(&snapshot)?;
+        assert_eq!(snapshot.phase, "Full decode of published movie");
+        assert!(
+            snapshot.stage_fraction().unwrap() > 0.39 && snapshot.stage_fraction().unwrap() < 0.4,
+            "nested full decode must retain the movie-copy portion, without claiming later hashes"
         );
         telemetry.close().await;
         assert_eq!(validation["source_decoded_frames"], 50);

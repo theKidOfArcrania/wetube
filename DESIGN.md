@@ -76,14 +76,23 @@ segments show completed stages and the current measurable phase; they are not
 a time-weighted completion percentage or an overall remaining-time estimate.
 Bytes copied/hashed and decoded media timestamps support phase percentage,
 elapsed time, average throughput and an estimated phase remainder. Discovery
-and metadata inspection remain indeterminate; validation/publication may contain
-multiple explicitly named phases. Unknown or stalled measurements and stale
-snapshots have no ETA. Current measured fills stop at 99% until the next validated
-stage or authoritative terminal state. Review waits, queued jobs and failed or
+and metadata inspection remain indeterminate. Conversion input revalidation and
+publication allocate fixed stage portions to sequential substeps; completed
+portions remain filled during unmeasured checks. Optional preservation copy and
+verification receive portions only when applicable. Measured percentages hold
+through telemetry gaps. Estimated phase time counts down from the last advancing
+measurement; repeated or regressing media timestamps and recorder heartbeats do
+not recalculate it. New advancing measurements may revise it in either direction.
+An exhausted estimate waits for an update, never implies completion. Unknown
+phases have no ETA. After about ten seconds without a worker heartbeat, snapshots
+are marked not live and show neither a countdown nor a waiting estimate. Initial
+heartbeat age uses the API response's server time; subsequent tracking uses
+browser-relative time, independently of measurement advancement. Current measured
+fills stop at 99% until the next validated stage or authoritative terminal state.
+Review waits, queued jobs and failed or
 interrupted attempts never masquerade as running work or library readiness.
-Repeated or regressing media timestamps do not refresh the ten-second
-no-advancement limit. Snapshot writes are best-effort: failures retry on later
-ticks with rate-limited warnings, never override authoritative job results, and
+Snapshot writes are best-effort: failures retry on later ticks with rate-limited
+warnings, never override authoritative job results, and
 the optional final flush has a one-second deadline after result persistence.
 FFmpeg progress is drained continuously with bounded line buffers, a bounded
 in-memory tail for final validation, and capped progress logs; stderr retains

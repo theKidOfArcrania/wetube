@@ -6,7 +6,10 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
-use std::{cell::RefCell, rc::Rc};
+use std::{
+    cell::{Cell, RefCell},
+    rc::Rc,
+};
 use wetube_core::{
     ApiError, ArchiveImport, ComparisonJob, ConversionJob, ConversionRequest, ConversionState,
     DiagnosticJob, DiagnosticReport, ImportEntry, ImportJob, ImportPage, IncomingFiles,
@@ -18,6 +21,12 @@ use wetube_core::{
 };
 
 async fn decode<T: DeserializeOwned>(response: Response) -> Result<T, String> {
+    if let Some(date) = response.headers().get("date") {
+        let server_seconds = js_sys::Date::parse(&date) / 1000.0;
+        if server_seconds.is_finite() {
+            SERVER_CLOCK.with(|clock| clock.set(Some((server_seconds, browser_clock()))));
+        }
+    }
     if !response.ok() {
         return Err(response
             .json::<ApiError>()
@@ -28,18 +37,72 @@ async fn decode<T: DeserializeOwned>(response: Response) -> Result<T, String> {
     response.json().await.map_err(|error| error.to_string())
 }
 
+thread_local! {
+    static SERVER_CLOCK: Cell<Option<(f64, f64)>> = const { Cell::new(None) };
+    // Polling replaces job cards; retain the receipt time for an unchanged observation.
+    static PROGRESS_RECEIPTS: RefCell<HashMap<String, ProgressReceipt>> = RefCell::new(HashMap::new());
+}
+
+struct ProgressReceipt {
+    progress: MediaProgress,
+    received: f64,
+    heartbeat_received: Option<f64>,
+}
+
+fn heartbeat_receipt(updated_at: i64, received: f64, heartbeat_advanced: bool) -> Option<f64> {
+    // Server time avoids browser clock skew. Without it, require an observed heartbeat
+    // before treating the first snapshot as live.
+    SERVER_CLOCK
+        .with(|clock| {
+            clock.get().map(|(server_seconds, observed)| {
+                let server_now = server_seconds + (received - observed).max(0.0);
+                received - (server_now - updated_at as f64)
+            })
+        })
+        .or_else(|| heartbeat_advanced.then_some(received))
+}
+
 #[component]
 fn MediaJobProgress(
+    observation_key: String,
     workflow: MediaWorkflow,
     progress: Option<MediaProgress>,
     state: MediaProgressState,
 ) -> impl IntoView {
     let workflow = progress.as_ref().map_or(workflow, |p| p.workflow);
     let fills = workflow.stage_fills(progress.as_ref(), state);
-    let now = RwSignal::new(js_sys::Date::now() / 1000.0);
+    let received = browser_clock();
+    let (received, heartbeat_received) = PROGRESS_RECEIPTS.with(|receipts| {
+        let mut receipts = receipts.borrow_mut();
+        if receipts.len() > 256 {
+            receipts.clear();
+        }
+        progress.as_ref().map_or((received, None), |p| {
+            let entry = receipts
+                .entry(observation_key)
+                .or_insert_with(|| ProgressReceipt {
+                    progress: p.clone(),
+                    received,
+                    heartbeat_received: heartbeat_receipt(p.updated_at, received, false),
+                });
+            if entry.progress.updated_at != p.updated_at {
+                entry.heartbeat_received = heartbeat_receipt(
+                    p.updated_at,
+                    received,
+                    p.updated_at > entry.progress.updated_at,
+                );
+            }
+            if entry.progress != *p {
+                entry.progress = p.clone();
+                entry.received = received;
+            }
+            (entry.received, entry.heartbeat_received)
+        })
+    });
+    let now = RwSignal::new(browser_clock());
     if state == MediaProgressState::Active {
         let timer = gloo_timers::callback::Interval::new(1000, move || {
-            let _ = now.try_set(js_sys::Date::now() / 1000.0);
+            let _ = now.try_set(browser_clock());
         });
         let timer = StoredValue::new_local(Some(timer));
         on_cleanup(move || {
@@ -47,10 +110,9 @@ fn MediaJobProgress(
         });
     }
     let message = move || {
-        let fresh = progress
-            .as_ref()
-            .is_some_and(|p| (now.get() - p.updated_at as f64).abs() <= 10.0);
-        let active = state == MediaProgressState::Active && fresh;
+        let active = state == MediaProgressState::Active
+            && heartbeat_received
+                .is_some_and(|heartbeat| (0.0..=10.0).contains(&(now.get() - heartbeat)));
         match state {
             MediaProgressState::Queued => "Queued — waiting for worker.".to_owned(),
             MediaProgressState::QueuedPublication => {
@@ -72,13 +134,23 @@ fn MediaJobProgress(
                         p.phase, percentage, p.elapsed_seconds
                     );
                     if active {
-                        if let Some((rate, eta)) = p.rate_and_eta() {
-                            text.push_str(&format!(
-                                " · {:.1} {}/s · estimated {:.0}s remaining in this phase",
-                                rate,
-                                p.unit,
-                                eta.ceil()
-                            ));
+                        let mut observed = p.clone();
+                        observed.elapsed_seconds += (now.get() - received).max(0.0);
+                        // Old records have no measurement anchor; do not recalculate their rate
+                        // from the browser timer.
+                        observed.measured_elapsed_seconds =
+                            p.measured_elapsed_seconds.or(Some(p.elapsed_seconds));
+                        if let Some((rate, eta)) = observed.rate_and_eta() {
+                            if eta > 0.0 {
+                                text.push_str(&format!(
+                                    " · {:.1} {}/s · estimated {:.0}s remaining in this phase",
+                                    rate,
+                                    p.unit,
+                                    eta.ceil()
+                                ));
+                            } else {
+                                text.push_str(" · waiting for updated estimate");
+                            }
                         }
                     } else {
                         text.push_str(" · last recorded; not live");
@@ -1537,7 +1609,7 @@ fn ProbeReview(
                         <h3 class="inspection-source">"Source: "{job.name.clone()}</h3>
                         <p class="inspection-state">{label}</p>
                         {move || probes.get().into_iter().find(|job| job.id == job_id.get_value()).map(|job| view! {
-                            <MediaJobProgress workflow=MediaWorkflow::Inspect progress=job.progress
+                            <MediaJobProgress observation_key=format!("inspect:{}", job.id) workflow=MediaWorkflow::Inspect progress=job.progress
                                 state=match job.state {
                                     ProbeState::Queued => MediaProgressState::Queued,
                                     ProbeState::NeedsReview => MediaProgressState::Complete,
@@ -1688,7 +1760,7 @@ fn ScanSelection(
                 view! {
                     <h3 class="inspection-source">"Source: "{scan.name}</h3>
                     <p class="inspection-state" role="status">{label}</p>
-                    <MediaJobProgress workflow=MediaWorkflow::Scan progress=scan.progress
+                    <MediaJobProgress observation_key=format!("scan:{}", scan.id) workflow=MediaWorkflow::Scan progress=scan.progress
                         state=match scan.state {
                             ScanState::Queued => MediaProgressState::Queued,
                             ScanState::NeedsReview => MediaProgressState::Complete,
@@ -1868,7 +1940,7 @@ fn ComparisonPreview(probe_id: String, csrf: StoredValue<String>) -> impl IntoVi
                     report["requested_start_seconds"].as_f64().unwrap_or(0.0),
                     report["requested_duration_seconds"].as_f64().unwrap_or(0.0)));
                 view! {
-                    <MediaJobProgress workflow=MediaWorkflow::Comparison progress=job.progress state=match job.state {
+                    <MediaJobProgress observation_key=format!("comparison:{}", job.id) workflow=MediaWorkflow::Comparison progress=job.progress state=match job.state {
                         JobState::Queued => MediaProgressState::Queued,
                         JobState::Running => MediaProgressState::Active,
                         JobState::Succeeded => MediaProgressState::Complete,
@@ -2041,14 +2113,14 @@ fn publication_metadata(
     Ok((title, year, description))
 }
 
-fn metadata_clock() -> f64 {
+fn browser_clock() -> f64 {
     web_sys::window()
         .and_then(|window| window.performance())
         .map_or(f64::NAN, |performance| performance.now() / 1000.0)
 }
 
 fn metadata_is_fresh(received_at: f64) -> bool {
-    (0.0..86400.0).contains(&(metadata_clock() - received_at))
+    (0.0..86400.0).contains(&(browser_clock() - received_at))
 }
 
 #[derive(Clone)]
@@ -2149,7 +2221,7 @@ fn MetadataLookup(
                     }
                     // Browser time is only a local elapsed-time hint. The server
                     // independently validates the unchanged fetched_at at publish.
-                    let received_at = metadata_clock();
+                    let received_at = browser_clock();
                     results.set(
                         response
                             .movies
@@ -2233,11 +2305,11 @@ fn ConversionReview(
     let description = RwSignal::new(String::new());
     let confirmed = RwSignal::new(false);
     let tmdb = RwSignal::new(None::<MetadataSelection>);
-    let clock = RwSignal::new(metadata_clock());
+    let clock = RwSignal::new(browser_clock());
     let timer = StoredValue::new_local(Some(gloo_timers::callback::Interval::new(
         30_000,
         move || {
-            let _ = clock.try_set(metadata_clock());
+            let _ = clock.try_set(browser_clock());
         },
     )));
     on_cleanup(move || {
@@ -2431,7 +2503,7 @@ fn ConversionReview(
                 };
                 view! {
                     <p class="inspection-state" role="status">{state}</p>
-                    <MediaJobProgress workflow=MediaWorkflow::Conversion progress=job.progress
+                    <MediaJobProgress observation_key=format!("conversion:{}", job.id) workflow=MediaWorkflow::Conversion progress=job.progress
                         state=match job.state {
                             ConversionState::Queued => MediaProgressState::Queued,
                             ConversionState::NeedsReview => MediaProgressState::Review,

@@ -8,12 +8,11 @@ use wetube_core::{MediaProgress, MediaWorkflow};
 struct Current {
     snapshot: MediaProgress,
     started: Instant,
-    last_advance: Instant,
     high_water: f64,
 }
 
 #[derive(Clone)]
-pub(crate) struct Progress(Arc<Mutex<Current>>);
+pub(crate) struct Progress(Arc<Mutex<Current>>, Option<(usize, [f64; 2])>);
 
 pub(crate) struct Recording {
     pub progress: Progress,
@@ -22,6 +21,19 @@ pub(crate) struct Recording {
 }
 
 impl Progress {
+    pub fn substep(&self, stage: usize, index: usize, count: usize) -> Self {
+        Self(
+            self.0.clone(),
+            Some((
+                stage,
+                [
+                    index as f64 / count as f64,
+                    (index + 1) as f64 / count as f64,
+                ],
+            )),
+        )
+    }
+
     pub fn stage(&self, stage: usize, phase: &str, total: Option<f64>, unit: &str) {
         let mut current = self.0.lock().unwrap();
         current.snapshot.stage = stage;
@@ -30,18 +42,18 @@ impl Progress {
         current.snapshot.total_units = total.filter(|n| n.is_finite() && *n > 0.0);
         current.snapshot.unit = unit.to_owned();
         current.started = Instant::now();
-        current.last_advance = current.started;
+        current.snapshot.measured_elapsed_seconds = None;
+        current.snapshot.stage_portion = self.1.filter(|(s, _)| *s == stage).map(|(_, p)| p);
         current.high_water = 0.0;
     }
 
     pub fn units(&self, done: f64) {
         let mut current = self.0.lock().unwrap();
-        if done.is_finite() && done >= 0.0 {
+        if done.is_finite() && done > current.high_water {
             current.snapshot.completed_units = Some(done);
-            if done > current.high_water {
-                current.last_advance = Instant::now();
-                current.high_water = done;
-            }
+            current.snapshot.measured_elapsed_seconds =
+                Some(current.started.elapsed().as_secs_f64());
+            current.high_water = done;
         }
     }
 
@@ -59,10 +71,6 @@ impl Progress {
         let mut snapshot = current.snapshot.clone();
         snapshot.elapsed_seconds = current.started.elapsed().as_secs_f64();
         snapshot.updated_at = wetube_backend::now();
-        // A stalled tool has no defensible current throughput or ETA.
-        if current.last_advance.elapsed() > Duration::from_secs(10) {
-            snapshot.total_units = None;
-        }
         snapshot
     }
 }
@@ -82,21 +90,25 @@ impl Recording {
             "comparison_jobs" => "UPDATE comparison_jobs SET progress=? WHERE id=?",
             _ => unreachable!("fixed progress table"),
         };
-        let progress = Progress(Arc::new(Mutex::new(Current {
-            snapshot: MediaProgress {
-                workflow,
-                stage,
-                phase: workflow.stages()[stage].into(),
-                elapsed_seconds: 0.0,
-                completed_units: None,
-                total_units: None,
-                unit: String::new(),
-                updated_at: wetube_backend::now(),
-            },
-            started: Instant::now(),
-            last_advance: Instant::now(),
-            high_water: 0.0,
-        })));
+        let progress = Progress(
+            Arc::new(Mutex::new(Current {
+                snapshot: MediaProgress {
+                    workflow,
+                    stage,
+                    phase: workflow.stages()[stage].into(),
+                    elapsed_seconds: 0.0,
+                    completed_units: None,
+                    total_units: None,
+                    unit: String::new(),
+                    updated_at: wetube_backend::now(),
+                    measured_elapsed_seconds: None,
+                    stage_portion: None,
+                },
+                started: Instant::now(),
+                high_water: 0.0,
+            })),
+            None,
+        );
         let (stop, mut stopped) = tokio::sync::oneshot::channel();
         let writer = progress.clone();
         let pool = pool.clone();
@@ -216,15 +228,16 @@ mod tests {
         let recording = Recording::start(&pool, "scan_jobs", "unused", MediaWorkflow::Scan, 0);
         let progress = &recording.progress;
         progress.stage(0, "Decode", Some(100.0), "media seconds");
-        progress.ffmpeg_line("out_time_us=50000000");
         {
             let mut current = progress.0.lock().unwrap();
             current.started = Instant::now() - Duration::from_secs(20);
         }
-        assert!(progress.snapshot().rate_and_eta().is_some());
+        progress.ffmpeg_line("out_time_us=50000000");
+        let measured = progress.snapshot().measured_elapsed_seconds;
+        let first_eta = progress.snapshot().rate_and_eta().unwrap().1;
         {
             let mut current = progress.0.lock().unwrap();
-            current.last_advance = Instant::now() - Duration::from_secs(11);
+            current.started = Instant::now() - Duration::from_secs(31);
         }
         for line in [
             "out_time_us=50000000",
@@ -232,12 +245,17 @@ mod tests {
             "out_time_us=50000000",
         ] {
             progress.ffmpeg_line(line);
-            assert_eq!(progress.snapshot().fraction(), None);
-            assert_eq!(progress.snapshot().rate_and_eta(), None);
+            let snapshot = progress.snapshot();
+            assert_eq!(snapshot.fraction(), Some(0.5));
+            assert_eq!(snapshot.measured_elapsed_seconds, measured);
+            let eta = snapshot.rate_and_eta().unwrap().1;
+            assert!(eta > 8.0 && eta < first_eta - 10.0);
         }
+        progress.0.lock().unwrap().started = Instant::now() - Duration::from_secs(50);
+        assert_eq!(progress.snapshot().rate_and_eta().unwrap().1, 0.0);
         progress.ffmpeg_line("out_time_us=60000000");
         assert_eq!(progress.snapshot().fraction(), Some(0.6));
-        assert!(progress.snapshot().rate_and_eta().is_some());
+        assert!(progress.snapshot().rate_and_eta().unwrap().1 > 30.0);
         recording.finish().await;
         pool.close().await;
         Ok(())
@@ -318,14 +336,62 @@ mod tests {
         assert_eq!(progress.snapshot().rate_and_eta(), None);
         {
             let mut current = progress.0.lock().unwrap();
-            current.last_advance = Instant::now() - Duration::from_secs(11);
+            current.started = Instant::now() - Duration::from_secs(11);
         }
         assert_eq!(
             progress.snapshot().fraction(),
-            None,
-            "stalled samples have no current throughput/ETA"
+            Some(0.99),
+            "a telemetry gap retains measured progress, never completion"
         );
         recording.finish().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn allocated_substeps_hold_completed_work_during_nested_unknown_phases() -> Result<()> {
+        let pool = SqlitePool::connect("sqlite::memory:").await?;
+        sqlx::query("CREATE TABLE conversion_jobs(id TEXT,progress TEXT)")
+            .execute(&pool)
+            .await?;
+        let recording = Recording::start(
+            &pool,
+            "conversion_jobs",
+            "unused",
+            MediaWorkflow::Conversion,
+            0,
+        );
+        let progress = &recording.progress;
+        let checksum = progress.substep(0, 0, 2);
+        checksum.stage(0, "Checksum", Some(100.0), "bytes");
+        checksum.units(50.0);
+        assert_eq!(progress.snapshot().stage_fraction(), Some(0.25));
+        checksum.units(100.0);
+        let before = progress.snapshot().stage_fraction().unwrap();
+        progress.substep(0, 1, 2).stage(0, "Reinspect", None, "");
+        assert!(progress.snapshot().stage_fraction().unwrap() >= before);
+        assert_eq!(progress.snapshot().fraction(), None);
+
+        for count in [3, 5] {
+            let mut previous = 0.0;
+            for index in 0..count {
+                let part = progress.substep(5, index, count);
+                part.stage(5, "Metadata or setup", None, "");
+                assert!(progress.snapshot().stage_fraction().unwrap() >= previous);
+                assert_eq!(progress.snapshot().rate_and_eta(), None);
+                part.stage(5, "Decode or hash", Some(100.0), "units");
+                for done in [0.0, 25.0, 100.0] {
+                    part.units(done);
+                    let fill = progress.snapshot().stage_fraction().unwrap();
+                    assert!(fill >= previous && fill < 1.0);
+                    previous = fill;
+                }
+            }
+            assert!(previous > 0.99);
+        }
+        progress.stage(6, "Register", None, "");
+        assert_eq!(progress.snapshot().stage_portion, None);
+        recording.finish().await;
+        pool.close().await;
         Ok(())
     }
 }

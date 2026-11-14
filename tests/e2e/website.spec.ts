@@ -695,6 +695,7 @@ test('TMDB refresh is explicit and survives library polling without blocking loc
 });
 
 test('live media progress renders measurable, indeterminate, queued, review, failed and terminal stages honestly', async ({ page }) => {
+  test.setTimeout(120_000);
   const now = () => Math.floor(Date.now() / 1000);
   const scan = {
     id: randomUUID(), name: 'Progress fixture.iso', state: 'queued',
@@ -709,6 +710,7 @@ test('live media progress renders measurable, indeterminate, queued, review, fai
       workflow: 'conversion', stage: 2, phase: 'Encoding movie',
       elapsed_seconds: 10, completed_units: 20, total_units: 80 as number | null,
       unit: 'media seconds', updated_at: now(),
+      measured_elapsed_seconds: 10, stage_portion: null as number[] | null,
     },
   };
   await page.route('**/api/v1/admin/imports?*', route => {
@@ -718,7 +720,8 @@ test('live media progress renders measurable, indeterminate, queued, review, fai
       { item: { kind: 'conversion', job: conversion }, can_archive: ['failed', 'published'].includes(conversion.state),
         history: conversion.state === 'published' },
     ];
-    return route.fulfill({ json: { entries: entries.filter(entry => entry.history === history),
+    return route.fulfill({ headers: { date: new Date().toUTCString() },
+      json: { entries: entries.filter(entry => entry.history === history),
       total: entries.filter(entry => entry.history === history).length,
       history_count: entries.filter(entry => entry.history).length } });
   });
@@ -739,6 +742,21 @@ test('live media progress renders measurable, indeterminate, queued, review, fai
   await expect(convertedCard.locator('.phase-progress')).toContainText('elapsed 10s');
   await expect(convertedCard.locator('.phase-progress')).toContainText('2.0 media seconds/s · estimated 30s remaining in this phase');
   await expect(convertedCard.getByText('Progress by stage, not time remaining', { exact: true })).toBeVisible();
+  await page.waitForTimeout(2200);
+  await expect(convertedCard.locator('.phase-progress')).toContainText(/estimated 2[678]s remaining/);
+  // Heartbeats advance observation age, not the measurement used for the estimate.
+  conversion.progress.elapsed_seconds = 22;
+  conversion.progress.updated_at = now();
+  await expect(convertedCard.locator('.phase-progress')).toContainText(/estimated 1[678]s remaining/);
+  await expect(encode).toHaveAttribute('aria-valuenow', '25');
+  conversion.progress.elapsed_seconds = 45;
+  await expect(convertedCard.locator('.phase-progress')).toContainText('waiting for updated estimate');
+  await expect(encode).toHaveAttribute('aria-valuenow', '25');
+  await expect(convertedCard.locator('.phase-progress')).not.toContainText('Workflow complete');
+  conversion.progress.completed_units = 40;
+  conversion.progress.measured_elapsed_seconds = 45;
+  await expect(encode).toHaveAttribute('aria-valuenow', '50');
+  await expect(convertedCard.locator('.phase-progress')).toContainText(/estimated 4[345]s remaining/);
 
   conversion.progress.completed_units = 80;
   await expect(encode).toHaveAttribute('aria-valuenow', '99');
@@ -746,6 +764,38 @@ test('live media progress renders measurable, indeterminate, queued, review, fai
   conversion.progress.total_units = null;
   await expect(encode).not.toHaveAttribute('aria-valuenow');
   await expect(convertedCard.locator('.phase-progress')).toContainText('indeterminate');
+
+  conversion.progress.stage = 0;
+  conversion.progress.phase = 'Revalidating retained input checksum';
+  conversion.progress.completed_units = 100;
+  conversion.progress.total_units = 100;
+  conversion.progress.stage_portion = [0, 0.5];
+  const input = convertedCard.getByRole('progressbar', { name: 'Revalidate input', exact: true });
+  await expect(input).toHaveAttribute('aria-valuenow', '50');
+  conversion.progress.phase = 'Reinspecting checksum-bound program';
+  conversion.progress.total_units = null;
+  conversion.progress.stage_portion = [0.5, 1];
+  await expect(convertedCard.locator('.phase-progress')).toContainText('Reinspecting checksum-bound program · indeterminate');
+  await expect(input).toHaveAttribute('aria-valuenow', '50');
+  conversion.state = 'publishing';
+  conversion.progress.stage = 5;
+  const publication = convertedCard.getByRole('progressbar', { name: 'Copy & verify publication', exact: true });
+  for (const portions of [3, 5]) {
+    for (let step = 0; step < portions; step++) {
+      conversion.progress.phase = `Publication check ${step + 1} of ${portions}`;
+      conversion.progress.stage_portion = [step / portions, (step + 1) / portions];
+      conversion.progress.total_units = null;
+      await expect(publication).toHaveAttribute('aria-valuenow', (100 * step / portions).toFixed(0));
+      conversion.progress.total_units = 100;
+      conversion.progress.completed_units = 50;
+      await expect(publication).toHaveAttribute('aria-valuenow', (100 * (step + 0.5) / portions).toFixed(0));
+    }
+  }
+  await expect(convertedCard.getByRole('progressbar', { name: 'Register', exact: true })).toHaveAttribute('aria-valuenow', '0');
+  conversion.state = 'converting';
+  conversion.progress.stage = 2;
+  conversion.progress.phase = 'Encoding movie';
+  conversion.progress.stage_portion = null;
 
   scan.state = 'scanning';
   scan.progress = {
@@ -759,9 +809,12 @@ test('live media progress renders measurable, indeterminate, queued, review, fai
 
   conversion.progress.completed_units = 20;
   conversion.progress.total_units = 80;
+  conversion.progress.measured_elapsed_seconds = 10;
+  conversion.progress.elapsed_seconds = 45;
   conversion.progress.updated_at = now() - 60;
   await expect(convertedCard.locator('.phase-progress')).toContainText('last recorded; not live');
   await expect(convertedCard.locator('.phase-progress')).not.toContainText('remaining');
+  await expect(convertedCard.locator('.phase-progress')).not.toContainText('waiting for updated estimate');
   conversion.state = 'failed';
   conversion.progress.updated_at = now();
   await expandImport(page, conversion.id);
@@ -787,6 +840,65 @@ test('live media progress renders measurable, indeterminate, queued, review, fai
   scan.state = 'needs_review';
   await expandImport(page, scan.id);
   await expect(scanCard.getByRole('progressbar', { name: 'Discover DVD', exact: true })).toHaveAttribute('aria-valuenow', '100');
+});
+
+test('media progress heartbeat liveness survives clock skew without refreshing measured ETA', async ({ page }) => {
+  const started = Date.now();
+  const now = () => Math.floor(Date.now() / 1000);
+  const job = (updatedAt: number) => ({
+    id: randomUUID(), probe_job_id: randomUUID(), state: 'converting', created_at: now(),
+    attempt_id: null, video_treatment: 'preserve', phase: 'encoding', report: null,
+    error: null, movie_id: null, movie_sha256: null,
+    progress: {
+      workflow: 'conversion', stage: 2, phase: 'Encoding movie', elapsed_seconds: 10,
+      completed_units: 20, total_units: 80, unit: 'media seconds', updated_at: updatedAt,
+      measured_elapsed_seconds: 10,
+    },
+  });
+  const live = job(now());
+  const stale = job(now() - 3600);
+  let heartbeats = true;
+  let estimateExpired = false;
+  await page.clock.setFixedTime(new Date('2042-06-01T12:00:00Z'));
+  await page.route('**/api/v1/admin/imports?*', route => {
+    if (heartbeats) {
+      live.progress.updated_at = now();
+      live.progress.elapsed_seconds = estimateExpired ? 45 : 10 + (Date.now() - started) / 1000;
+    }
+    const history = new URL(route.request().url()).searchParams.get('history') === 'true';
+    const entries = history ? [] : [live, stale].map(job => ({
+      item: { kind: 'conversion', job }, can_archive: job.state === 'failed',
+    }));
+    return route.fulfill({
+      headers: { date: new Date().toUTCString() },
+      json: { entries, total: entries.length, history_count: 0 },
+    });
+  });
+  await login(page, 'e2e-admin');
+  const liveCard = page.locator(`[data-testid="conversion-job"][data-job-id="${live.id}"]`);
+  const staleCard = page.locator(`[data-testid="conversion-job"][data-job-id="${stale.id}"]`);
+  const livePhase = liveCard.locator('.phase-progress');
+  const stalePhase = staleCard.locator('.phase-progress');
+  const encode = liveCard.getByRole('progressbar', { name: 'Encode', exact: true });
+  await expect(stalePhase).toContainText('last recorded; not live');
+  await expect(stalePhase).not.toContainText(/remaining|waiting for updated estimate/);
+  await expect(staleCard.getByRole('progressbar', { name: 'Encode', exact: true })).toHaveAttribute('aria-valuenow', '25');
+  await expect(livePhase).toContainText(/estimated (30|2[789])s remaining/);
+  await page.waitForTimeout(11_000);
+  await expect(encode).toHaveAttribute('aria-valuenow', '25');
+  await expect(livePhase).toContainText(/estimated 1[56789]s remaining/);
+  await expect(livePhase).not.toContainText('not live');
+  heartbeats = false;
+  await expect(livePhase).toContainText('last recorded; not live', { timeout: 15_000 });
+  await expect(livePhase).not.toContainText(/remaining|waiting for updated estimate/);
+  await expect(encode).toHaveAttribute('aria-valuenow', '25');
+  heartbeats = true;
+  estimateExpired = true;
+  await expect(livePhase).toContainText('waiting for updated estimate');
+  await expect(livePhase).not.toContainText('not live');
+  live.state = 'failed';
+  await expect(livePhase).toContainText('last recorded; not live');
+  await expect(livePhase).not.toContainText(/remaining|waiting for updated estimate/);
 });
 
 test('midpoint preview progress polls measured and indeterminate phases without implying readiness', async ({ page }) => {
@@ -817,7 +929,7 @@ test('midpoint preview progress polls measured and indeterminate phases without 
       submitted = true;
       return route.fulfill({ status: 202, json: job });
     }
-    return route.fulfill({ json: submitted ? job : null });
+    return route.fulfill({ headers: { date: new Date().toUTCString() }, json: submitted ? job : null });
   });
   await login(page, 'e2e-admin');
   await expandImport(page, probe.id);
@@ -860,9 +972,11 @@ test('midpoint preview progress polls measured and indeterminate phases without 
   await expect(validate).not.toHaveAttribute('aria-valuenow');
   await expect(preview.locator('.phase-progress')).toContainText('indeterminate');
   await expect(preview.locator('.phase-progress')).not.toContainText('remaining');
-  job.progress = { ...job.progress, completed_units: 5, total_units: 10, updated_at: now() - 60 };
+  job.progress = { ...job.progress, completed_units: 5, total_units: 10, updated_at: now() - 60,
+    measured_elapsed_seconds: 10, elapsed_seconds: 25 };
   await expect(preview.locator('.phase-progress')).toContainText('last recorded; not live');
   await expect(preview.locator('.phase-progress')).not.toContainText('remaining');
+  await expect(preview.locator('.phase-progress')).not.toContainText('waiting for updated estimate');
   job.state = 'failed';
   job.error = 'Injected validation failure; artifacts retained.';
   job.progress.updated_at = now();

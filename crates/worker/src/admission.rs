@@ -233,10 +233,15 @@ async fn admit_inner(
     let source_reader = source.try_clone()?;
     let target_writer = output(&target)?;
     let timeout = options.timeout;
-    if let Some(progress) = progress {
+    let has_tracks = !report["validation"]["original_tracks"].is_null();
+    let portions = if has_tracks { 5 } else { 3 };
+    let movie_copy = progress.map(|p| p.substep(5, 0, portions));
+    let movie_validation = progress.map(|p| p.substep(5, 1, portions));
+    let movie_verification = progress.map(|p| p.substep(5, 2, portions));
+    if let Some(progress) = movie_copy.as_ref() {
         progress.stage(5, "Copying and hashing movie", Some(size as f64), "bytes");
     }
-    let copying_progress = progress.cloned();
+    let copying_progress = movie_copy;
     let sha256 = tokio::task::spawn_blocking(move || {
         copy_and_hash_progress(
             source_reader,
@@ -259,14 +264,19 @@ async fn admit_inner(
     // Some filesystems finalize write timestamps only when the last writer closes.
     let copied = input(&target)?;
     let copy_identity = identity(&copied.metadata()?);
-    if let Some(progress) = progress {
+    if let Some(progress) = movie_validation.as_ref() {
         progress.stage(5, "Independently decoding published copy", None, "");
     }
-    let validated =
-        crate::preview::validate_progress(&copied, &report, options.timeout, progress).await?;
+    let validated = crate::preview::validate_progress(
+        &copied,
+        &report,
+        options.timeout,
+        movie_validation.as_ref(),
+    )
+    .await?;
     // Rehash the actual validated copy before finalization.
     let hash_file = copied.try_clone()?;
-    if let Some(progress) = progress {
+    if let Some(progress) = movie_verification.as_ref() {
         progress.stage(
             5,
             "Verifying published movie checksum",
@@ -274,7 +284,7 @@ async fn admit_inner(
             "bytes",
         );
     }
-    let hashing_progress = progress.cloned();
+    let hashing_progress = movie_verification;
     let actual_hash = tokio::task::spawn_blocking(move || {
         hash_copy_progress(hash_file, size, timeout, hashing_progress.as_ref())
     })
@@ -298,7 +308,9 @@ async fn admit_inner(
     drop(retained_report);
     // Preservation assets belong to the package, not merely the processing scratch root.
     let mut original_tracks_manifest = Value::Null;
-    if !report["validation"]["original_tracks"].is_null() {
+    if has_tracks {
+        let tracks_copy = progress.map(|p| p.substep(5, 3, portions));
+        let tracks_verification = progress.map(|p| p.substep(5, 4, portions));
         let tracks_path = pinned_parent.join("original-tracks.mkv");
         let tracks = input(&tracks_path)?;
         let tracks_identity = identity(&tracks.metadata()?);
@@ -317,7 +329,7 @@ async fn admit_inner(
         let target_path = staging.join("original-tracks.mkv");
         let source_reader = tracks.try_clone()?;
         let target_writer = output(&target_path)?;
-        if let Some(progress) = progress {
+        if let Some(progress) = tracks_copy.as_ref() {
             progress.stage(
                 5,
                 "Copying and hashing preservation tracks",
@@ -325,7 +337,7 @@ async fn admit_inner(
                 "bytes",
             );
         }
-        let copying_progress = progress.cloned();
+        let copying_progress = tracks_copy;
         let digest = tokio::task::spawn_blocking(move || {
             copy_and_hash_progress(
                 source_reader,
@@ -350,7 +362,7 @@ async fn admit_inner(
         let copied_tracks = input(&target_path)?;
         let copied_identity = identity(&copied_tracks.metadata()?);
         let hash_file = copied_tracks.try_clone()?;
-        if let Some(progress) = progress {
+        if let Some(progress) = tracks_verification.as_ref() {
             progress.stage(
                 5,
                 "Verifying published preservation tracks",
@@ -358,7 +370,7 @@ async fn admit_inner(
                 "bytes",
             );
         }
-        let hashing_progress = progress.cloned();
+        let hashing_progress = tracks_verification;
         let actual = tokio::task::spawn_blocking(move || {
             hash_copy_progress(hash_file, tracks_size, timeout, hashing_progress.as_ref())
         })

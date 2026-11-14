@@ -102,7 +102,7 @@ impl MediaWorkflow {
                         MediaProgressState::Active | MediaProgressState::Failed
                     )
                 {
-                    progress.and_then(MediaProgress::fraction)
+                    progress.and_then(MediaProgress::stage_fraction)
                 } else {
                     Some(0.0)
                 }
@@ -122,9 +122,30 @@ pub struct MediaProgress {
     pub total_units: Option<f64>,
     pub unit: String,
     pub updated_at: i64,
+    /// Phase elapsed time at the last strictly advancing measurement, not a recorder heartbeat.
+    #[serde(default)]
+    pub measured_elapsed_seconds: Option<f64>,
+    /// Fixed stage interval allocated to this sequential substep.
+    #[serde(default)]
+    pub stage_portion: Option<[f64; 2]>,
 }
 
 impl MediaProgress {
+    pub fn stage_fraction(&self) -> Option<f64> {
+        match self.stage_portion {
+            Some([start, end])
+                if start.is_finite()
+                    && end.is_finite()
+                    && start >= 0.0
+                    && end > start
+                    && end <= 1.0 =>
+            {
+                Some(start + (end - start) * self.fraction().unwrap_or(0.0))
+            }
+            _ => self.fraction(),
+        }
+    }
+
     pub fn fraction(&self) -> Option<f64> {
         let (done, total) = (self.completed_units?, self.total_units?);
         (done.is_finite() && total.is_finite() && done >= 0.0 && total > 0.0)
@@ -133,16 +154,21 @@ impl MediaProgress {
 
     pub fn rate_and_eta(&self) -> Option<(f64, f64)> {
         let (done, total) = (self.completed_units?, self.total_units?);
+        let measured_elapsed = self
+            .measured_elapsed_seconds
+            .unwrap_or(self.elapsed_seconds);
         if self.fraction().is_none()
+            || !measured_elapsed.is_finite()
+            || measured_elapsed < 2.0
             || !self.elapsed_seconds.is_finite()
-            || self.elapsed_seconds < 2.0
             || done <= 0.0
             || done >= total
         {
             return None;
         }
-        let rate = done / self.elapsed_seconds;
-        let eta = (total - done) / rate;
+        let rate = done / measured_elapsed;
+        let age = (self.elapsed_seconds - measured_elapsed).max(0.0);
+        let eta = ((total - done) / rate - age).max(0.0);
         (rate.is_finite() && rate > 0.0 && eta.is_finite()).then_some((rate, eta))
     }
 }
@@ -522,6 +548,8 @@ mod tests {
             total_units: Some(80.0),
             unit: "media seconds".into(),
             updated_at: 1,
+            measured_elapsed_seconds: None,
+            stage_portion: None,
         }
     }
 
@@ -557,6 +585,37 @@ mod tests {
             progress.total_units = Some(invalid);
             assert_eq!(progress.fraction(), None);
         }
+    }
+
+    #[test]
+    fn estimates_count_down_from_measurements_not_heartbeats_and_expire_without_completion() {
+        let mut progress = media_progress();
+        progress.measured_elapsed_seconds = Some(10.0);
+        progress.elapsed_seconds = 22.0;
+        assert_eq!(progress.rate_and_eta(), Some((2.0, 18.0)));
+        progress.updated_at += 1000;
+        assert_eq!(progress.rate_and_eta(), Some((2.0, 18.0)));
+        progress.elapsed_seconds = 45.0;
+        assert_eq!(progress.rate_and_eta(), Some((2.0, 0.0)));
+        assert_eq!(progress.fraction(), Some(0.25));
+        progress.completed_units = Some(40.0);
+        progress.measured_elapsed_seconds = Some(45.0);
+        assert_eq!(progress.rate_and_eta(), Some((40.0 / 45.0, 45.0)));
+        progress.total_units = None;
+        assert_eq!(progress.rate_and_eta(), None);
+    }
+
+    #[test]
+    fn legacy_progress_defaults_to_unallocated_measurements() {
+        let progress: MediaProgress = serde_json::from_str(
+            r#"{"workflow":"conversion","stage":2,"phase":"Encoding","elapsed_seconds":10,
+            "completed_units":20,"total_units":80,"unit":"media seconds","updated_at":1}"#,
+        )
+        .unwrap();
+        assert_eq!(progress.measured_elapsed_seconds, None);
+        assert_eq!(progress.stage_portion, None);
+        assert_eq!(progress.stage_fraction(), Some(0.25));
+        assert_eq!(progress.rate_and_eta(), Some((2.0, 30.0)));
     }
 
     #[test]

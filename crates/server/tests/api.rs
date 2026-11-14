@@ -256,6 +256,8 @@ async fn comparison_jobs_are_private_deduplicated_snapshot_bound_and_range_pinne
         total_units: Some(10.0),
         unit: "media seconds".into(),
         updated_at: wetube_backend::now(),
+        measured_elapsed_seconds: None,
+        stage_portion: None,
     };
     sqlx::query("UPDATE comparison_jobs SET progress=? WHERE id=?")
         .bind(serde_json::to_string(&progress).unwrap())
@@ -982,6 +984,8 @@ async fn conversion_publication_and_scan_selection_require_admin_csrf_and_bound_
         total_units: Some(80.0),
         unit: "media seconds".into(),
         updated_at: wetube_backend::now(),
+        measured_elapsed_seconds: None,
+        stage_portion: None,
     };
     sqlx::query("UPDATE conversion_jobs SET progress=? WHERE id=?")
         .bind(serde_json::to_string(&progress).unwrap())
