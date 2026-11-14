@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 7;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", content = "job", rename_all = "snake_case")]
@@ -300,6 +300,19 @@ pub struct ProbeJob {
 pub enum VideoTreatment {
     Preserve,
     Yadif,
+}
+
+pub const YADIF_FILTER: &str = "yadif=mode=send_frame:parity=auto:deint=all";
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ComparisonJob {
+    pub id: String,
+    pub probe_job_id: String,
+    pub state: JobState,
+    pub created_at: i64,
+    pub attempt_id: Option<String>,
+    pub report: Option<serde_json::Value>,
+    pub error: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

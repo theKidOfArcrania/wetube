@@ -8,11 +8,12 @@ use std::sync::{
 };
 use std::{cell::RefCell, rc::Rc};
 use wetube_core::{
-    ApiError, ArchiveImport, ConversionJob, ConversionRequest, ConversionState, DiagnosticJob,
-    DiagnosticReport, ImportEntry, ImportJob, ImportPage, IncomingFiles, InspectRequest, JobState,
-    Library, LoginRequest, MediaProgress, MediaProgressState, MediaWorkflow, Movie, MovieDetails,
-    PlaybackProgress, ProbeJob, ProbeState, PublishRequest, Role, ScanJob, ScanRequest, ScanState,
-    Session, SystemStatus, UpdatePlaybackProgress, VideoTreatment,
+    ApiError, ArchiveImport, ComparisonJob, ConversionJob, ConversionRequest, ConversionState,
+    DiagnosticJob, DiagnosticReport, ImportEntry, ImportJob, ImportPage, IncomingFiles,
+    InspectRequest, JobState, Library, LoginRequest, MediaProgress, MediaProgressState,
+    MediaWorkflow, Movie, MovieDetails, PlaybackProgress, ProbeJob, ProbeState, PublishRequest,
+    Role, ScanJob, ScanRequest, ScanState, Session, SystemStatus, UpdatePlaybackProgress,
+    VideoTreatment,
 };
 
 async fn decode<T: DeserializeOwned>(response: Response) -> Result<T, String> {
@@ -1704,6 +1705,116 @@ fn update_conversion(jobs: RwSignal<Vec<ConversionJob>>, job: ConversionJob) {
 }
 
 #[component]
+fn ComparisonPreview(probe_id: String, csrf: StoredValue<String>) -> impl IntoView {
+    let path = StoredValue::new(format!("/api/v1/admin/probes/{probe_id}/comparison"));
+    let job = RwSignal::new(None::<ComparisonJob>);
+    let loading = RwSignal::new(false);
+    let loaded = RwSignal::new(false);
+    let error = RwSignal::new(None::<String>);
+    let scope = admin_scope();
+    let refresh = move || {
+        if loading.get_untracked() {
+            return;
+        }
+        loading.set(true);
+        spawn_local(async move {
+            let result = admin_get::<Option<ComparisonJob>>(scope, &path.get_value()).await;
+            if loading.try_update(|loading| *loading = false).is_none() {
+                return;
+            }
+            match result {
+                Ok(current) => {
+                    job.set(current);
+                    loaded.set(true);
+                    error.set(None);
+                }
+                Err(message) => error.set(Some(message)),
+            }
+        });
+    };
+    refresh();
+    let timer = gloo_timers::callback::Interval::new(2000, move || {
+        if job
+            .get_untracked()
+            .is_some_and(|job| matches!(job.state, JobState::Queued | JobState::Running))
+        {
+            refresh();
+        }
+    });
+    let timer = StoredValue::new_local(Some(timer));
+    on_cleanup(move || {
+        let _ = timer.try_update_value(|timer| timer.take());
+    });
+    let submit = move |_| {
+        if loading.get_untracked() {
+            return;
+        }
+        loading.set(true);
+        error.set(None);
+        spawn_local(async move {
+            let result =
+                admin_post::<ComparisonJob>(scope, &path.get_value(), &csrf.get_value(), &()).await;
+            if loading.try_update(|loading| *loading = false).is_none() {
+                return;
+            }
+            match result {
+                Ok(current) => job.set(Some(current)),
+                Err(message) => {
+                    error.set(Some(message));
+                    refresh();
+                }
+            }
+        });
+    };
+    view! {
+        <section class="comparison-preview" data-testid="comparison-preview">
+            <h4>"Compare a midpoint sample"</h4>
+            <p class="subtle">"Generate the same approximately centered 10-second window for both treatments
+                (short titles use their shorter duration). Reuses the verified private staged ISO, without another NAS copy
+                or full-film encode. DVD timing is approximate; this is not motion detection.
+                H.264/AAC previews are not lossless and do not validate the full title/disc or authorize publication."</p>
+            <button type="button" on:click=submit disabled=move || !loaded.get() || loading.get()
+                || job.get().is_some_and(|job| job.state != JobState::Failed)>
+                "Generate Preserve vs Yadif preview"
+            </button>
+            <button type="button" on:click=move |_| refresh() disabled=move || loading.get()>
+                "Refresh comparison status"
+            </button>
+            {move || job.get().map(|job| {
+                let ready = job.state == JobState::Succeeded;
+                let timing = job.report.as_ref().map(|report| format!(
+                    "Requested approximate DVD window: {:.2}s from title start, {:.2}s long. Title/angle bound to this inspection.",
+                    report["requested_start_seconds"].as_f64().unwrap_or(0.0),
+                    report["requested_duration_seconds"].as_f64().unwrap_or(0.0)));
+                view! {
+                    <p role="status">{match job.state {
+                        JobState::Queued => "Comparison queued — waiting for worker.",
+                        JobState::Running => "Generating and decoding both comparison clips...",
+                        JobState::Succeeded => "Both comparison clips decoded and ready. No movie was registered.",
+                        JobState::Failed => "Comparison failed. Partial artifacts retained, unregistered.",
+                    }}</p>
+                    {job.error.map(|message| view! { <p role="alert" class="error">{message}</p> })}
+                    {timing.map(|text| view! { <p class="subtle">{text}</p> })}
+                    {ready.then(|| {
+                        let preserve = format!("/api/v1/admin/comparisons/{}/preserve/video",job.id);
+                        let yadif = format!("/api/v1/admin/comparisons/{}/yadif/video",job.id);
+                        view! {
+                            <div>
+                                <h5>"Preserve — no interlace filter (not lossless)"</h5>
+                                <video controls playsinline preload="metadata" aria-label="Preserve comparison" src=preserve style="width:100%;max-width:640px"/>
+                                <h5>"Yadif — mode=send_frame:parity=auto:deint=all"</h5>
+                                <video controls playsinline preload="metadata" aria-label="Yadif comparison" src=yadif style="width:100%;max-width:640px"/>
+                            </div>
+                        }
+                    })}
+                }
+            })}
+            {move || error.get().map(|message| view! { <p role="alert" class="error">{message}</p> })}
+        </section>
+    }
+}
+
+#[component]
 fn ProbeConversion(
     probe_id: String,
     csrf: StoredValue<String>,
@@ -1768,6 +1879,7 @@ fn ProbeConversion(
     };
     view! {
         <div class="conversion-controls">
+            <ComparisonPreview probe_id=probe_id.get_value() csrf=csrf/>
             <h4>"Review before conversion"</h4>
             <p class="notice">"Review the selected program, duration, field order and all warnings above.
                 Neither treatment is an approved production profile. Original tracks are retained,

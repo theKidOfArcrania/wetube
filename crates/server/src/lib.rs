@@ -21,7 +21,8 @@ use tower_http::services::ServeDir;
 use uuid::Uuid;
 use wetube_backend::preview::PreviewRoot;
 use wetube_backend::{
-    accounts, conversions, db, import_history, incoming::IncomingRoot, now, probe_jobs, scans,
+    accounts, comparisons, conversions, db, import_history, incoming::IncomingRoot, now,
+    probe_jobs, scans,
 };
 use wetube_core::{
     APP_VERSION, ApiError, ArchiveImport, ConversionJob, ConversionJobs, ConversionRequest,
@@ -48,6 +49,7 @@ struct AppState {
     incoming: Option<Arc<IncomingRoot>>,
     media: Option<Arc<PreviewRoot>>,
     conversion_enabled: bool,
+    scratch: Option<Arc<PreviewRoot>>,
 }
 
 pub async fn router(pool: SqlitePool, origin: &str, static_dir: &Path) -> anyhow::Result<Router> {
@@ -156,6 +158,7 @@ pub async fn router_with_conversions(
         incoming: incoming.map(Arc::new),
         conversion_enabled: scratch_dir.is_some() && media.is_some(),
         media: media.map(Arc::new),
+        scratch: scratch.map(Arc::new),
     };
 
     let api = Router::new()
@@ -176,6 +179,14 @@ pub async fn router_with_conversions(
         .route("/admin/imports", get(imports))
         .route("/admin/imports/{kind}/{id}/archive", post(archive_import))
         .route("/admin/probes", get(probes).post(queue_probe))
+        .route(
+            "/admin/probes/{id}/comparison",
+            get(comparison).post(queue_comparison),
+        )
+        .route(
+            "/admin/comparisons/{id}/{treatment}/video",
+            get(comparison_video).head(comparison_video),
+        )
         .route(
             "/admin/conversions",
             get(conversion_jobs).post(queue_conversion),
@@ -611,19 +622,28 @@ async fn video(
             "Movie media has changed; re-admission is required".into(),
         ));
     }
-    let range = match byte_range(&headers, movie.size) {
+    serve_video(file, movie.size, method, headers).await
+}
+
+async fn serve_video(
+    file: std::fs::File,
+    size: u64,
+    method: Method,
+    headers: HeaderMap,
+) -> Result<Response, HttpError> {
+    let range = match byte_range(&headers, size) {
         Ok(range) => range,
         Err(()) => {
             return Response::builder()
                 .status(StatusCode::RANGE_NOT_SATISFIABLE)
-                .header(header::CONTENT_RANGE, format!("bytes */{}", movie.size))
+                .header(header::CONTENT_RANGE, format!("bytes */{size}"))
                 .header(header::ACCEPT_RANGES, "bytes")
                 .header(header::CONTENT_LENGTH, "0")
                 .body(Body::empty())
                 .map_err(internal);
         }
     };
-    let (start, end) = range.unwrap_or((0, movie.size - 1));
+    let (start, end) = range.unwrap_or((0, size - 1));
     let length = end - start + 1;
     let mut response = Response::builder()
         .status(if range.is_some() {
@@ -635,10 +655,7 @@ async fn video(
         .header(header::ACCEPT_RANGES, "bytes")
         .header(header::CONTENT_LENGTH, length.to_string());
     if range.is_some() {
-        response = response.header(
-            header::CONTENT_RANGE,
-            format!("bytes {start}-{end}/{}", movie.size),
-        );
+        response = response.header(header::CONTENT_RANGE, format!("bytes {start}-{end}/{size}"));
     }
     let body = if method == Method::HEAD {
         Body::empty()
@@ -650,6 +667,101 @@ async fn video(
         Body::from_stream(ReaderStream::with_capacity(file.take(length), 64 * 1024))
     };
     response.body(body).map_err(internal)
+}
+
+async fn comparison(
+    State(state): State<AppState>,
+    RoutePath(id): RoutePath<String>,
+    headers: HeaderMap,
+) -> Result<Json<Option<wetube_core::ComparisonJob>>, HttpError> {
+    admin(&state, &headers).await?;
+    Ok(Json(
+        comparisons::latest(&state.pool, &id)
+            .await
+            .map_err(internal)?,
+    ))
+}
+
+async fn queue_comparison(
+    State(state): State<AppState>,
+    RoutePath(id): RoutePath<String>,
+    headers: HeaderMap,
+) -> Result<(StatusCode, Json<wetube_core::ComparisonJob>), HttpError> {
+    let current = admin(&state, &headers).await?;
+    check_csrf(&current, &headers)?;
+    if state.scratch.is_none() {
+        return Err(HttpError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Private scratch is not configured".into(),
+        ));
+    }
+    if Uuid::parse_str(&id).is_err() {
+        return Err(HttpError(
+            StatusCode::BAD_REQUEST,
+            "Invalid probe ID".into(),
+        ));
+    }
+    let job = comparisons::enqueue(&state.pool, &current.user.id, &id).await.map_err(internal)?
+        .ok_or_else(|| HttpError(StatusCode::CONFLICT,
+            "Comparison already exists, queue is full, or selected inspection is not ready. Refresh its comparison.".into()))?;
+    Ok((StatusCode::ACCEPTED, Json(job)))
+}
+
+async fn comparison_video(
+    State(state): State<AppState>,
+    RoutePath((id, treatment)): RoutePath<(String, String)>,
+    method: Method,
+    headers: HeaderMap,
+) -> Result<Response, HttpError> {
+    admin(&state, &headers).await?;
+    let unavailable = || {
+        HttpError(
+            StatusCode::NOT_FOUND,
+            "Comparison is unavailable or stale".into(),
+        )
+    };
+    if !matches!(treatment.as_str(), "preserve" | "yadif") {
+        return Err(unavailable());
+    }
+    let row = sqlx::query(
+        "SELECT c.* FROM comparison_jobs c JOIN probe_jobs p ON p.id=c.probe_job_id
+        WHERE c.id=? AND c.state='succeeded' AND p.state='needs_review'
+        AND c.probe_report=p.report AND c.title=p.title AND c.angle=p.angle",
+    )
+    .bind(id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(internal)?
+    .ok_or_else(unavailable)?;
+    let job = comparisons::from_row(&row).map_err(internal)?;
+    let report = job.report.as_ref().ok_or_else(unavailable)?;
+    if report["version"] != 1
+        || report["status"] != "succeeded"
+        || !report["preserve"]["filter"].is_null()
+        || report["yadif"]["filter"] != wetube_core::YADIF_FILTER
+    {
+        return Err(unavailable());
+    }
+    let clip = &report[&treatment];
+    let size = clip["size_bytes"]
+        .as_u64()
+        .filter(|n| *n > 0)
+        .ok_or_else(unavailable)?;
+    let root = state.scratch.as_ref().ok_or_else(unavailable)?;
+    let file = root
+        .open_comparison(
+            job.attempt_id.as_deref().ok_or_else(unavailable)?,
+            &treatment,
+        )
+        .map_err(|_| unavailable())?;
+    let metadata = file.metadata().map_err(internal)?;
+    if metadata.len() != size
+        || Some(wetube_backend::incoming::identity(&metadata).as_str())
+            != clip["file_identity"].as_str()
+    {
+        return Err(unavailable());
+    }
+    serve_video(file, size, method, headers).await
 }
 
 async fn status(

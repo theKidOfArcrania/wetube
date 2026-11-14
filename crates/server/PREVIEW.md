@@ -92,7 +92,7 @@ rounding; accepted positions are clamped to the movie duration before saving.
 Responses remain `no-store`. Existing ready catalogue seeds remain visible;
 only admitted previews have playable details/media.
 
-Supported older schemas upgrade to schema 6 with a consistent pre-upgrade SQLite
-snapshot. For schema 3 snapshots, retain the registered media unchanged and in
+Supported older schemas upgrade to the current schema with a consistent pre-upgrade SQLite
+snapshot. For snapshots referencing media, retain the registered assets unchanged and in
 place: this backup contains no media files. This is not the design's complete
 asset-aware backup/restore protocol.

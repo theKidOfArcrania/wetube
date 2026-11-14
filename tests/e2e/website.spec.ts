@@ -74,10 +74,11 @@ test.beforeAll(async ({}, testInfo) => {
     throw new Error('WETUBE_E2E_ARTIFACTS_DIR must resolve under /mnt/c/TempPrivate; Linux ISO staging is prohibited.');
   }
   retainState = testInfo.config.metadata.retainState === true;
-  command('cargo', ['build', '--locked', '--package', 'wetube-server', '--package', 'wetube-worker']);
-  command('rustup', ['run', 'stable', '/home/henry/.cargo/bin/trunk', 'build', '--release', '--locked'], undefined, join(repo, 'crates/web'));
   root = mkdtempSync(join(artifactsBase, 'wetube-browser-e2e-'));
   artifactsRoot = mkdtempSync(join(artifactsBase, 'wetube-media-e2e-'));
+  const staticDir = join(artifactsRoot, 'frontend');
+  command('cargo', ['build', '--locked', '--package', 'wetube-server', '--package', 'wetube-worker']);
+  command('rustup', ['run', 'stable', '/home/henry/.cargo/bin/trunk', 'build', '--release', '--locked', '--dist', staticDir], undefined, join(repo, 'crates/web'));
   if (retainState) {
     const credentials = join(root, 'login.txt');
     writeFileSync(credentials, `Username: e2e-admin\nPassword: ${password}\nViewer: e2e-viewer (same test password)\n`, {
@@ -117,7 +118,7 @@ test.beforeAll(async ({}, testInfo) => {
   mkdirSync(dvdSource, { mode: 0o700 });
   const longVob = join(dvdSource, 'long.vob');
   const shortVob = join(dvdSource, 'short.vob');
-  for (const [vob, seconds] of [[longVob, '6'], [shortVob, '3']]) {
+  for (const [vob, seconds] of [[longVob, '20'], [shortVob, '3']]) {
     command('ffmpeg', [
       '-hide_banner', '-nostdin', '-v', 'error',
       '-f', 'lavfi', '-i', 'testsrc2=size=720x480:rate=30000/1001',
@@ -162,7 +163,7 @@ test.beforeAll(async ({}, testInfo) => {
   server = spawn(binary, [
     '--state-dir', state, 'serve', '--bind', `127.0.0.1:${port}`,
     '--origin', baseURL,
-    '--static-dir', join(repo, 'dist'), '--media-dir', media, '--incoming-dir', incoming,
+    '--static-dir', staticDir, '--media-dir', media, '--incoming-dir', incoming,
     '--scratch-dir', scratch,
   ], { cwd: repo, stdio: ['ignore', 'pipe', 'pipe'] });
   server.stdout?.on('data', chunk => { serverLog = (serverLog + chunk).slice(-16_384); });
@@ -768,6 +769,9 @@ test('real DVD scan, selected inspection, conversion, publication and playback p
   const convert = probeCard.getByRole('button', { name: 'Convert reviewed title', exact: true });
   await expandImport(page, probe.id);
   await expect(convert).toBeVisible({ timeout: 30_000 });
+  const shortComparison = await compareInspectedProgram(page, probe.id);
+  expect(shortComparison.report.requested_start_seconds).toBe(0);
+  expect(shortComparison.report.requested_duration_seconds).toBeLessThan(4);
   await probeCard.getByRole('combobox', { name: 'Video treatment', exact: true }).selectOption('preserve');
   await probeCard.getByRole('checkbox', { name: /I reviewed this inspection and warnings/ }).check();
   await page.waitForResponse(response => response.url().includes('/api/v1/admin/imports?')
@@ -832,4 +836,107 @@ test('real DVD scan, selected inspection, conversion, publication and playback p
   expect(retained.identity).toBe(original.identity);
   const media = join(artifactsRoot!, 'media');
   expect(readdirSync(media).some(packageName => existsSync(join(media, packageName, 'original-tracks.mkv')))).toBe(true);
+});
+
+async function compareInspectedProgram(page: Page, probeId: string) {
+  const card = page.locator(`[data-testid="probe-job"][data-job-id="${probeId}"]`);
+  const comparison = card.getByTestId('comparison-preview');
+  await expect(comparison).toContainText('not lossless');
+  await expect(comparison).toContainText('not motion detection');
+  const mediaResponses: string[] = [];
+  const listener = response => {
+    if (response.url().includes('/admin/comparisons/') && response.request().resourceType() === 'media'
+      && response.status() === 206) mediaResponses.push(response.url());
+  };
+  page.on('response', listener);
+  try {
+    const queued = page.waitForResponse(response => response.url().endsWith(`/admin/probes/${probeId}/comparison`)
+      && response.request().method() === 'POST');
+    await comparison.getByRole('button', { name: 'Generate Preserve vs Yadif preview', exact: true }).click();
+    expect((await queued).status()).toBe(202);
+    const session = await (await page.request.get(`${baseURL}/api/v1/auth/me`)).json();
+    const path = `${baseURL}/api/v1/admin/probes/${probeId}/comparison`;
+    const duplicate = await page.request.post(path, {
+      headers: { Origin: baseURL, 'x-csrf-token': session.csrf_token },
+    });
+    expect(duplicate.status()).toBe(409);
+    await expect.poll(async () => {
+      const current = await (await page.request.get(path)).json();
+      if (current?.state === 'failed') throw new Error(`Comparison failed: ${current.error}`);
+      return current?.state;
+    }, { timeout: 45_000 }).toBe('succeeded');
+    const current = await (await page.request.get(path)).json();
+    expect(current.report.preserve.decoded_frames).toBe(current.report.yadif.decoded_frames);
+    expect(current.report.yadif.filter).toBe('yadif=mode=send_frame:parity=auto:deint=all');
+    expect(current.report.preserve.filter).toBeNull();
+    await expect(comparison.locator('video')).toHaveCount(2);
+    for (const treatment of ['preserve', 'yadif']) {
+      const url = `${baseURL}/api/v1/admin/comparisons/${current.id}/${treatment}/video`;
+      const range = await page.request.get(url, { headers: { Range: 'bytes=0-31' } });
+      expect(range.status()).toBe(206);
+      expect((await range.body()).length).toBe(32);
+      const video = comparison.locator(`video[aria-label="${treatment === 'preserve' ? 'Preserve' : 'Yadif'} comparison"]`);
+      await expect.poll(() => video.evaluate((element: HTMLVideoElement) => element.readyState)).toBeGreaterThanOrEqual(1);
+      expect(await video.evaluate((element: HTMLVideoElement) => element.duration)).toBeGreaterThan(1);
+      await video.evaluate(async (element: HTMLVideoElement) => { element.muted = true; await element.play(); });
+      await expect.poll(() => video.evaluate((element: HTMLVideoElement) => element.currentTime)).toBeGreaterThan(0.25);
+      await video.evaluate((element: HTMLVideoElement) => element.pause());
+      await expect.poll(() => mediaResponses.some(url => url.includes(`/${current.id}/${treatment}/video`))).toBe(true);
+    }
+    return current;
+  } finally {
+    page.off('response', listener);
+  }
+}
+
+test('administrator midpoint Preserve vs Yadif clips share a native-seeked window without publishing', async ({ page, browser }) => {
+  test.setTimeout(90_000);
+  await login(page, 'e2e-admin');
+  const session = await (await page.request.get(`${baseURL}/api/v1/auth/me`)).json();
+  const headers = { Origin: baseURL, 'x-csrf-token': session.csrf_token };
+  const before = await (await page.request.get(`${baseURL}/api/v1/movies`)).json();
+  const { jobs: scans } = await (await page.request.get(`${baseURL}/api/v1/admin/scans`)).json();
+  // Reuse the verified fixture scan when running the suite; remain independently selectable.
+  let scan = scans.find(job => job.name === 'browser-valid.iso' && job.state === 'needs_review');
+  if (!scan) {
+    const incoming = await (await page.request.get(`${baseURL}/api/v1/admin/incoming`)).json();
+    const file = incoming.files.find(file => file.name === 'browser-valid.iso');
+    const queued = await page.request.post(`${baseURL}/api/v1/admin/scans`, {
+      headers, data: { name: file.name, identity: file.identity, copy_complete: true },
+    });
+    expect(queued.status()).toBe(202);
+    const pending = await queued.json();
+    await expect.poll(async () => {
+      const { jobs } = await (await page.request.get(`${baseURL}/api/v1/admin/scans`)).json();
+      scan = jobs.find(job => job.id === pending.id);
+      return scan?.state;
+    }, { timeout: 30_000 }).toBe('needs_review');
+  }
+  const inspected = await page.request.post(`${baseURL}/api/v1/admin/scans/${scan.id}/inspect`, {
+    headers, data: { title: 1, angle: 1 },
+  });
+  expect(inspected.status()).toBe(202);
+  const probe = await inspected.json();
+  expect(probe.attempt_id).toBe(scan.attempt_id);
+  await expandImport(page, probe.id);
+  const comparison = await compareInspectedProgram(page, probe.id);
+  expect(comparison.report.requested_start_seconds).toBeGreaterThan(4);
+  expect(comparison.report.requested_duration_seconds).toBe(10);
+  expect(comparison.report.seek.native_dvd_seek).toContain('seeking: requested_nav_pts=');
+  expect(comparison.report.full_disc_validated).toBe(false);
+  expect(existsSync(join(artifactsRoot!, 'scratch', comparison.attempt_id, 'input.iso'))).toBe(false);
+  const viewer = await browser.newContext();
+  try {
+    const viewerPage = await viewer.newPage();
+    await login(viewerPage, 'e2e-viewer');
+    for (const treatment of ['preserve', 'yadif']) {
+      const response = await viewerPage.request.get(`${baseURL}/api/v1/admin/comparisons/${comparison.id}/${treatment}/video`);
+      expect(response.status()).toBe(403);
+    }
+    await expect(viewerPage.getByTestId('comparison-preview')).toHaveCount(0);
+  } finally {
+    await viewer.close();
+  }
+  const { movies } = await (await page.request.get(`${baseURL}/api/v1/movies`)).json();
+  expect(movies).toHaveLength(before.movies.length);
 });

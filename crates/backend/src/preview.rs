@@ -60,10 +60,23 @@ impl PreviewRoot {
     }
 
     pub fn open_movie(&self, package: &str) -> Result<File> {
+        self.open_clip(package, "movie.mp4")
+    }
+
+    pub fn open_comparison(&self, package: &str, treatment: &str) -> Result<File> {
+        let name = match treatment {
+            "preserve" => "preserve.mp4",
+            "yadif" => "yadif.mp4",
+            _ => anyhow::bail!("invalid comparison treatment"),
+        };
+        self.open_clip(package, name)
+    }
+
+    fn open_clip(&self, package: &str, name: &str) -> Result<File> {
         let id = uuid::Uuid::parse_str(package)?;
         ensure!(id.to_string() == package, "invalid preview package ID");
         let directory = open_at(&self.directory, package, true)?;
-        let file = open_at(&directory, "movie.mp4", false)?;
+        let file = open_at(&directory, name, false)?;
         ensure!(
             file.metadata()?.is_file() && file.metadata()?.len() > 0,
             "invalid preview movie"

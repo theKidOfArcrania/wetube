@@ -6,6 +6,7 @@ use wetube_backend::now;
 use wetube_core::{DiagnosticReport, ToolCheck};
 
 pub mod admission;
+pub mod comparisons;
 pub mod conversions;
 pub mod dvdnav;
 pub mod experimental;

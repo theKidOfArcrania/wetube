@@ -16,6 +16,234 @@ const ORIGIN: &str = "http://wetube.test";
 const PASSWORD: &str = "a household test password";
 
 #[tokio::test]
+async fn comparison_jobs_are_private_deduplicated_snapshot_bound_and_range_pinned() {
+    use serde_json::json;
+    use wetube_core::{ComparisonJob, JobState};
+    let mut fixture = Fixture::new().await;
+    let scratch = tempfile::tempdir().unwrap();
+    fixture.app = wetube_server::router_with_conversions(
+        fixture.pool.clone(),
+        ORIGIN,
+        fixture._directory.path(),
+        None,
+        None,
+        Some(scratch.path()),
+    )
+    .await
+    .unwrap();
+    let (admin, session) = fixture.login("admin").await;
+    let (viewer, viewer_session) = fixture.login("viewer").await;
+    let probe = uuid::Uuid::new_v4().to_string();
+    sqlx::query("INSERT INTO probe_jobs(id,requested_by,name,source_identity,title,angle,state,created_at,attempt_id,report)
+        VALUES (?,?,'retained.iso','identity',1,1,'failed',1,?,'{}')")
+        .bind(&probe).bind(&session.user.id).bind(uuid::Uuid::new_v4().to_string())
+        .execute(&fixture.pool).await.unwrap();
+    let path = format!("/api/v1/admin/probes/{probe}/comparison");
+    for (cookie, csrf, expected) in [
+        (None, None, StatusCode::UNAUTHORIZED),
+        (
+            Some(viewer.as_str()),
+            Some(viewer_session.csrf_token.as_str()),
+            StatusCode::FORBIDDEN,
+        ),
+        (Some(admin.as_str()), None, StatusCode::FORBIDDEN),
+    ] {
+        assert_eq!(
+            fixture.send("POST", &path, "", cookie, csrf).await.status(),
+            expected
+        );
+    }
+    for cookie in [None, Some(viewer.as_str())] {
+        let expected = if cookie.is_some() {
+            StatusCode::FORBIDDEN
+        } else {
+            StatusCode::UNAUTHORIZED
+        };
+        assert_eq!(
+            fixture.send("GET", &path, "", cookie, None).await.status(),
+            expected
+        );
+    }
+    let wrong_origin = Request::builder()
+        .method("POST")
+        .uri(&path)
+        .header(header::HOST, "wetube.test")
+        .header(header::ORIGIN, "http://evil.test")
+        .header(header::COOKIE, &admin)
+        .header("x-csrf-token", &session.csrf_token)
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        fixture
+            .app
+            .clone()
+            .oneshot(wrong_origin)
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        fixture
+            .send("POST", &path, "", Some(&admin), Some(&session.csrf_token))
+            .await
+            .status(),
+        StatusCode::CONFLICT
+    );
+    sqlx::query("UPDATE probe_jobs SET state='needs_review' WHERE id=?")
+        .bind(&probe)
+        .execute(&fixture.pool)
+        .await
+        .unwrap();
+    let response = fixture
+        .send("POST", &path, "", Some(&admin), Some(&session.csrf_token))
+        .await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let job: ComparisonJob =
+        serde_json::from_slice(&to_bytes(response.into_body(), 32768).await.unwrap()).unwrap();
+    assert_eq!(job.state, JobState::Queued);
+    assert_eq!(
+        fixture
+            .send("POST", &path, "", Some(&admin), Some(&session.csrf_token))
+            .await
+            .status(),
+        StatusCode::CONFLICT
+    );
+    let video = format!("/api/v1/admin/comparisons/{}/preserve/video", job.id);
+    assert_eq!(
+        fixture
+            .send("GET", &video, "", Some(&admin), None)
+            .await
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    // Inject terminal metadata only to isolate the HTTP/file boundary. Actual media is
+    // generated and independently decoded by the worker's authored-DVD test.
+    let attempt = uuid::Uuid::new_v4().to_string();
+    let directory = scratch.path().join(&attempt);
+    std::fs::create_dir(&directory).unwrap();
+    let bytes = b"private pinned comparison bytes";
+    let mut report = json!({"version":1,"status":"succeeded","preserve":{"filter":null},
+        "yadif":{"filter":wetube_core::YADIF_FILTER}});
+    for treatment in ["preserve", "yadif"] {
+        let clip = directory.join(format!("{treatment}.mp4"));
+        std::fs::write(&clip, bytes).unwrap();
+        let metadata = std::fs::metadata(clip).unwrap();
+        report[treatment]["file_identity"] = json!(wetube_backend::incoming::identity(&metadata));
+        report[treatment]["size_bytes"] = json!(bytes.len());
+    }
+    sqlx::query("UPDATE comparison_jobs SET state='succeeded',attempt_id=?,report=? WHERE id=?")
+        .bind(&attempt)
+        .bind(report.to_string())
+        .bind(&job.id)
+        .execute(&fixture.pool)
+        .await
+        .unwrap();
+    for treatment in ["preserve", "yadif"] {
+        let video = format!("/api/v1/admin/comparisons/{}/{treatment}/video", job.id);
+        for (cookie, expected) in [
+            (None, StatusCode::UNAUTHORIZED),
+            (Some(viewer.as_str()), StatusCode::FORBIDDEN),
+        ] {
+            assert_eq!(
+                fixture.send("GET", &video, "", cookie, None).await.status(),
+                expected
+            );
+        }
+        for method in ["GET", "HEAD"] {
+            let request = Request::builder()
+                .method(method)
+                .uri(&video)
+                .header(header::HOST, "wetube.test")
+                .header(header::COOKIE, &admin)
+                .header(header::RANGE, "bytes=2-6")
+                .body(Body::empty())
+                .unwrap();
+            let response = fixture.app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+            assert_eq!(response.headers()[header::CONTENT_LENGTH], "5");
+            let payload = to_bytes(response.into_body(), 1024).await.unwrap();
+            assert_eq!(
+                &payload[..],
+                if method == "HEAD" { b"" } else { &bytes[2..7] }
+            );
+        }
+        let request = Request::builder()
+            .uri(&video)
+            .header(header::HOST, "wetube.test")
+            .header(header::COOKIE, &admin)
+            .header(header::RANGE, "bytes=9999-")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            fixture.app.clone().oneshot(request).await.unwrap().status(),
+            StatusCode::RANGE_NOT_SATISFIABLE
+        );
+    }
+    sqlx::query("UPDATE probe_jobs SET title=2 WHERE id=?")
+        .bind(&probe)
+        .execute(&fixture.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        fixture
+            .send("GET", &video, "", Some(&admin), None)
+            .await
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    let response = fixture.send("GET", &path, "", Some(&admin), None).await;
+    assert_eq!(
+        &to_bytes(response.into_body(), 1024).await.unwrap()[..],
+        b"null"
+    );
+    sqlx::query("UPDATE probe_jobs SET title=1,report='{\"changed\":true}' WHERE id=?")
+        .bind(&probe)
+        .execute(&fixture.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        fixture
+            .send("GET", &video, "", Some(&admin), None)
+            .await
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    sqlx::query("UPDATE probe_jobs SET report='{}' WHERE id=?")
+        .bind(&probe)
+        .execute(&fixture.pool)
+        .await
+        .unwrap();
+    let clip = directory.join("preserve.mp4");
+    let saved = directory.join("saved.mp4");
+    std::fs::rename(&clip, &saved).unwrap();
+    std::os::unix::fs::symlink(&saved, &clip).unwrap();
+    assert_eq!(
+        fixture
+            .send("GET", &video, "", Some(&admin), None)
+            .await
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    std::fs::remove_file(&clip).unwrap();
+    std::fs::write(&clip, bytes).unwrap();
+    assert_eq!(
+        fixture
+            .send("GET", &video, "", Some(&admin), None)
+            .await
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM movies")
+            .fetch_one(&fixture.pool)
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
 async fn personal_import_history_validates_lifecycle_permissions_pagination_and_persistence() {
     use wetube_core::{ImportJob, ImportPage};
     let fixture = Fixture::new().await;

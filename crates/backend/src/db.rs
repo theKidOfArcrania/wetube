@@ -46,7 +46,7 @@ pub async fn initialize(state_dir: &Path) -> Result<()> {
             // This additive migration does not modify registered media. Snapshot
             // SQLite first; operators must retain the separate media/attempt roots.
             anyhow::ensure!(
-                matches!(version.0, 1..=5),
+                matches!(version.0, 1..=6),
                 "unsupported upgrade; requires a complete asset-aware backup"
             );
             let backup = state_dir.join(format!("pre-upgrade-{}", uuid::Uuid::new_v4()));
@@ -93,6 +93,83 @@ pub async fn check_version(pool: &SqlitePool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn comparison_upgrade_retains_schema_six_reviews_and_personal_history() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let migrations = tempfile::tempdir()?;
+        for (name, sql) in [
+            (
+                "0001_foundation.sql",
+                include_str!("../migrations/0001_foundation.sql"),
+            ),
+            (
+                "0002_probe_jobs.sql",
+                include_str!("../migrations/0002_probe_jobs.sql"),
+            ),
+            (
+                "0003_local_preview.sql",
+                include_str!("../migrations/0003_local_preview.sql"),
+            ),
+            (
+                "0004_conversions.sql",
+                include_str!("../migrations/0004_conversions.sql"),
+            ),
+            (
+                "0005_media_progress.sql",
+                include_str!("../migrations/0005_media_progress.sql"),
+            ),
+            (
+                "0006_import_history.sql",
+                include_str!("../migrations/0006_import_history.sql"),
+            ),
+        ] {
+            std::fs::write(migrations.path().join(name), sql)?;
+        }
+        let pool = open(directory.path(), true).await?;
+        sqlx::migrate::Migrator::new(migrations.path())
+            .await?
+            .run(&pool)
+            .await?;
+        sqlx::query("INSERT INTO users VALUES ('admin','admin','hash','admin')")
+            .execute(&pool)
+            .await?;
+        sqlx::query("INSERT INTO scan_jobs(id,requested_by,name,source_identity,state,created_at,attempt_id,report)
+            VALUES ('scan','admin','count.iso','bound','needs_review',1,'retained-scan','{\"titles\":[]}')").execute(&pool).await?;
+        sqlx::query("INSERT INTO probe_jobs(id,requested_by,name,source_identity,title,angle,state,created_at,scan_job_id,attempt_id,report)
+            VALUES ('probe','admin','count.iso','bound',1,1,'needs_review',1,'scan','retained-scan','{\"sha256\":\"retained\"}')").execute(&pool).await?;
+        sqlx::query(
+            "INSERT INTO import_preferences(user_id,kind,job_id,archived)
+            VALUES ('admin','scan','scan',1)",
+        )
+        .execute(&pool)
+        .await?;
+        pool.close().await;
+        initialize(directory.path()).await?;
+        initialize(directory.path()).await?;
+        let pool = connect(directory.path()).await?;
+        let probe = crate::probe_jobs::list(&pool).await?.remove(0);
+        assert_eq!(probe.state, wetube_core::ProbeState::NeedsReview);
+        assert_eq!(probe.attempt_id.as_deref(), Some("retained-scan"));
+        assert_eq!(probe.report, Some(serde_json::json!({"sha256":"retained"})));
+        assert_eq!(crate::scans::list(&pool).await?.len(), 1);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT archived FROM import_preferences WHERE user_id='admin'"
+            )
+            .fetch_one(&pool)
+            .await?,
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM comparison_jobs")
+                .fetch_one(&pool)
+                .await?,
+            0
+        );
+        pool.close().await;
+        Ok(())
+    }
 
     #[tokio::test]
     async fn history_upgrade_preserves_schema_five_jobs_and_snapshots_once() -> Result<()> {

@@ -538,7 +538,7 @@ async fn media_pipeline(
         "+faststart",
     ]);
     if matches!(options.video_treatment, VideoTreatment::Yadif) {
-        encode.args(["-vf", "yadif=mode=send_frame:parity=auto:deint=all"]);
+        encode.args(["-vf", wetube_core::YADIF_FILTER]);
     }
     encode.args(["-f", "mp4", &descriptor(&movie)]);
     if let Some(tracks) = &tracks {

@@ -90,6 +90,31 @@ publication, and playback. Full-length real-disc validation, Docker integration,
 and deployment acceptance remain separate gates; a failed retained attempt is
 not publication evidence.
 
+Schema 7 additionally provides private administrator treatment comparisons on a
+reviewed probe, without changing its state or conversion/publication eligibility.
+The existing serialized worker rehashes and pins the same staged input, extracts
+one approximately centered window of up to ten seconds, then sequentially encodes
+Preserve (no interlace filter) and the exact full-pipeline Yadif filter. A bounded,
+retained FFV1/PCM intermediate makes both source windows identical; audio timestamps
+are normalized once there. Output clips are lossy H.264/AAC, not full-disc
+validation or evidence of motion/interlacing detection. DVD timing and clip-edge
+filter context remain approximate. Input-side native DVD seeking must produce
+FFmpeg's successful NAV seek trace; no silent decode-from-start fallback is allowed.
+Version-dependent seek incompatibility is a retained failure, not a reason to
+relax integrity checks.
+
+Comparison jobs bind the exact inspection report/title/angle. Active duplicates,
+duplicate unchanged successful results, and queues over four active jobs are
+rejected. They run before the next full conversion, without preemption or another
+heavy worker. Hard per-file limits (256 MiB sample; at most 32 MiB per clip),
+scratch capacity checks, bounded capture/logs, pinned descriptors, per-tool
+deadlines of at most 180 seconds, full clip decodes, hashes and ready fingerprints
+bound this optional work. UUID attempt directories and fixed clip names remain
+under private scratch, never static media. Playback requires administrator
+authentication, an unchanged inspection and validated file identity through a
+pinned no-symlink root, including byte ranges. Failures/restarts retain partial
+artifacts unregistered and never advance readiness or touch originals.
+
 On this development host, incoming files are in /mnt/share/staging. ISO staging
 is exclusively in /mnt/c/TempPrivate/website-staging; new prepared media belongs
 in /mnt/c/TempPrivate/website-media. Do not use /tmp or another Linux directory

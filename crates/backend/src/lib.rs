@@ -1,4 +1,5 @@
 pub mod accounts;
+pub mod comparisons;
 pub mod conversions;
 pub mod db;
 pub mod import_history;

@@ -15,6 +15,8 @@ This is a runnable local website preview, not a production TrueNAS deployment:
 - DVD program discovery with duration/track information and title/angle dropdowns.
 - Administrator-selected incoming copies, checksum-verified private staging,
   inspection, explicit conversion, and separate reviewed local-library publication.
+- Administrator-only, approximately centered 10-second Preserve/Yadif comparisons
+  from the same inspected staged ISO, before committing to a full conversion.
 - Preserved original audio/image-subtitle sidecars and retained failed attempts.
 - Live, persisted media-phase progress with labeled stage-based workflow bars.
 - Compact latest media readiness, expandable checks, and per-admin import
@@ -53,6 +55,41 @@ Media tools are optional for starting the website. Scanning/conversion require
 mandatory `lsdvd` subprocess. Tesseract with `eng` trained data is optional and
 does not determine conversion readiness; caption OCR itself is not implemented.
 Installed tools alone do not prove that a particular ISO can be imported.
+
+### Short treatment comparisons
+
+After inspecting a title/angle, expand its review and choose **Generate Preserve
+vs Yadif preview**. Both H.264/AAC clips use one retained FFV1/PCM source sample:
+Preserve applies no interlace filter; Yadif uses exactly
+`yadif=mode=send_frame:parity=auto:deint=all`, as in full conversion. These
+are not lossless previews, motion detection, or full-disc validation. Short
+titles use their shorter duration. DVD timecodes are approximate; no expensive
+full-disc preindex is performed. Audio timing is normalized once in the shared
+sample; clip-edge filter context can differ from a full-film conversion.
+
+The worker rehashes the existing staged ISO read-only; it does not recopy the NAS
+input, modify originals, publish/register anything, or promote conversion readiness.
+An input-side DVD native timestamp seek must be confirmed by FFmpeg's successful
+NAV seek trace; an unsupported/failed seek fails closed rather than silently
+decoding from the film's beginning. Logs and requested-window/source/result
+metadata are retained in a fresh private scratch attempt. Both clips are fully
+decoded and fingerprinted before administrator-only, authenticated range playback.
+
+Comparisons share the existing single serialized worker, with sequential treatment
+encodes. They are considered before the next queued full conversion, never
+preempting work already running. There is at most one active comparison per probe,
+four queued/running comparisons globally, and no duplicate successful comparison
+for an unchanged inspection. Each media invocation has a 180-second ceiling
+(or the configured smaller tool timeout); the shared sample has a hard 256 MiB
+cap and each clip a 32 MiB cap (or the configured smaller output limit).
+Scratch quota/free-space checks also apply. Failed/interrupted files stay
+unregistered for operator review; restart marks running comparisons failed.
+Clips are never placed in the public static directory or library.
+
+Schema 7 adds comparison jobs. Stop both services before the normal `init`
+migration; it takes a SQLite-only snapshot and retains all schema-6 jobs,
+review selections, preferences, staged files, and media in place. Retain the
+separate scratch/media roots; the snapshot is not an asset backup.
 
 ## Initialize and run
 
@@ -454,8 +491,9 @@ WETUBE_E2E_ARTIFACTS_DIR=/mnt/c/TempPrivate npm test
 
 This development harness requires an explicit, existing artifacts directory
 under /mnt/c/TempPrivate and checks its resolved location before building or
-generating media. It never falls back to Linux ISO staging. Only the small test
-database uses Linux temporary storage.
+generating media. It never falls back to Linux ISO staging. Per-run state,
+media, staged inputs, and frontend build output use that C-drive root. Tests
+serve their isolated frontend build rather than overwriting the live `dist/`.
 
 The real-DVD fixture requires `dvdauthor` and `genisoimage`, in addition to the
 existing FFmpeg and browser prerequisites. These authoring tools are test-only;
@@ -470,6 +508,7 @@ directories, and cleanup. The ordinary run removes its own temporary state.
 prints its location and a private credentials-file path, without printing the
 password. Its test server and worker still stop at the end; use the retained
 paths with `serve` and `wetube-worker run` to leave a local website running.
+For its frontend, pass `--static-dir RETAINED_MEDIA_DIRECTORY/frontend`.
 Traces may contain
 ephemeral test credentials and are ignored by Git.
 

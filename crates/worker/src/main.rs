@@ -170,6 +170,7 @@ async fn run(cli: Cli) -> Result<()> {
             wetube_worker::imports::recover(&pool).await?;
             wetube_worker::conversions::recover(&pool).await?;
             wetube_worker::scans::recover(&pool).await?;
+            wetube_worker::comparisons::recover(&pool).await?;
             let mut interval = tokio::time::interval(Duration::from_secs(2));
             let shutdown = shutdown();
             tokio::pin!(shutdown);
@@ -184,7 +185,10 @@ async fn run(cli: Cli) -> Result<()> {
                     if let Some(config) = &imports {
                         wetube_worker::scans::tick(&pool, config.clone()).await?;
                         wetube_worker::imports::tick(&pool, config.clone()).await?;
-                        if let Some(media) = &media {
+                        let compared =
+                            wetube_worker::comparisons::tick(&pool, config.clone(), &limits)
+                                .await?;
+                        if !compared && let Some(media) = &media {
                             wetube_worker::conversions::tick(&pool, config.clone(), media, &limits)
                                 .await?;
                         }
