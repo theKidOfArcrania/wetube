@@ -492,6 +492,8 @@ test('scanned title and angle choices gate conversion and explicit publication t
 
 for (const clockSkew of [0, -5_000, 2 * 86_400_000]) {
   test(`TMDB metadata lookup requires explicit selection and editable digest-bound publication (browser clock ${clockSkew}ms)`, async ({ page }) => {
+    const pageErrors: string[] = [];
+    page.on('pageerror', error => pageErrors.push(error.message));
     await page.addInitScript(({ offset }) => {
       const now = Date.now.bind(Date);
       Date.now = () => now() + offset;
@@ -507,6 +509,8 @@ for (const clockSkew of [0, -5_000, 2 * 86_400_000]) {
     };
     let published = false;
     let searches = 0;
+    let releasePublication!: () => void;
+    const publicationGate = new Promise<void>(resolve => { releasePublication = resolve; });
     await page.route('**/api/v1/admin/imports?*', route => {
       const history = new URL(route.request().url()).searchParams.get('history') === 'true';
       const entries = history ? [] : [{ item: { kind: 'conversion', job: conversion }, can_archive: false, history: false }];
@@ -523,6 +527,12 @@ for (const clockSkew of [0, -5_000, 2 * 86_400_000]) {
         return route.fulfill({ status: 502, json: { error: 'TMDB is unavailable. Try again later or enter metadata manually.' } });
       }
       if (request.query === 'none') return route.fulfill({ json: { movies: [] } });
+      if (request.query === 'Fresh search') {
+        expect(request.year).toBe(2002);
+        return route.fulfill({ json: { movies: [
+          { id: 3, title: 'Another movie', year: 2003, description: 'Another synopsis', fetched_at: fetchedAt },
+        ] } });
+      }
       expect(request).toEqual({ query: 'Monte Cristo', year: 2002 });
       await new Promise(resolve => setTimeout(resolve, 300));
       return route.fulfill({ json: { movies: [
@@ -530,13 +540,14 @@ for (const clockSkew of [0, -5_000, 2 * 86_400_000]) {
         { id: 2, title: 'The Count of Monte Cristo', year: 2002, description: 'Selected synopsis', fetched_at: fetchedAt },
       ] } });
     });
-    await page.route(`**/api/v1/admin/conversions/${id}/publish`, route => {
+    await page.route(`**/api/v1/admin/conversions/${id}/publish`, async route => {
       expect(route.request().postDataJSON()).toEqual({
-        title: 'My reviewed title', year: 2002, description: 'Edited synopsis',
-        movie_sha256: digest, confirm: true, tmdb: { id: 2, fetched_at: fetchedAt },
+        title: 'My reviewed title', year: 2003, description: 'Edited synopsis',
+        movie_sha256: digest, confirm: true, tmdb: { id: 3, fetched_at: fetchedAt },
       });
       expect(route.request().headers()['x-csrf-token']).toBeTruthy();
       published = true;
+      await publicationGate;
       return route.fulfill({ status: 202, json: { ...conversion, state: 'queued_publication' } });
     });
     await login(page, 'e2e-admin');
@@ -549,6 +560,11 @@ for (const clockSkew of [0, -5_000, 2 * 86_400_000]) {
     const searchButton = card.getByRole('button', { name: 'Search TMDB', exact: true });
     const confirmation = card.getByRole('checkbox', { name: /I reviewed the validated conversion/ });
     const publish = card.getByRole('button', { name: 'Publish to local library', exact: true });
+    const matches = card.getByRole('button', { name: 'Use this match', exact: true });
+    const selected = card.getByRole('region', { name: 'Selected TMDB match', exact: true });
+    const changeMatch = card.getByRole('button', { name: 'Change match', exact: true });
+    const yearField = card.getByRole('spinbutton', { name: 'Year (optional)', exact: true });
+    await expect(card.locator('form form')).toHaveCount(0);
     await titleField.fill('Manual fallback');
     await confirmation.check();
     await search.fill('offline');
@@ -563,17 +579,64 @@ for (const clockSkew of [0, -5_000, 2 * 86_400_000]) {
     await searchYear.fill('2002');
     await searchButton.click();
     await titleField.fill('Edited while searching');
-    await expect(card.getByRole('button', { name: 'Use this match', exact: true })).toHaveCount(2);
+    await expect(matches).toHaveCount(2);
+    await expect(matches.first()).toHaveAttribute('type', 'button');
     await expect(titleField).toHaveValue('Edited while searching');
     expect(published).toBe(false);
-    await card.getByRole('button', { name: 'Use this match', exact: true }).nth(1).click();
+    await matches.nth(1).click();
     await expect(titleField).toHaveValue('The Count of Monte Cristo');
+    await expect(yearField).toHaveValue('2002');
+    await expect(description).toHaveValue('Selected synopsis');
+    await expect(matches).toHaveCount(0);
+    await expect(selected).toContainText('The Count of Monte Cristo (2002)');
+    await expect(selected).toContainText('Source: TMDB');
+    await expect(card.getByText('The Count of Monte Cristo (1934)', { exact: true })).toHaveCount(0);
+    await expect(changeMatch).toHaveAttribute('type', 'button');
     await expect(confirmation).not.toBeChecked();
     await expect(publish).toBeDisabled();
+    await titleField.fill('Keep this edit');
+    await confirmation.check();
+    const details = page.locator(`[data-testid="attention-row"][data-job-id="${id}"] > details.import-details`);
+    await details.locator(':scope > summary').click();
+    await expect(selected).not.toBeVisible();
+    await expandImport(page, id);
+    await expect(selected).toBeVisible();
+    await expect(matches).toHaveCount(0);
+    await page.waitForResponse(response => response.url().includes('/api/v1/admin/imports?') && response.request().method() === 'GET');
+    await expect(matches).toHaveCount(0);
+    await expect(selected).toContainText('The Count of Monte Cristo (2002)');
+    await changeMatch.click();
+    await expect(matches).toHaveCount(2);
+    await expect(titleField).toHaveValue('Keep this edit');
+    await expect(confirmation).toBeChecked();
+    expect(searches).toBe(3);
+    await matches.first().click();
+    await expect(yearField).toHaveValue('1934');
+    await expect(description).toHaveValue('First adaptation');
+    await expect(confirmation).not.toBeChecked();
+    await expect(selected).toContainText('The Count of Monte Cristo (1934)');
+    await expect(matches).toHaveCount(0);
     await card.getByRole('button', { name: 'Clear TMDB selection for manual entry' }).click();
     await expect(titleField).toHaveValue('');
     await expect(description).toHaveValue('');
-    await card.getByRole('button', { name: 'Use this match', exact: true }).nth(1).click();
+    await expect(yearField).toHaveValue('');
+    await expect(selected).toHaveCount(0);
+    await matches.nth(1).click();
+    await titleField.fill('Keep while searching');
+    await confirmation.check();
+    await search.fill('Fresh search');
+    await searchButton.click();
+    await expect(matches).toHaveCount(1);
+    await expect(titleField).toHaveValue('Keep while searching');
+    await expect(confirmation).toBeChecked();
+    await expect(selected).toContainText('The Count of Monte Cristo (2002)');
+    await matches.click();
+    await expect(titleField).toHaveValue('Another movie');
+    await expect(yearField).toHaveValue('2003');
+    await expect(description).toHaveValue('Another synopsis');
+    await expect(confirmation).not.toBeChecked();
+    await expect(selected).toContainText('Another movie (2003)');
+    await expect(matches).toHaveCount(0);
     await confirmation.check();
     await titleField.fill('My reviewed title');
     await expect(confirmation).not.toBeChecked();
@@ -583,16 +646,24 @@ for (const clockSkew of [0, -5_000, 2 * 86_400_000]) {
     await expect(titleField).toHaveValue('My reviewed title');
     await expect(description).toHaveValue('Edited synopsis');
     await expect(confirmation).toBeChecked();
+    await expect(matches).toHaveCount(0);
     await publish.click();
+    await expect(changeMatch).toBeDisabled();
+    await expect(matches).toHaveCount(0);
     await expect.poll(() => published).toBe(true);
-    expect(searches).toBe(3);
+    releasePublication();
+    await expect(card.getByRole('heading', { name: 'Optional TMDB lookup', exact: true })).toHaveCount(0);
+    expect(searches).toBe(4);
     const logo = page.getByRole('img', { name: 'TMDB', exact: true });
     await expect(logo).toHaveAttribute('src', '/tmdb.svg');
     await expect(page.getByText('This application uses TMDB and the TMDB APIs but is not endorsed, certified, or otherwise approved by TMDB.')).toBeVisible();
+    expect(pageErrors).toEqual([]);
   });
 }
 
-test('TMDB stale publication rejection clears consent and matches and permits manual entry', async ({ page }) => {
+test('TMDB stale publication and rebuilt review offer search recovery and manual entry', async ({ page }) => {
+  const pageErrors: string[] = [];
+  page.on('pageerror', error => pageErrors.push(error.message));
   const id = randomUUID();
   const digest = 'e'.repeat(64);
   const fetchedAt = Math.floor(Date.now() / 1000);
@@ -603,15 +674,19 @@ test('TMDB stale publication rejection clears consent and matches and permits ma
     report: { status: 'verified_experimental_output', movie_sha256: digest, warnings: [] },
   };
   let attempts = 0;
+  let searches = 0;
   await page.route('**/api/v1/admin/imports?*', route => {
     const history = new URL(route.request().url()).searchParams.get('history') === 'true';
     const entries = history ? [] : [{ item: { kind: 'conversion', job: conversion }, can_archive: false, history: false }];
     return route.fulfill({ json: { entries, total: entries.length, history_count: 0 } });
   });
   await page.route('**/api/v1/admin/metadata', route => route.fulfill({ json: { configured: true } }));
-  await page.route('**/api/v1/admin/metadata/search', route => route.fulfill({ json: { movies: [
-    { id: 7, title: 'Synthetic match', year: 2002, description: 'Synthetic synopsis', fetched_at: fetchedAt },
-  ] } }));
+  await page.route('**/api/v1/admin/metadata/search', route => {
+    searches++;
+    return route.fulfill({ json: { movies: [
+      { id: 7, title: 'Synthetic match', year: 2002, description: 'Synthetic synopsis', fetched_at: fetchedAt },
+    ] } });
+  });
   await page.route(`**/api/v1/admin/conversions/${id}/publish`, route => {
     const body = route.request().postDataJSON();
     expect(route.request().headers()['x-csrf-token']).toBeTruthy();
@@ -630,24 +705,66 @@ test('TMDB stale publication rejection clears consent and matches and permits ma
   await expandImport(page, id);
   const card = page.locator(`[data-testid="conversion-job"][data-job-id="${id}"]`);
   const searchButton = card.getByRole('button', { name: 'Search TMDB', exact: true });
+  const search = card.getByRole('textbox', { name: 'Search TMDB title', exact: true });
+  const searchAgain = card.getByRole('button', { name: 'Search again', exact: true });
+  const changeMatch = card.getByRole('button', { name: 'Change match', exact: true });
+  const matches = card.getByRole('button', { name: 'Use this match', exact: true });
+  const selected = card.getByRole('region', { name: 'Selected TMDB match', exact: true });
+  const titleField = card.getByRole('textbox', { name: 'Movie title', exact: true });
   const confirmation = card.getByRole('checkbox', { name: /I reviewed the validated conversion/ });
   const publish = card.getByRole('button', { name: 'Publish to local library', exact: true });
-  await card.getByRole('textbox', { name: 'Search TMDB title', exact: true }).fill('Synthetic search');
+  await search.fill('Synthetic search');
   await searchButton.click();
-  await card.getByRole('button', { name: 'Use this match', exact: true }).click();
+  await matches.click();
+  await titleField.fill('Keep through review rebuild');
+  await confirmation.check();
+  conversion.movie_sha256 = '';
+  await expect(search).toHaveCount(0);
+  conversion.movie_sha256 = digest;
+  await expect(selected).toContainText('Synthetic match (2002)');
+  await expect(titleField).toHaveValue('Keep through review rebuild');
+  await expect(confirmation).not.toBeChecked();
+  await expect(changeMatch).toHaveCount(0);
+  await expect(searchAgain).toHaveAttribute('type', 'button');
+  await searchAgain.click();
+  await expect(search).toBeFocused();
+  await expect(titleField).toHaveValue('Keep through review rebuild');
+  await expect(selected).toContainText('Source: TMDB');
+  expect(searches).toBe(1);
+  await search.fill('Synthetic search');
+  await searchButton.click();
+  await expect(matches).toHaveCount(1);
+  await expect(titleField).toHaveValue('Keep through review rebuild');
+  await matches.click();
+  await expect(changeMatch).toBeVisible();
+  await expect(matches).toHaveCount(0);
   await confirmation.check();
   await publish.click();
   await expect(card.getByText('TMDB selection expired; search again before publication', { exact: true })).toBeVisible();
   await expect(confirmation).not.toBeChecked();
   await expect(publish).toBeDisabled();
-  await expect(card.getByRole('button', { name: 'Use this match', exact: true })).toHaveCount(0);
+  await expect(matches).toHaveCount(0);
   await expect(searchButton).toBeEnabled();
+  await expect(changeMatch).toHaveCount(0);
+  await expect(searchAgain).toBeVisible();
+  await searchAgain.click();
+  await expect(search).toBeFocused();
+  await expect(titleField).toHaveValue('Synthetic match');
+  await expect(selected).toContainText('Synthetic match (2002)');
+  expect(searches).toBe(2);
+  await expect(publish).toBeDisabled();
   expect(attempts).toBe(1);
+  await searchButton.click();
+  await expect(matches).toHaveCount(1);
+  await expect(selected).toContainText('Synthetic match (2002)');
+  await expect(publish).toBeDisabled();
+  expect(searches).toBe(3);
   await card.getByRole('button', { name: 'Clear TMDB selection for manual entry', exact: true }).click();
-  await card.getByRole('textbox', { name: 'Movie title', exact: true }).fill('Manual recovery');
+  await titleField.fill('Manual recovery');
   await confirmation.check();
   await publish.click();
   await expect.poll(() => attempts).toBe(2);
+  expect(pageErrors).toEqual([]);
 });
 
 test('movie labels persist through polling, reuse and removal, with viewer search and exact filters', async ({ page, browser }) => {

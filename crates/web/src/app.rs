@@ -2448,6 +2448,7 @@ fn metadata_is_fresh(received_at: f64) -> bool {
 struct MetadataSelection {
     source: TmdbSource,
     received_at: f64,
+    label: String,
 }
 
 #[component]
@@ -2459,6 +2460,7 @@ fn MetadataLookup(
     source: RwSignal<Option<MetadataSelection>>,
     confirmed: RwSignal<bool>,
     disabled: Signal<bool>,
+    clock: RwSignal<f64>,
 ) -> impl IntoView {
     let scope = admin_scope();
     let configured = RwSignal::new(false);
@@ -2466,7 +2468,17 @@ fn MetadataLookup(
     let search_year = RwSignal::new(String::new());
     let searching = RwSignal::new(false);
     let results = RwSignal::new(Vec::<(MetadataMatch, f64)>::new());
+    let show_results = RwSignal::new(true);
     let message = RwSignal::new(None::<String>);
+    let search_input = NodeRef::<leptos::html::Input>::new();
+    let cached_matches_available = move || {
+        let _ = clock.get();
+        results.with(|results| {
+            results
+                .iter()
+                .any(|(_, received_at)| metadata_is_fresh(*received_at))
+        })
+    };
     Effect::new(move |_| {
         if source
             .get()
@@ -2517,6 +2529,7 @@ fn MetadataLookup(
             return;
         }
         searching.set(true);
+        show_results.set(true);
         results.set(Vec::new());
         message.set(None);
         spawn_local(async move {
@@ -2561,7 +2574,7 @@ fn MetadataLookup(
             <p class="subtle">"TMDB receives only the search title and optional year you enter, not filenames, ISOs or media.
                 Choose a match, then review or edit it. Cached metadata expires after 150 days; administrators refresh it manually."</p>
             <form on:submit=search>
-                <label>"Search TMDB title"<input maxlength="256" required bind:value=query
+                <label>"Search TMDB title"<input node_ref=search_input maxlength="256" required bind:value=query
                     disabled=move || disabled.get() || searching.get() || !configured.get()/></label>
                 <label>"Search TMDB year (optional)"<input type="number" min="1888" max="2100" bind:value=search_year
                     disabled=move || disabled.get() || searching.get() || !configured.get()/></label>
@@ -2570,11 +2583,39 @@ fn MetadataLookup(
                 </button>
             </form>
             {move || message.get().map(|message| view! { <p role="status">{message}</p> })}
+            {move || source.get().map(|selection| view! {
+                <section aria-label="Selected TMDB match">
+                    <strong>{selection.label}</strong>
+                    <p class="subtle">"Source: TMDB"</p>
+                    <Show when=move || !show_results.get() && cached_matches_available()>
+                        <button type="button" class="secondary" disabled=move || disabled.get() || searching.get()
+                            on:click=move |_| {
+                                if disabled.get_untracked() || searching.get_untracked() { return; }
+                                if !results.with_untracked(|results| results.iter().any(|(_, received_at)| metadata_is_fresh(*received_at))) {
+                                    clock.set(browser_clock());
+                                    return;
+                                }
+                                show_results.set(true);
+                            }>"Change match"</button>
+                    </Show>
+                    <Show when=move || !cached_matches_available()>
+                        <p class="subtle">"Search again for other matches. Your edits are kept until you select a match."</p>
+                        <button type="button" class="secondary" disabled=move || disabled.get() || searching.get() || !configured.get()
+                            on:click=move |_| {
+                                if disabled.get_untracked() || searching.get_untracked() || !configured.get_untracked() { return; }
+                                if let Some(input) = search_input.get_untracked() {
+                                    let _ = input.focus();
+                                }
+                            }>"Search again"</button>
+                    </Show>
+                </section>
+            })}
+            <Show when=move || show_results.get()>
             {move || results.get().into_iter().map(|(matched, received_at)| {
                 let label = format!("{} ({})", matched.title, matched.year.map(|year| year.to_string()).unwrap_or_else(|| "year unknown".into()));
                 view! {
                     <article>
-                        <strong>{label}</strong>
+                        <strong>{label.clone()}</strong>
                         <p>{matched.description.clone()}</p>
                         <button type="button" disabled=move || disabled.get() || searching.get()
                             on:click=move |_| {
@@ -2589,12 +2630,15 @@ fn MetadataLookup(
                                 source.set(Some(MetadataSelection {
                                     source: TmdbSource { id: matched.id, fetched_at: matched.fetched_at },
                                     received_at,
+                                    label: label.clone(),
                                 }));
                                 confirmed.set(false);
+                                show_results.set(false);
                             }>"Use this match"</button>
                     </article>
                 }
             }).collect_view()}
+            </Show>
             <Show when=move || source.get().is_some()>
                 <p class="subtle">"Selected TMDB metadata remains editable. Confirm publication separately within 24 hours."</p>
                 <button type="button" class="secondary" disabled=move || disabled.get()
@@ -2605,6 +2649,7 @@ fn MetadataLookup(
                         year.set(String::new());
                         description.set(String::new());
                         confirmed.set(false);
+                        show_results.set(true);
                     }>"Clear TMDB selection for manual entry"</button>
             </Show>
         </section>
@@ -2868,7 +2913,7 @@ fn ConversionReview(
                         This adds preview playback to your local library, not production approval.
                         Original tracks are kept; image subtitles and OCR captions are unavailable."</p>
                     <MetadataLookup csrf=csrf title=title year=year description=description
-                        source=tmdb confirmed=confirmed
+                        source=tmdb confirmed=confirmed clock=clock
                         disabled=Signal::derive(move || busy.get() || submitted.get() || !ready())/>
                     <Show when=move || !fresh()>
                         <p role="alert">"TMDB selection expired; search again or clear it for manual entry."</p>
