@@ -328,7 +328,7 @@ test('admin diagnostics and ISO scanning retain failed input without publication
     return jobs.some(job => job.state === 'succeeded' || job.state === 'failed');
   }).toBe(true);
   await page.getByTestId('latest-readiness').getByText('Individual checks', { exact: true }).click();
-  await expect(page.getByTestId('latest-readiness').getByText('Required scan, inspection and conversion capabilities available. Optional OCR does not determine readiness.', { exact: true })).toBeVisible();
+  await expect(page.getByTestId('latest-readiness').getByText('Required tools are available. OCR is optional.', { exact: true })).toBeVisible();
   const original = (await (await page.request.get(`${baseURL}/api/v1/admin/incoming`)).json()).files.find(file => file.name === 'browser-invalid.iso');
   const originalHash = command('sha256sum', [incomingFile]).split(/\s+/, 1)[0];
   await page.getByRole('button', { name: 'Refresh incoming files', exact: true }).click();
@@ -738,7 +738,7 @@ test('live media progress renders measurable, indeterminate, queued, review, fai
   await expect(encode).toHaveAttribute('aria-valuenow', '25');
   await expect(convertedCard.locator('.phase-progress')).toContainText('elapsed 10s');
   await expect(convertedCard.locator('.phase-progress')).toContainText('2.0 media seconds/s · estimated 30s remaining in this phase');
-  await expect(convertedCard.getByText('Total workflow — stage-based, not elapsed-time weighted', { exact: true })).toBeVisible();
+  await expect(convertedCard.getByText('Progress by stage, not time remaining', { exact: true })).toBeVisible();
 
   conversion.progress.completed_units = 80;
   await expect(encode).toHaveAttribute('aria-valuenow', '99');

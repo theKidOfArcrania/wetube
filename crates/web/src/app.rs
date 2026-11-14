@@ -61,7 +61,7 @@ fn MediaJobProgress(
             }
             MediaProgressState::Complete => "Workflow complete.".to_owned(),
             _ => progress.as_ref().map_or_else(
-                || "Progress telemetry unavailable.".to_owned(),
+                || "Progress unavailable.".to_owned(),
                 |p| {
                     let percentage = p
                         .fraction()
@@ -90,7 +90,7 @@ fn MediaJobProgress(
     };
     view! {
         <section class="media-progress" data-testid="media-progress">
-            <p class="subtle">"Total workflow — stage-based, not elapsed-time weighted"</p>
+            <p class="subtle">"Progress by stage, not time remaining"</p>
             <div class="stage-segments" role="group" aria-label="Total workflow stages">
                 {workflow.stages().iter().zip(fills).map(|(label, fill)| {
                     let indeterminate = fill.is_none();
@@ -422,13 +422,11 @@ fn LibraryPage(current: Session, session: RwSignal<Option<Session>>) -> impl Int
             <span class="subtle">"Signed in as " {username}</span>
             <button class="secondary" on:click=sign_out disabled=move || signing_out.get()>"Sign out"</button>
         </div>
-        <p class="eyebrow">"The beginning of your collection"</p>
+        <p class="eyebrow">"Your movie collection"</p>
         <h1>"Movie night starts here."</h1>
         <p class="notice">
-            "Local experimental website preview: reviewed DVD conversions can be explicitly published
-             for H.264/AAC playback. This is not an approved production conversion profile.
-             Original ISOs and original tracks are retained. Audio-track selection, image-subtitle
-             playback and OCR captions remain pending; source deletion is never enabled."
+            "DVD playback is in preview, using H.264/AAC. Original ISOs and tracks are kept; sources are never
+             automatically deleted. Audio-track selection, image subtitles and OCR captions are not available."
         </p>
         <For each={move || selected.get().into_iter().collect::<Vec<_>>()}
             key=|movie| movie.id.clone()
@@ -451,7 +449,7 @@ fn LibraryPage(current: Session, session: RwSignal<Option<Session>>) -> impl Int
                         <h2>{move || if query.get().is_empty() { "A home for your DVD collection" } else { "No matching movies" }}</h2>
                         <p class="subtle">
                             {move || if query.get().is_empty() {
-                                "No movies are published yet. An administrator must inspect, convert, validate and explicitly publish a movie before it appears here."
+                                "No movies yet. An administrator must review and publish a validated conversion before it appears here."
                             } else {
                                 "Try a different title or description."
                             }}
@@ -510,7 +508,7 @@ fn LibraryPage(current: Session, session: RwSignal<Option<Session>>) -> impl Int
                     <For each={move || jobs.get().into_iter().skip(1).collect::<Vec<_>>()}
                         key=|job| job.id.clone()
                         children=move |job| view! { <ReadinessCheck id=job.id jobs=jobs latest=false/> }/>
-                    <p class="subtle">"Up to 19 previous checks. All reports remain retained."</p>
+                    <p class="subtle">"Showing up to 19 previous checks. All reports are kept."</p>
                 </details>
             </section>
             <Show when=move || selected.get().is_none() && !signing_out.get()>
@@ -609,8 +607,8 @@ fn ReadinessCheck(id: String, jobs: RwSignal<Vec<DiagnosticJob>>, latest: bool) 
             {move || job.get().and_then(|job| job.error).map(|message| view! { <p role="alert" class="error">{message}</p> })}
             <details>
                 <summary>"Individual checks"</summary>
-                <p class="subtle">"Read-only capability checks, not conversion approval. No ISO is opened or deleted.
-                    DVD discovery, FFmpeg, ffprobe and DVD-Video support are required. OCR is optional."</p>
+                <p class="subtle">"Checks tool availability, not conversion quality. No ISO is opened or deleted.
+                    DVD discovery, FFmpeg, ffprobe and DVD-Video support are required; OCR is optional."</p>
                 {move || job.get().and_then(|job| job.report).map(diagnostic_capabilities)}
             </details>
         </div>
@@ -641,13 +639,11 @@ fn diagnostic_capabilities(report: DiagnosticReport) -> AnyView {
         .iter()
         .find(|tool| tool.name == "DVD discovery");
     let scan_status = match scanner {
-        Some(tool) if tool.available => "DVD title discovery capability available.",
+        Some(tool) if tool.available => "DVD title discovery available.",
         Some(_) => {
-            "DVD title discovery unavailable. Review the installed DVD library or optional scanner capability below."
+            "DVD title discovery unavailable. Check the DVD library or fallback scanner below."
         }
-        None => {
-            "Integrated DVD discovery was not checked by this report. Run updated read-only diagnostics."
-        }
+        None => "DVD title discovery was not checked. Run a new check.",
     };
     let conversion_ready = ["ffmpeg", "ffprobe", "dvdvideo"].iter().all(|name| {
         report
@@ -661,11 +657,9 @@ fn diagnostic_capabilities(report: DiagnosticReport) -> AnyView {
         .map(|tool| {
             let capability = match tool.name.as_str() {
                 "DVD discovery" => "Required for DVD title discovery",
-                "lsdvd" => "Optional DVD discovery fallback — not required when the DVD library is available",
+                "lsdvd" => "Optional fallback for DVD title discovery",
                 "ffmpeg" | "ffprobe" | "dvdvideo" => "Required for DVD inspection and conversion",
-                "tesseract" | "English OCR" => {
-                    "Optional OCR — not needed for current conversion/playback"
-                }
+                "tesseract" | "English OCR" => "Optional OCR",
                 _ => "Additional capability",
             };
             view! {
@@ -680,12 +674,12 @@ fn diagnostic_capabilities(report: DiagnosticReport) -> AnyView {
     view! {
         <p class="notice">{scan_status}</p>
         {required_ready.then(|| view! {
-            <p class="subtle">"Required scan, inspection and conversion capabilities available. Optional OCR does not determine readiness."</p>
+            <p class="subtle">"Required tools are available. OCR is optional."</p>
         })}
         <p class="subtle">{if conversion_ready {
-            "Required DVD conversion tools available. This is not conversion validation or production approval."
+            "Conversion tools are available; each conversion still needs validation and review."
         } else {
-            "Required DVD conversion tools are missing or not checked. Review FFmpeg, ffprobe and DVD-Video capabilities below."
+            "Conversion tools are missing or unchecked. Review FFmpeg, ffprobe and DVD-Video support below."
         }}</p>
         {tools}
     }.into_any()
@@ -976,7 +970,7 @@ fn MoviePlayer(
                     on:ended=move |_| record(true)
                     on:error=move |_| {
                         if writer.try_get_value().is_some_and(|state| state.borrow().active) {
-                            media_error.set(Some("The movie could not be played. Check the admitted media and browser H.264/AAC support.".into()));
+                            media_error.set(Some("The movie could not be played. Check your browser's H.264/AAC support or ask your administrator to check the video file.".into()));
                         }
                     }>
                     "Your browser does not support native video playback."
@@ -1224,14 +1218,13 @@ fn ImportsPanel(
                 </button>
             </div>
             <p class="notice">
-                "First scan: the worker stages and checksum-verifies a private copy, then discovers
-                 the actual DVD titles and available angles. Choose a program from the scan before
-                 inspection. Scanning does not convert, publish or delete anything."
+                "Scan a verified private copy to find DVD titles and angles, then choose a title to inspect.
+                 Scanning does not convert, publish or delete anything."
             </p>
             {move || incoming.get().map(|list| if !list.configured {
-                view! { <p class="subtle">"Incoming DVD scanning is disabled. An operator must configure the completed-copy source and private worker staging."</p> }.into_any()
+                view! { <p class="subtle">"DVD scanning is disabled. Ask your administrator to configure incoming copies and private working storage."</p> }.into_any()
             } else if list.files.is_empty() {
-                view! { <p class="subtle">"No readable, non-empty ISO files in the incoming root. Finish copying, then refresh."</p> }.into_any()
+                view! { <p class="subtle">"No readable, non-empty ISO files in the incoming folder. Finish copying, then refresh."</p> }.into_any()
             } else {
                 view! { <p class="subtle">"Use finished incoming copies only, never the original archive. Scans wait for a connected, configured worker."</p> }.into_any()
             })}
@@ -1257,7 +1250,7 @@ fn ImportsPanel(
                         on:change=move |event| copy_complete.set(event_target_checked(&event))/>
                     "I confirm this copy is finished and its SMB writers are closed."
                 </label>
-                <p class="subtle">"Acknowledgement is not proof of writer exclusion and never authorizes source deletion."</p>
+                <p class="subtle">"Confirmation cannot verify that writers are closed and does not authorize source deletion."</p>
                 <button type="submit" disabled=move || requesting.get() || refreshing.get()
                     || !copy_complete.get() || selected.get().is_empty()
                     || scans.get().iter().any(|job| matches!(job.state, ScanState::Queued | ScanState::Staging | ScanState::Scanning))>
@@ -1265,9 +1258,9 @@ fn ImportsPanel(
                 </button>
             </form>
             {move || error.get().map(|message| view! { <p role="alert" class="error">{message}</p> })}
-            <h2>"Active imports and attention"</h2>
-            <p class="subtle">"Expand a review to choose a title, inspect warnings or publish. Errors stay here until you archive them.
-                Archive acknowledges a job for your account only; it never deletes inputs, reports or media."</p>
+            <h2>"Imports needing attention"</h2>
+            <p class="subtle">"Expand an import to review it. Errors stay here until archived.
+                Archiving only moves a job to your History; inputs, reports and media are kept."</p>
             {move || jobs_error.get().map(|message| view! { <p role="alert" class="error">"Could not refresh imports: "{message}</p> })}
             <For each=move || main_entries.get() key=import_key
                 children=move |entry| view! {
@@ -1290,7 +1283,7 @@ fn ImportsPanel(
                     }>"More imports needing attention"</button>
                 </Show>
             </div>
-            <p class="subtle">"All attempts, including failed/interrupted ones, count against scratch limits and require operator review. No automatic cleanup is enabled."</p>
+            <p class="subtle">"Every attempt uses working storage, even if it fails or stops. An operator must review storage use; nothing is automatically deleted."</p>
             <details data-testid="import-history" on:toggle=move |event| {
                 use js_sys::wasm_bindgen::JsCast;
                 let open = event.target().and_then(|target| target.dyn_into::<web_sys::Element>().ok())
@@ -1298,7 +1291,7 @@ fn ImportsPanel(
                 history_open.set(open);
             }>
                 <summary>{move || format!("History ({})", history_count.get())}</summary>
-                <p class="subtle">"Completed steps and your archived jobs. Restore returns a row to your attention list, not to the worker queue."</p>
+                <p class="subtle">"Completed steps and archived jobs. Restoring a job returns it to your attention list without running it again."</p>
                 <For each=move || history_entries.get() key=import_key
                     children=move |entry| view! {
                         <ImportRow entry_key=import_key(&entry) entries=history_entries history=true
@@ -1531,7 +1524,7 @@ fn ProbeReview(
                         {job.attempt_id.map(|attempt| view! { <p class="attempt">"Attempt: "{attempt}</p> })}
                         {job.error.map(|message| view! { <p class="error">{message}</p> })}
                         {job.report.map(|report| view! {
-                            <details><summary>"Raw staging / inspection JSON"</summary><pre>{format!("{report:#}")}</pre></details>
+                            <details><summary>"Inspection details (JSON)"</summary><pre>{format!("{report:#}")}</pre></details>
                         })}
                     </article>
                 }
@@ -1659,8 +1652,8 @@ fn ScanSelection(
             {move || scan.get().map(|scan| {
                 let label = match scan.state {
                     ScanState::Queued => "Scan queued — waiting for worker",
-                    ScanState::Staging => "Staging and checksum-verifying the ISO — this may take a while",
-                    ScanState::Scanning => "Scanning actual DVD titles and angles",
+                    ScanState::Staging => "Copying and verifying the ISO",
+                    ScanState::Scanning => "Finding DVD titles and angles",
                     ScanState::NeedsReview => "Scan complete — select a title for inspection",
                     ScanState::Failed => "Scan failed — ISO, reports and logs retained",
                 };
@@ -1680,9 +1673,8 @@ fn ScanSelection(
                 }
             })}
             <Show when=ready>
-                <p class="field-help">"A DVD title is a numbered video program, not the movie name.
-                    Features, trailers and extras can be separate titles; title 1 is not always the main feature.
-                    The longest title is only a main-feature candidate — review before choosing."</p>
+                <p class="field-help">"DVD titles are numbered programs: features, trailers or extras.
+                    Neither title 1 nor the longest title is always the main feature. Review before choosing."</p>
                 <Show when=move || scan.get().and_then(|scan| scan.report).is_none_or(|report| report.titles.is_empty())>
                     <p class="error">"No usable title inventory is available. Inspection is disabled; review the scan error or retry scanning."</p>
                 </Show>
@@ -1718,7 +1710,7 @@ fn ScanSelection(
                                 title.subtitle_count, languages(title.subtitle_languages),
                             )}</p>
                             {(title.angles.len() == 1).then(|| view! {
-                                <p class="field-help">{format!("Single available angle: {}. No alternate-angle choice is needed.", title.angles[0])}</p>
+                                <p class="field-help">{format!("Only available angle: {}", title.angles[0])}</p>
                             })}
                             {title.angles.is_empty().then(|| view! {
                                 <p class="error">"No valid angles were reported for this title. Inspection is disabled."</p>
@@ -1742,7 +1734,7 @@ fn ScanSelection(
                         </label>
                         <p class="field-help">"Angles are alternate camera views on supported discs. Normally choose angle 1 when it is available."</p>
                     </Show>
-                    <p class="subtle">"Inspection reuses this scan's checksum-verified staged ISO; it does not copy from the NAS again."</p>
+                    <p class="subtle">"Inspection uses the verified private copy; no new NAS copy is needed."</p>
                     <button type="submit" disabled=move || busy.get() || queued.get().is_some() || !valid_selection()>
                         {move || if busy.get() { "Queueing inspection..." } else { "Inspect selected title" }}
                     </button>
@@ -1829,10 +1821,9 @@ fn ComparisonPreview(probe_id: String, csrf: StoredValue<String>) -> impl IntoVi
     view! {
         <section class="comparison-preview" data-testid="comparison-preview">
             <h4>"Compare a midpoint sample"</h4>
-            <p class="subtle">"Generate the same approximately centered 10-second window for both treatments
-                (short titles use their shorter duration). Reuses the verified private staged ISO, without another NAS copy
-                or full-film encode. DVD timing is approximate; this is not motion detection.
-                H.264/AAC previews are not lossless and do not validate the full title/disc or authorize publication."</p>
+            <p class="subtle">"Compare both treatments using the same 10-second midpoint sample, or less for short titles.
+                Uses the verified private copy. Sample selection uses approximate DVD timing, not motion detection.
+                These H.264/AAC previews are not lossless, do not validate the full title or disc, and do not authorize publication."</p>
             <div class="probe-options">
                 <button type="button" on:click=submit disabled=move || !loaded.get() || loading.get()
                     || job.get().is_some_and(|job| job.state != JobState::Failed)>
@@ -1845,7 +1836,7 @@ fn ComparisonPreview(probe_id: String, csrf: StoredValue<String>) -> impl IntoVi
             {move || job.get().map(|job| {
                 let ready = job.state == JobState::Succeeded;
                 let timing = job.report.as_ref().map(|report| format!(
-                    "Requested approximate DVD window: {:.2}s from title start, {:.2}s long. Title/angle bound to this inspection.",
+                    "Approximate sample: {:.2}s from the start, {:.2}s long, using the inspected title and angle.",
                     report["requested_start_seconds"].as_f64().unwrap_or(0.0),
                     report["requested_duration_seconds"].as_f64().unwrap_or(0.0)));
                 view! {
@@ -1858,8 +1849,8 @@ fn ComparisonPreview(probe_id: String, csrf: StoredValue<String>) -> impl IntoVi
                     <p role="status">{match job.state {
                         JobState::Queued => "Comparison queued — waiting for worker.",
                         JobState::Running => "Generating and decoding both comparison clips...",
-                        JobState::Succeeded => "Both comparison clips decoded and ready. No movie was registered.",
-                        JobState::Failed => "Comparison failed. Partial artifacts retained, unregistered.",
+                        JobState::Succeeded => "Both clips decoded and ready. Nothing was published.",
+                        JobState::Failed => "Comparison failed. Partial files kept; nothing published.",
                     }}</p>
                     {job.error.map(|message| view! { <p role="alert" class="error">{message}</p> })}
                     {timing.map(|text| view! { <p class="subtle">{text}</p> })}
@@ -1868,9 +1859,9 @@ fn ComparisonPreview(probe_id: String, csrf: StoredValue<String>) -> impl IntoVi
                         let yadif = format!("/api/v1/admin/comparisons/{}/yadif/video",job.id);
                         view! {
                             <div>
-                                <h5>"Preserve — no interlace filter (not lossless)"</h5>
+                                <h5>"Preserve — no deinterlacing (not lossless)"</h5>
                                 <video controls playsinline preload="metadata" aria-label="Preserve comparison" src=preserve style="width:100%;max-width:640px"/>
-                                <h5>"Yadif — mode=send_frame:parity=auto:deint=all"</h5>
+                                <h5>"Yadif — deinterlaced"</h5>
                                 <video controls playsinline preload="metadata" aria-label="Yadif comparison" src=yadif style="width:100%;max-width:640px"/>
                             </div>
                         }
@@ -1949,9 +1940,9 @@ fn ProbeConversion(
         <div class="conversion-controls">
             <ComparisonPreview probe_id=probe_id.get_value() csrf=csrf/>
             <h4>"Review before conversion"</h4>
-            <p class="notice">"Review the selected program, duration, field order and all warnings above.
-                Neither treatment is an approved production profile. Original tracks are retained,
-                but image subtitles are not playable captions and no OCR captions are produced."</p>
+            <p class="notice">"Review the program, duration, field order and warnings.
+                Both treatments are preview profiles, not approved for production. Original tracks are kept;
+                image subtitles and OCR captions are not available for playback."</p>
             <form on:submit=submit>
                 <label>
                     "Video treatment"
@@ -1966,13 +1957,13 @@ fn ProbeConversion(
                         <option value="yadif">"Yadif — apply deinterlacing"</option>
                     </select>
                 </label>
-                <p class="field-help">"Preserve does not mean lossless or bit-for-bit video copying.
-                    Yadif changes the video; review whether deinterlacing is appropriate for this title."</p>
+                <p class="field-help">"Preserve re-encodes video without deinterlacing; it is not lossless.
+                    Use Yadif only if deinterlacing is appropriate for this title."</p>
                 <label class="confirmation">
                     <input type="checkbox" required prop:checked=move || reviewed.get()
                         disabled=move || busy.get() || submitted.get() || existing()
                         on:change=move |event| reviewed.set(event_target_checked(&event))/>
-                    "I reviewed this inspection and warnings, and explicitly chose this experimental treatment."
+                    "I reviewed this inspection and warnings, and chose this preview treatment."
                 </label>
                 <button type="submit" disabled=move || busy.get() || submitted.get() || existing()
                     || !reviewed.get() || treatment.get().is_empty()>
@@ -1980,7 +1971,7 @@ fn ProbeConversion(
                 </button>
             </form>
             {move || (submitted.get() || existing()).then(|| view! {
-                <p role="status" class="subtle">"Conversion queued or already exists. Follow its job below; publication is a separate step."</p>
+                <p role="status" class="subtle">"Conversion queued or already exists. Review it below; publication requires separate approval."</p>
             })}
             {move || error.get().map(|message| view! { <p role="alert" class="error">{message}</p> })}
         </div>
@@ -2146,9 +2137,8 @@ fn MetadataLookup(
     view! {
         <section class="metadata-lookup">
             <h4>"Optional TMDB lookup"</h4>
-            <p class="subtle">"Only the search title and optional year you enter are sent to TMDB by the server.
-                No filename, ISO or media is uploaded. Choose a result explicitly, then edit and review.
-                TMDB metadata expires after 150 days; library refresh is administrator-initiated."</p>
+            <p class="subtle">"TMDB receives only the search title and optional year you enter, not filenames, ISOs or media.
+                Choose a match, then review or edit it. Cached metadata expires after 150 days; administrators refresh it manually."</p>
             <form on:submit=search>
                 <label>"Search TMDB title"<input maxlength="256" required bind:value=query
                     disabled=move || disabled.get() || searching.get() || !configured.get()/></label>
@@ -2265,7 +2255,7 @@ fn ConversionReview(
         };
         let Some(movie_sha256) = validated_hash(&current) else {
             error.set(Some(
-                "This job has no validated movie digest and cannot be published.".into(),
+                "This conversion has no validated checksum and cannot be published.".into(),
             ));
             return;
         };
@@ -2431,23 +2421,23 @@ fn ConversionReview(
                     {job.attempt_id.map(|attempt| view! { <p class="attempt">"Attempt: "{attempt}</p> })}
                     {job.error.map(|message| view! { <p role="alert" class="error">{message}</p> })}
                     {missing_hash.then(|| view! {
-                        <p class="error">"Validated movie digest is unavailable. Publication is disabled."</p>
+                        <p class="error">"Validated checksum is unavailable. Publication is disabled."</p>
                     })}
                 }
             })}
             <Show when=move || job.get().is_some_and(|job| job.report.is_some())>
                 <details>
-                    <summary>"Conversion / validation report and warnings (JSON)"</summary>
+                    <summary>"Validation report and warnings (JSON)"</summary>
                     <pre>{move || job.get().and_then(|job| job.report).map(|report| format!("{report:#}"))}</pre>
                 </details>
             </Show>
             <Show when=ready>
                 <div class="publication-review">
                     <h4>"Review metadata and publish"</h4>
-                    <p class="notice">"Inspect the validation report and warnings before publication.
-                        The worker rechecks this job's validated movie digest.
-                        Publishing adds experimental playback to this local library only — not production approval.
-                        Original tracks stay retained; image subtitles and OCR captions are not available for playback."</p>
+                    <p class="notice">"Review the validation report and warnings. Publication is tied to this conversion's
+                        validated checksum, which is checked again before publishing.
+                        This adds preview playback to your local library, not production approval.
+                        Original tracks are kept; image subtitles and OCR captions are unavailable."</p>
                     <MetadataLookup csrf=csrf title=title year=year description=description
                         source=tmdb confirmed=confirmed
                         disabled=Signal::derive(move || busy.get() || submitted.get() || !ready())/>
@@ -2618,7 +2608,7 @@ fn inspection_summary(job: &ProbeJob) -> AnyView {
                 <div class="inspection-checksum"><dt>"Staged SHA-256"</dt><dd><code>{checksum}</code></dd></div>
             </dl>
             <h4>"Metadata inspection only"</h4>
-            <p class="subtle">"Only the selected title and angle are described. Nothing is published; this is not conversion or playback validation."</p>
+            <p class="subtle">"Describes only the selected title and angle. This does not validate conversion or playback, or publish anything."</p>
             {metadata.is_none().then(|| view! {
                 <p class="subtle">"DVD metadata is not available for this attempt. Staging details, if present, do not mean inspection succeeded."</p>
             })}
@@ -2626,7 +2616,7 @@ fn inspection_summary(job: &ProbeJob) -> AnyView {
                 <div><dt>"Approximate duration"</dt><dd>{approximate_duration(seconds)}</dd></div>
                 <div><dt>"Chapter count"</dt><dd>{chapters}</dd></div>
             </dl>
-            <p class="subtle">"Duration and chapter timing are approximate; full-disc preindexing is disabled."</p>
+            <p class="subtle">"Duration and chapter timing are approximate."</p>
             <div class="inspection-track-grid">{track_groups}</div>
             <div class="inspection-warnings">
                 <h4>"Inspection warnings"</h4>
