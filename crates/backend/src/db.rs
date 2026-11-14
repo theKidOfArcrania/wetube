@@ -43,13 +43,17 @@ pub async fn initialize(state_dir: &Path) -> Result<()> {
             "incompatible state; migration is not authorized for this release"
         );
         if version.0 < SCHEMA_VERSION {
-            // Schemas 1/2 precede any published asset registry. This is not a general
-            // asset-aware upgrade authorization for subsequent releases.
+            // This additive migration does not modify registered media. Snapshot
+            // SQLite first; operators must retain the separate media/attempt roots.
             anyhow::ensure!(
-                matches!(version.0, 1 | 2),
+                matches!(version.0, 1..=3),
                 "unsupported upgrade; requires a complete asset-aware backup"
             );
             let backup = state_dir.join(format!("pre-upgrade-{}", uuid::Uuid::new_v4()));
+            eprintln!(
+                "SQLite-only snapshot: {}. Registered media and attempts are not copied; retain them in place.",
+                backup.display()
+            );
             std::fs::DirBuilder::new().mode(0o700).create(&backup)?;
             let database = backup.join("wetube.sqlite3");
             sqlx::query("VACUUM INTO ?")
@@ -107,8 +111,8 @@ mod tests {
 
     #[tokio::test]
     async fn upgrades_foundation_only_after_a_consistent_private_backup() {
-        let dir = tempfile::tempdir().unwrap();
-        let migrations = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let migrations = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
         std::fs::write(
             migrations.path().join("0001_foundation.sql"),
             include_str!("../migrations/0001_foundation.sql"),
@@ -234,5 +238,97 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(preview_tables, 0);
+    }
+
+    #[tokio::test]
+    async fn conversion_upgrade_preserves_schema_three_media_and_staged_probe_registry() {
+        let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let migrations = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        for (name, sql) in [
+            (
+                "0001_foundation.sql",
+                include_str!("../migrations/0001_foundation.sql"),
+            ),
+            (
+                "0002_probe_jobs.sql",
+                include_str!("../migrations/0002_probe_jobs.sql"),
+            ),
+            (
+                "0003_local_preview.sql",
+                include_str!("../migrations/0003_local_preview.sql"),
+            ),
+        ] {
+            std::fs::write(migrations.path().join(name), sql).unwrap();
+        }
+        let pool = open(dir.path(), true).await.unwrap();
+        sqlx::migrate::Migrator::new(migrations.path())
+            .await
+            .unwrap()
+            .run(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO users VALUES ('admin','admin','hash','admin')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO movies(id,title,status) VALUES ('movie','Retained preview','ready')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO preview_media VALUES ('movie','retained-package','retained-hash',100,1.0,'retained-identity',1)")
+            .execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO probe_jobs(id,requested_by,name,source_identity,title,angle,state,created_at,attempt_id,report) VALUES ('probe','admin','source.iso','identity',1,1,'needs_review',1,'retained-attempt','{}')")
+            .execute(&pool).await.unwrap();
+        pool.close().await;
+        initialize(dir.path()).await.unwrap();
+        let pool = connect(dir.path()).await.unwrap();
+        let media: (String, String, String) = sqlx::query_as(
+            "SELECT package_id,sha256,file_identity FROM preview_media WHERE movie_id='movie'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            media,
+            (
+                "retained-package".into(),
+                "retained-hash".into(),
+                "retained-identity".into()
+            )
+        );
+        let attempt: String =
+            sqlx::query_scalar("SELECT attempt_id FROM probe_jobs WHERE id='probe'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(attempt, "retained-attempt");
+        let ready: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM movies WHERE id='movie' AND status='ready'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(ready, 1);
+        let foreign_keys = sqlx::query("PRAGMA foreign_key_check")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert!(foreign_keys.is_empty());
+        let backups = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("pre-upgrade-")
+            })
+            .count();
+        assert_eq!(
+            backups, 1,
+            "SQLite-only snapshot is created before the additive registry upgrade"
+        );
+        pool.close().await;
     }
 }

@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -84,6 +84,18 @@ pub struct DiagnosticReport {
     pub dvdvideo_available: bool,
 }
 
+impl DiagnosticReport {
+    pub fn required_tools_available(&self) -> bool {
+        ["ffmpeg", "ffprobe", "dvdvideo", "DVD discovery"]
+            .iter()
+            .all(|name| {
+                self.tools
+                    .iter()
+                    .any(|tool| tool.name == *name && tool.available)
+            })
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JobState {
@@ -145,6 +157,121 @@ pub struct ProbeJob {
     pub attempt_id: Option<String>,
     pub report: Option<serde_json::Value>,
     pub error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VideoTreatment {
+    Preserve,
+    Yadif,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConversionState {
+    Queued,
+    Converting,
+    NeedsReview,
+    QueuedPublication,
+    Publishing,
+    Published,
+    Failed,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConversionRequest {
+    pub probe_job_id: String,
+    pub video_treatment: VideoTreatment,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublishRequest {
+    pub title: String,
+    pub year: Option<i32>,
+    pub description: String,
+    pub movie_sha256: String,
+    pub confirm: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ConversionJob {
+    pub id: String,
+    pub probe_job_id: String,
+    pub state: ConversionState,
+    pub created_at: i64,
+    pub attempt_id: Option<String>,
+    pub video_treatment: VideoTreatment,
+    pub phase: Option<String>,
+    pub report: Option<serde_json::Value>,
+    pub error: Option<String>,
+    pub movie_id: Option<String>,
+    pub movie_sha256: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ConversionJobs {
+    pub jobs: Vec<ConversionJob>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScanRequest {
+    pub name: String,
+    pub identity: String,
+    pub copy_complete: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct InspectRequest {
+    pub title: u8,
+    pub angle: u8,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScanState {
+    Queued,
+    Staging,
+    Scanning,
+    NeedsReview,
+    Failed,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct DvdTitle {
+    pub title: u8,
+    pub duration_seconds: f64,
+    pub chapter_count: u16,
+    pub audio_count: u16,
+    pub subtitle_count: u16,
+    pub audio_languages: Vec<String>,
+    pub subtitle_languages: Vec<String>,
+    pub angles: Vec<u8>,
+    pub main_feature_candidate: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct DvdScanReport {
+    pub titles: Vec<DvdTitle>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ScanJob {
+    pub id: String,
+    pub name: String,
+    pub state: ScanState,
+    pub created_at: i64,
+    pub attempt_id: Option<String>,
+    pub report: Option<DvdScanReport>,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ScanJobs {
+    pub jobs: Vec<ScanJob>,
 }
 
 #[derive(Debug, thiserror::Error, Eq, PartialEq)]

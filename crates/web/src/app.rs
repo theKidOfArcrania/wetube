@@ -1,15 +1,17 @@
 use gloo_net::http::{Request, Response};
 use leptos::{prelude::*, task::spawn_local};
 use serde::de::DeserializeOwned;
+use std::collections::HashMap;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
 use std::{cell::RefCell, rc::Rc};
 use wetube_core::{
-    ApiError, DiagnosticJob, IncomingFiles, JobState, Library, LoginRequest, Movie, MovieDetails,
-    PlaybackProgress, ProbeJob, ProbeRequest, ProbeState, Role, Session, SystemStatus,
-    UpdatePlaybackProgress,
+    ApiError, ConversionJob, ConversionJobs, ConversionRequest, ConversionState, DiagnosticJob,
+    DiagnosticReport, IncomingFiles, InspectRequest, JobState, Library, LoginRequest, Movie,
+    MovieDetails, PlaybackProgress, ProbeJob, ProbeState, PublishRequest, Role, ScanJob, ScanJobs,
+    ScanRequest, ScanState, Session, SystemStatus, UpdatePlaybackProgress, VideoTreatment,
 };
 
 async fn decode<T: DeserializeOwned>(response: Response) -> Result<T, String> {
@@ -29,6 +31,90 @@ async fn get<T: DeserializeOwned>(path: &str) -> Result<T, String> {
         .await
         .map_err(|error| error.to_string())?;
     decode(response).await
+}
+
+#[derive(Default)]
+struct AdminRequests {
+    closed: bool,
+    next_id: usize,
+    controllers: HashMap<usize, web_sys::AbortController>,
+}
+
+type AdminScope = StoredValue<Rc<RefCell<AdminRequests>>, LocalStorage>;
+
+fn admin_scope() -> AdminScope {
+    let scope = StoredValue::new_local(Rc::new(RefCell::new(AdminRequests::default())));
+    on_cleanup(move || {
+        let requests = scope.get_value();
+        let mut requests = requests.borrow_mut();
+        requests.closed = true;
+        for controller in requests.controllers.values() {
+            controller.abort();
+        }
+        requests.controllers.clear();
+    });
+    scope
+}
+
+async fn admin_request<T: DeserializeOwned>(
+    scope: AdminScope,
+    build: impl FnOnce(&web_sys::AbortSignal) -> Result<Request, String>,
+) -> Result<T, String> {
+    let requests = scope
+        .try_get_value()
+        .ok_or_else(|| "This page is no longer active.".to_owned())?;
+    let controller = web_sys::AbortController::new()
+        .map_err(|_| "This browser cannot initialize cancellable requests.".to_owned())?;
+    let id = {
+        let mut requests = requests.borrow_mut();
+        if requests.closed {
+            return Err("This page is no longer active.".into());
+        }
+        let id = requests.next_id;
+        requests.next_id += 1;
+        requests.controllers.insert(id, controller.clone());
+        id
+    };
+    let deadline_controller = controller.clone();
+    let deadline = gloo_timers::callback::Timeout::new(20_000, move || {
+        deadline_controller.abort();
+    });
+    let result = async {
+        let response = build(&controller.signal())?.send().await.map_err(|_| {
+            "Request interrupted or timed out. Refresh job status before retrying.".to_owned()
+        })?;
+        decode(response).await
+    }
+    .await;
+    drop(deadline);
+    requests.borrow_mut().controllers.remove(&id);
+    result
+}
+
+async fn admin_get<T: DeserializeOwned>(scope: AdminScope, path: &str) -> Result<T, String> {
+    admin_request(scope, |signal| {
+        Request::get(path)
+            .abort_signal(Some(signal))
+            .build()
+            .map_err(|error| error.to_string())
+    })
+    .await
+}
+
+async fn admin_post<T: DeserializeOwned>(
+    scope: AdminScope,
+    path: &str,
+    csrf: &str,
+    body: &impl serde::Serialize,
+) -> Result<T, String> {
+    admin_request(scope, |signal| {
+        Request::post(path)
+            .header("x-csrf-token", csrf)
+            .abort_signal(Some(signal))
+            .json(body)
+            .map_err(|error| error.to_string())
+    })
+    .await
 }
 
 #[component]
@@ -129,6 +215,13 @@ fn LibraryPage(current: Session, session: RwSignal<Option<Session>>) -> impl Int
     let loading = RwSignal::new(true);
     let signing_out = RwSignal::new(false);
     let playback_notice = RwSignal::new(None::<String>);
+    let playback_owner = Owner::current().expect("LibraryPage must have a reactive owner");
+    let watch_movie = Callback::new(move |movie: Movie| {
+        playback_owner.with(|| {
+            playback_notice.set(None);
+            selected.set(Some(movie));
+        });
+    });
     let status = RwSignal::new(None::<SystemStatus>);
     let jobs = RwSignal::new(Vec::<DiagnosticJob>::new());
     let error = RwSignal::new(None::<String>);
@@ -226,14 +319,17 @@ fn LibraryPage(current: Session, session: RwSignal<Option<Session>>) -> impl Int
         <p class="eyebrow">"The beginning of your collection"</p>
         <h1>"Movie night starts here."</h1>
         <p class="notice">
-            "Local experimental website preview: operator-admitted H.264/AAC movies can play.
-             Production DVD conversion and ISO deletion remain off. Your original files are never modified.
-             Audio-track selection and OCR captions are future work."
+            "Local experimental website preview: reviewed DVD conversions can be explicitly published
+             for H.264/AAC playback. This is not an approved production conversion profile.
+             Original ISOs and original tracks are retained. Audio-track selection, image-subtitle
+             playback and OCR captions remain pending; source deletion is never enabled."
         </p>
-        {move || selected.get().map(|movie| view! {
-            <MoviePlayer movie=movie csrf=csrf selected=selected playback_notice=playback_notice/>
-        })}
-        <Show when=move || selected.get().is_none()>
+        <For each={move || selected.get().into_iter().collect::<Vec<_>>()}
+            key=|movie| movie.id.clone()
+            children=move |movie| view! {
+                <MoviePlayer movie=movie csrf=csrf selected=selected playback_notice=playback_notice/>
+            }/>
+        <Show when=move || selected.get().is_none() && !signing_out.get()>
         {move || playback_notice.get().map(|message| view! { <p role="alert" class="error">{message}</p> })}
         <div class="toolbar">
             <h2>"Your library"</h2>
@@ -254,7 +350,7 @@ fn LibraryPage(current: Session, session: RwSignal<Option<Session>>) -> impl Int
                         <h2>{if needle.is_empty() { "A home for your DVD collection" } else { "No matching movies" }}</h2>
                         <p class="subtle">
                             {if needle.is_empty() {
-                                "No movies have been admitted for this local preview. An operator must validate and admit experimental media before it appears here."
+                                "No movies are published yet. An administrator must inspect, convert, validate and explicitly publish a movie before it appears here."
                             } else {
                                 "Try a different title or description."
                             }}
@@ -273,8 +369,7 @@ fn LibraryPage(current: Session, session: RwSignal<Option<Session>>) -> impl Int
                                 <small>{movie.year.map(|year| year.to_string())}</small>
                                 <p>{movie.description}</p>
                                 <button on:click=move |_| {
-                                    playback_notice.set(None);
-                                    selected.set(Some(chosen.clone()));
+                                    watch_movie.run(chosen.clone());
                                 }
                                     disabled=move || signing_out.get()>{watch_label}</button>
                             </article>
@@ -302,31 +397,32 @@ fn LibraryPage(current: Session, session: RwSignal<Option<Session>>) -> impl Int
                         "Run read-only diagnostics"
                     </button>
                 </div>
-                <p class="subtle">"Checks installed DVD and OCR tools. No ISO is opened, converted, or deleted."</p>
+                <p class="subtle">"Read-only capability checks: DVD discovery is required for title scanning;
+                    FFmpeg, ffprobe and DVD-Video support are required for conversion.
+                    Discovery uses the installed DVD library, with lsdvd only an optional fallback.
+                    OCR is optional and does not block current conversion or playback.
+                    No ISO is opened, converted or deleted; captions remain pending."</p>
                 <For each={move || jobs.get().into_iter().take(4).collect::<Vec<_>>()}
                     key=|job| (job.id.clone(), job.state)
                     children=|job| {
                         let label = match job.state {
                             JobState::Queued => "Queued",
                             JobState::Running => "Checking media tools",
-                            JobState::Succeeded => "Media prerequisites available",
-                            JobState::Failed => "Media prerequisites need attention",
+                            JobState::Succeeded => "Diagnostic checks completed",
+                            JobState::Failed => "Diagnostic checks need review — see individual capabilities",
                         };
                         view! {
                             <article class="job">
                                 <strong>{label}</strong>
                                 {job.error.map(|message| view! { <p class="error">{message}</p> })}
-                                {job.report.map(|report| report.tools.into_iter().map(|tool| view! {
-                                    <div class="tool" class:available=tool.available>
-                                        <strong>{tool.name}</strong>
-                                        <span>{tool.detail}</span>
-                                    </div>
-                                }).collect_view())}
+                                {job.report.map(diagnostic_capabilities)}
                             </article>
                         }
                     }/>
             </section>
-            <ImportsPanel csrf=csrf/>
+            <Show when=move || selected.get().is_none() && !signing_out.get()>
+                <ImportsPanel csrf=csrf movies=movies watch_movie=watch_movie/>
+            </Show>
         })}
     }
 }
@@ -346,6 +442,63 @@ struct ProgressWriter {
     navigation_error: RwSignal<Option<String>>,
     saved: RwSignal<Option<f64>>,
     selected: RwSignal<Option<Movie>>,
+}
+
+fn diagnostic_capabilities(report: DiagnosticReport) -> AnyView {
+    let required_ready = report.required_tools_available();
+    let scanner = report
+        .tools
+        .iter()
+        .find(|tool| tool.name == "DVD discovery");
+    let scan_status = match scanner {
+        Some(tool) if tool.available => "DVD title discovery capability available.",
+        Some(_) => {
+            "DVD title discovery unavailable. Review the installed DVD library or optional scanner capability below."
+        }
+        None => {
+            "Integrated DVD discovery was not checked by this report. Run updated read-only diagnostics."
+        }
+    };
+    let conversion_ready = ["ffmpeg", "ffprobe", "dvdvideo"].iter().all(|name| {
+        report
+            .tools
+            .iter()
+            .any(|tool| tool.name == *name && tool.available)
+    });
+    let tools = report
+        .tools
+        .into_iter()
+        .map(|tool| {
+            let capability = match tool.name.as_str() {
+                "DVD discovery" => "Required for DVD title discovery",
+                "lsdvd" => "Optional DVD discovery fallback — not required when the DVD library is available",
+                "ffmpeg" | "ffprobe" | "dvdvideo" => "Required for DVD inspection and conversion",
+                "tesseract" | "English OCR" => {
+                    "Optional OCR — not needed for current conversion/playback"
+                }
+                _ => "Additional capability",
+            };
+            view! {
+                <div class="tool" class:available=tool.available>
+                    <strong>{tool.name}</strong>
+                    <span>{capability}": "{if tool.available { "available" } else { "unavailable" }}
+                        <br/>{tool.detail}</span>
+                </div>
+            }
+        })
+        .collect_view();
+    view! {
+        <p class="notice">{scan_status}</p>
+        {required_ready.then(|| view! {
+            <p class="subtle">"Required scan, inspection and conversion capabilities available. Optional OCR does not determine readiness."</p>
+        })}
+        <p class="subtle">{if conversion_ready {
+            "Required DVD conversion tools available. This is not conversion validation or production approval."
+        } else {
+            "Required DVD conversion tools are missing or not checked. Review FFmpeg, ffprobe and DVD-Video capabilities below."
+        }}</p>
+        {tools}
+    }.into_any()
 }
 
 fn queue_progress(writer: Rc<RefCell<ProgressWriter>>, position: f64, force: bool, close: bool) {
@@ -657,16 +810,24 @@ fn MoviePlayer(
 }
 
 #[component]
-fn ImportsPanel(csrf: StoredValue<String>) -> impl IntoView {
+fn ImportsPanel(
+    csrf: StoredValue<String>,
+    movies: RwSignal<Vec<Movie>>,
+    watch_movie: Callback<Movie>,
+) -> impl IntoView {
     let incoming = RwSignal::new(None::<IncomingFiles>);
     let jobs = RwSignal::new(Vec::<ProbeJob>::new());
+    let scans = RwSignal::new(Vec::<ScanJob>::new());
+    let conversions = RwSignal::new(Vec::<ConversionJob>::new());
     let selected = RwSignal::new(String::new());
-    let title = RwSignal::new(String::new());
-    let angle = RwSignal::new("1".to_owned());
     let copy_complete = RwSignal::new(false);
     let refreshing = RwSignal::new(false);
     let requesting = RwSignal::new(false);
     let error = RwSignal::new(None::<String>);
+    let probe_error = RwSignal::new(None::<String>);
+    let scan_error = RwSignal::new(None::<String>);
+    let conversion_error = RwSignal::new(None::<String>);
+    let scope = admin_scope();
     let mounted = Arc::new(AtomicBool::new(true));
     let cleanup = mounted.clone();
     on_cleanup(move || cleanup.store(false, Ordering::Relaxed));
@@ -680,7 +841,7 @@ fn ImportsPanel(csrf: StoredValue<String>) -> impl IntoView {
         copy_complete.set(false);
         error.set(None);
         spawn_local(async move {
-            let result = get::<IncomingFiles>("/api/v1/admin/incoming").await;
+            let result = admin_get::<IncomingFiles>(scope, "/api/v1/admin/incoming").await;
             if refreshing.try_update(|busy| *busy = false).is_none() {
                 return;
             }
@@ -693,13 +854,38 @@ fn ImportsPanel(csrf: StoredValue<String>) -> impl IntoView {
     refresh();
     spawn_local(async move {
         while mounted.load(Ordering::Relaxed) {
-            let result = get::<Vec<ProbeJob>>("/api/v1/admin/probes").await;
+            let result = admin_get::<ScanJobs>(scope, "/api/v1/admin/scans").await;
             if !mounted.load(Ordering::Relaxed) {
                 break;
             }
             match result {
-                Ok(history) => jobs.set(history),
-                Err(message) => error.set(Some(message)),
+                Ok(history) => {
+                    scans.set(history.jobs);
+                    scan_error.set(None);
+                }
+                Err(message) => scan_error.set(Some(message)),
+            }
+            let result = admin_get::<Vec<ProbeJob>>(scope, "/api/v1/admin/probes").await;
+            if !mounted.load(Ordering::Relaxed) {
+                break;
+            }
+            match result {
+                Ok(history) => {
+                    jobs.set(history);
+                    probe_error.set(None);
+                }
+                Err(message) => probe_error.set(Some(message)),
+            }
+            let result = admin_get::<ConversionJobs>(scope, "/api/v1/admin/conversions").await;
+            if !mounted.load(Ordering::Relaxed) {
+                break;
+            }
+            match result {
+                Ok(history) => {
+                    conversions.set(history.jobs);
+                    conversion_error.set(None);
+                }
+                Err(message) => conversion_error.set(Some(message)),
             }
             gloo_timers::future::TimeoutFuture::new(5000).await;
         }
@@ -715,44 +901,35 @@ fn ImportsPanel(csrf: StoredValue<String>) -> impl IntoView {
                 .into_iter()
                 .find(|file| file.name == selected.get_untracked())
         });
-        let (Some(file), Ok(title), Ok(angle)) = (
-            file,
-            title.get_untracked().parse::<u8>(),
-            angle.get_untracked().parse::<u8>(),
-        ) else {
-            error.set(Some("Select an ISO and a valid title/angle first.".into()));
+        let Some(file) = file else {
+            error.set(Some("Select a completed ISO copy first.".into()));
             return;
         };
-        let request = ProbeRequest {
+        if !copy_complete.get_untracked() {
+            error.set(Some(
+                "Confirm the ISO copy is finished before scanning.".into(),
+            ));
+            return;
+        }
+        let request = ScanRequest {
             name: file.name,
             identity: file.identity,
-            title,
-            angle,
             copy_complete: copy_complete.get_untracked(),
         };
         let token = csrf.get_value();
         requesting.set(true);
         error.set(None);
         spawn_local(async move {
-            let result = async {
-                let response = Request::post("/api/v1/admin/probes")
-                    .header("x-csrf-token", &token)
-                    .json(&request)
-                    .map_err(|error| error.to_string())?
-                    .send()
-                    .await
-                    .map_err(|error| error.to_string())?;
-                decode::<ProbeJob>(response).await
-            }
-            .await;
+            let result =
+                admin_post::<ScanJob>(scope, "/api/v1/admin/scans", &token, &request).await;
             if requesting.try_update(|busy| *busy = false).is_none() {
                 return;
             }
             copy_complete.set(false);
             match result {
-                Ok(job) => jobs.update(|jobs| {
-                    jobs.retain(|existing| existing.id != job.id);
-                    jobs.insert(0, job);
+                Ok(job) => scans.update(|scans| {
+                    scans.retain(|existing| existing.id != job.id);
+                    scans.insert(0, job);
                 }),
                 Err(message) => error.set(Some(message)),
             }
@@ -762,22 +939,23 @@ fn ImportsPanel(csrf: StoredValue<String>) -> impl IntoView {
     view! {
         <section class="panel">
             <div class="toolbar">
-                <h2>"Inspect an incoming DVD copy"</h2>
+                <h2>"Scan an incoming DVD copy"</h2>
                 <button class="secondary" on:click=move |_| refresh()
                     disabled=move || refreshing.get() || requesting.get()>
                     "Refresh incoming files"
                 </button>
             </div>
             <p class="notice">
-                "Inspection only: the worker keeps a private, checksum-verified copy.
-                 Nothing is converted, published, or deleted. Title selection is manual."
+                "First scan: the worker stages and checksum-verifies a private copy, then discovers
+                 the actual DVD titles and available angles. Choose a program from the scan before
+                 inspection. Scanning does not convert, publish or delete anything."
             </p>
             {move || incoming.get().map(|list| if !list.configured {
-                view! { <p class="subtle">"Incoming inspection is disabled. Configure the incoming root on the server and incoming/private scratch roots on the worker."</p> }.into_any()
+                view! { <p class="subtle">"Incoming DVD scanning is disabled. An operator must configure the completed-copy source and private worker staging."</p> }.into_any()
             } else if list.files.is_empty() {
                 view! { <p class="subtle">"No readable, non-empty ISO files in the incoming root. Finish copying, then refresh."</p> }.into_any()
             } else {
-                view! { <p class="subtle">"Use finished copies only, never the original archive. Both processes must use the same incoming directory; jobs wait if the worker has no staging configuration."</p> }.into_any()
+                view! { <p class="subtle">"Use finished incoming copies only, never the original archive. Scans wait for a connected, configured worker."</p> }.into_any()
             })}
             <form on:submit=submit>
                 <label for="incoming-iso">"Completed ISO copy"</label>
@@ -796,16 +974,6 @@ fn ImportsPanel(csrf: StoredValue<String>) -> impl IntoView {
                             view! { <option value=file.name>{label}</option> }
                         }/>
                 </select>
-                <div class="probe-options">
-                    <div>
-                        <label for="dvd-title">"DVD title (1-99)"</label>
-                        <input id="dvd-title" type="number" min="1" max="99" required bind:value=title/>
-                    </div>
-                    <div>
-                        <label for="dvd-angle">"Angle (1-9)"</label>
-                        <input id="dvd-angle" type="number" min="1" max="9" required bind:value=angle/>
-                    </div>
-                </div>
                 <label class="confirmation">
                     <input type="checkbox" required prop:checked=move || copy_complete.get()
                         on:change=move |event| copy_complete.set(event_target_checked(&event))/>
@@ -814,14 +982,20 @@ fn ImportsPanel(csrf: StoredValue<String>) -> impl IntoView {
                 <p class="subtle">"Acknowledgement is not proof of writer exclusion and never authorizes source deletion."</p>
                 <button type="submit" disabled=move || requesting.get() || refreshing.get()
                     || !copy_complete.get() || selected.get().is_empty()
-                    || jobs.get().iter().any(|job| matches!(job.state, ProbeState::Queued | ProbeState::Staging | ProbeState::Probing))>
-                    {move || if requesting.get() { "Queueing..." } else { "Stage and inspect selected title" }}
+                    || scans.get().iter().any(|job| matches!(job.state, ScanState::Queued | ScanState::Staging | ScanState::Scanning))>
+                    {move || if requesting.get() { "Queueing scan..." } else { "Scan DVD" }}
                 </button>
             </form>
             {move || error.get().map(|message| view! { <p role="alert" class="error">{message}</p> })}
+            <h2>"DVD scan history"</h2>
+            {move || scan_error.get().map(|message| view! { <p role="alert" class="error">"Could not refresh DVD scans: "{message}</p> })}
+            <For each={move || scans.get().into_iter().map(|scan| scan.id).collect::<Vec<_>>()}
+                key=|id| id.clone()
+                children=move |id| view! { <ScanSelection id=id csrf=csrf scans=scans probes=jobs/> }/>
             <h2>"Inspection history"</h2>
+            {move || probe_error.get().map(|message| view! { <p role="alert" class="error">"Could not refresh inspection jobs: "{message}</p> })}
             <For each=move || jobs.get() key=|job| (job.id.clone(), job.state)
-                children=|job| {
+                children=move |job| {
                     let label = match job.state {
                         ProbeState::Queued => "Queued",
                         ProbeState::Staging => "Copying and verifying private input",
@@ -830,10 +1004,13 @@ fn ImportsPanel(csrf: StoredValue<String>) -> impl IntoView {
                         ProbeState::Failed => "Failed - inputs retained",
                     };
                     view! {
-                        <article class="job">
+                        <article class="job" data-testid="probe-job" data-job-id=job.id.clone()>
                             <h3 class="inspection-source">"Source: "{job.name.clone()}</h3>
                             <p class="inspection-state">{label}</p>
                             {inspection_summary(&job)}
+                            {(job.state == ProbeState::NeedsReview).then(|| view! {
+                                <ProbeConversion probe_id=job.id.clone() csrf=csrf conversions=conversions/>
+                            })}
                             {job.attempt_id.map(|attempt| view! { <p class="attempt">"Attempt: "{attempt}</p> })}
                             {job.error.map(|message| view! { <p class="error">{message}</p> })}
                             {job.report.map(|report| view! {
@@ -846,7 +1023,609 @@ fn ImportsPanel(csrf: StoredValue<String>) -> impl IntoView {
                     }
                 }/>
             <p class="subtle">"All attempts, including failed/interrupted ones, count against scratch limits and require operator review. No automatic cleanup is enabled."</p>
+            <h2>"Conversion and publication history"</h2>
+            <p class="notice">"Conversion can take a long time. Inputs, reports and logs are retained on failure.
+                A validated conversion still needs metadata review and your deliberate publication confirmation."</p>
+            {move || conversion_error.get().map(|message| view! { <p role="alert" class="error">"Could not refresh conversions: "{message}</p> })}
+            <For each={move || conversions.get().into_iter().map(|job| job.id).collect::<Vec<_>>()}
+                key=|id| id.clone()
+                children=move |id| view! {
+                    <ConversionReview id=id csrf=csrf jobs=conversions movies=movies
+                        watch_movie=watch_movie/>
+                }/>
         </section>
+    }
+}
+
+fn scan_title_label(title: &wetube_core::DvdTitle) -> String {
+    let duration = if title.duration_seconds.is_finite() && title.duration_seconds >= 0.0 {
+        let seconds = title.duration_seconds.round() as u64;
+        format!(
+            "{}:{:02}:{:02}",
+            seconds / 3600,
+            seconds / 60 % 60,
+            seconds % 60
+        )
+    } else {
+        "duration unavailable".into()
+    };
+    format!(
+        "Title {} — {} · {} chapters{}",
+        title.title,
+        duration,
+        title.chapter_count,
+        if title.main_feature_candidate {
+            " · longest-title candidate"
+        } else {
+            ""
+        },
+    )
+}
+
+#[component]
+fn ScanSelection(
+    id: String,
+    csrf: StoredValue<String>,
+    scans: RwSignal<Vec<ScanJob>>,
+    probes: RwSignal<Vec<ProbeJob>>,
+) -> impl IntoView {
+    let id = StoredValue::new(id);
+    let scan = Signal::derive(move || {
+        scans
+            .get()
+            .into_iter()
+            .find(|scan| scan.id == id.get_value())
+    });
+    let title = RwSignal::new(String::new());
+    let angle = RwSignal::new(String::new());
+    let selected_title = Signal::derive(move || {
+        let title = title.get().parse::<u8>().ok()?;
+        scan.get()?
+            .report?
+            .titles
+            .into_iter()
+            .find(|candidate| candidate.title == title)
+    });
+    let busy = RwSignal::new(false);
+    let queued = RwSignal::new(None::<String>);
+    let error = RwSignal::new(None::<String>);
+    let scope = admin_scope();
+    let ready = move || {
+        scan.get()
+            .is_some_and(|scan| scan.state == ScanState::NeedsReview)
+    };
+    let valid_selection = move || {
+        selected_title.get().is_some_and(|title| {
+            angle
+                .get()
+                .parse::<u8>()
+                .ok()
+                .is_some_and(|angle| title.angles.contains(&angle))
+        })
+    };
+    let submit = move |event: web_sys::SubmitEvent| {
+        event.prevent_default();
+        if busy.get_untracked() || queued.get_untracked().is_some() || !ready() {
+            return;
+        }
+        let (Some(selected), Ok(angle)) = (
+            selected_title.get_untracked(),
+            angle.get_untracked().parse::<u8>(),
+        ) else {
+            error.set(Some(
+                "Choose a scanned title and one of its available angles.".into(),
+            ));
+            return;
+        };
+        if !selected.angles.contains(&angle) {
+            error.set(Some(
+                "This angle is not available for the scanned title.".into(),
+            ));
+            return;
+        }
+        let request = InspectRequest {
+            title: selected.title,
+            angle,
+        };
+        let url = format!(
+            "/api/v1/admin/scans/{}/inspect",
+            js_sys::encode_uri_component(&id.get_value())
+                .as_string()
+                .unwrap_or_default()
+        );
+        busy.set(true);
+        error.set(None);
+        spawn_local(async move {
+            let result = admin_post::<ProbeJob>(scope, &url, &csrf.get_value(), &request).await;
+            if busy.try_update(|busy| *busy = false).is_none() {
+                return;
+            }
+            match result {
+                Ok(job) => {
+                    queued.set(Some(job.id.clone()));
+                    probes.update(|probes| {
+                        probes.retain(|existing| existing.id != job.id);
+                        probes.insert(0, job);
+                    });
+                }
+                Err(message) => error.set(Some(message)),
+            }
+        });
+    };
+    view! {
+        <article class="job scan-job" data-testid="scan-job" data-job-id=id.get_value()>
+            {move || scan.get().map(|scan| {
+                let label = match scan.state {
+                    ScanState::Queued => "Scan queued — waiting for worker",
+                    ScanState::Staging => "Staging and checksum-verifying the ISO — this may take a while",
+                    ScanState::Scanning => "Scanning actual DVD titles and angles",
+                    ScanState::NeedsReview => "Scan complete — select a title for inspection",
+                    ScanState::Failed => "Scan failed — ISO, reports and logs retained",
+                };
+                view! {
+                    <h3 class="inspection-source">"Source: "{scan.name}</h3>
+                    <p class="inspection-state" role="status">{label}</p>
+                    <p class="attempt">"Scan job: "{scan.id}</p>
+                    {scan.attempt_id.map(|attempt| view! { <p class="attempt">"Attempt: "{attempt}</p> })}
+                    {scan.error.map(|message| view! { <p role="alert" class="error">{message}</p> })}
+                }
+            })}
+            <Show when=ready>
+                <p class="field-help">"A DVD title is a numbered video program, not the movie name.
+                    Features, trailers and extras can be separate titles; title 1 is not always the main feature.
+                    The longest title is only a main-feature candidate — review before choosing."</p>
+                <Show when=move || scan.get().and_then(|scan| scan.report).is_none_or(|report| report.titles.is_empty())>
+                    <p class="error">"No usable title inventory is available. Inspection is disabled; review the scan error or retry scanning."</p>
+                </Show>
+                <form on:submit=submit>
+                    <label>
+                        "DVD title"
+                        <select required prop:value=move || title.get()
+                            disabled=move || busy.get()
+                            on:change=move |event| {
+                                title.set(event_target_value(&event));
+                                let angles = selected_title.get_untracked().map(|title| title.angles).unwrap_or_default();
+                                angle.set(if angles.len() == 1 { angles[0].to_string() } else { String::new() });
+                                queued.set(None);
+                                error.set(None);
+                            }>
+                            <option value="">"Choose a scanned title..."</option>
+                            <For each=move || scan.get().and_then(|scan| scan.report).map(|report| report.titles).unwrap_or_default()
+                                key=|title| title.title
+                                children=|title| {
+                                    let label = scan_title_label(&title);
+                                    view! { <option value=title.title.to_string()>{label}</option> }
+                                }/>
+                        </select>
+                    </label>
+                    {move || selected_title.get().map(|title| {
+                        let languages = |languages: Vec<String>| if languages.is_empty() {
+                            "not reported".to_owned()
+                        } else { languages.join(", ") };
+                        view! {
+                            <p class="field-help">{format!(
+                                "{} audio tracks ({}) · {} subtitle tracks ({})",
+                                title.audio_count, languages(title.audio_languages),
+                                title.subtitle_count, languages(title.subtitle_languages),
+                            )}</p>
+                            {(title.angles.len() == 1).then(|| view! {
+                                <p class="field-help">{format!("Single available angle: {}. No alternate-angle choice is needed.", title.angles[0])}</p>
+                            })}
+                            {title.angles.is_empty().then(|| view! {
+                                <p class="error">"No valid angles were reported for this title. Inspection is disabled."</p>
+                            })}
+                        }
+                    })}
+                    <Show when=move || selected_title.get().is_some_and(|title| title.angles.len() > 1)>
+                        <label>
+                            "DVD angle"
+                            <select required prop:value=move || angle.get() disabled=move || busy.get()
+                                on:change=move |event| {
+                                    angle.set(event_target_value(&event));
+                                    queued.set(None);
+                                    error.set(None);
+                                }>
+                                <option value="">"Choose an available angle..."</option>
+                                <For each=move || selected_title.get().map(|title| title.angles).unwrap_or_default()
+                                    key=|angle| *angle
+                                    children=|angle| view! { <option value=angle.to_string()>{format!("Angle {angle}")}</option> }/>
+                            </select>
+                        </label>
+                        <p class="field-help">"Angles are alternate camera views on supported discs. Normally choose angle 1 when it is available."</p>
+                    </Show>
+                    <p class="subtle">"Inspection reuses this scan's checksum-verified staged ISO; it does not copy from the NAS again."</p>
+                    <button type="submit" disabled=move || busy.get() || queued.get().is_some() || !valid_selection()>
+                        {move || if busy.get() { "Queueing inspection..." } else { "Inspect selected title" }}
+                    </button>
+                </form>
+                {move || queued.get().map(|id| view! { <p role="status" class="subtle">"Inspection queued: "{id}". Review its report below before conversion."</p> })}
+            </Show>
+            {move || error.get().map(|message| view! { <p role="alert" class="error">{message}</p> })}
+        </article>
+    }
+}
+
+fn update_conversion(jobs: RwSignal<Vec<ConversionJob>>, job: ConversionJob) {
+    jobs.update(|jobs| {
+        if let Some(existing) = jobs.iter_mut().find(|existing| existing.id == job.id) {
+            *existing = job;
+        } else {
+            jobs.insert(0, job);
+        }
+    });
+}
+
+#[component]
+fn ProbeConversion(
+    probe_id: String,
+    csrf: StoredValue<String>,
+    conversions: RwSignal<Vec<ConversionJob>>,
+) -> impl IntoView {
+    let probe_id = StoredValue::new(probe_id);
+    let treatment = RwSignal::new(String::new());
+    let reviewed = RwSignal::new(false);
+    let busy = RwSignal::new(false);
+    let submitted = RwSignal::new(false);
+    let error = RwSignal::new(None::<String>);
+    let scope = admin_scope();
+    let existing = move || {
+        conversions.get().iter().any(|job| {
+            job.probe_job_id == probe_id.get_value() && job.state != ConversionState::Failed
+        })
+    };
+    let submit = move |event: web_sys::SubmitEvent| {
+        event.prevent_default();
+        if busy.get_untracked() || submitted.get_untracked() || existing() {
+            return;
+        }
+        let video_treatment = match treatment.get_untracked().as_str() {
+            "preserve" => VideoTreatment::Preserve,
+            "yadif" => VideoTreatment::Yadif,
+            _ => {
+                error.set(Some("Select a video treatment explicitly.".into()));
+                return;
+            }
+        };
+        if !reviewed.get_untracked() {
+            error.set(Some(
+                "Review the inspection, warnings and selected video treatment first.".into(),
+            ));
+            return;
+        }
+        busy.set(true);
+        error.set(None);
+        let request = ConversionRequest {
+            probe_job_id: probe_id.get_value(),
+            video_treatment,
+        };
+        spawn_local(async move {
+            let result = admin_post::<ConversionJob>(
+                scope,
+                "/api/v1/admin/conversions",
+                &csrf.get_value(),
+                &request,
+            )
+            .await;
+            if busy.try_update(|busy| *busy = false).is_none() {
+                return;
+            }
+            match result {
+                Ok(job) => {
+                    submitted.set(true);
+                    update_conversion(conversions, job);
+                }
+                Err(message) => error.set(Some(message)),
+            }
+        });
+    };
+    view! {
+        <div class="conversion-controls">
+            <h4>"Review before conversion"</h4>
+            <p class="notice">"Review the selected program, duration, field order and all warnings above.
+                Neither treatment is an approved production profile. Original tracks are retained,
+                but image subtitles are not playable captions and no OCR captions are produced."</p>
+            <form on:submit=submit>
+                <label>
+                    "Video treatment"
+                    <select required prop:value=move || treatment.get()
+                        disabled=move || busy.get() || submitted.get() || existing()
+                        on:change=move |event| {
+                            treatment.set(event_target_value(&event));
+                            reviewed.set(false);
+                        }>
+                        <option value="">"Choose a treatment..."</option>
+                        <option value="preserve">"Preserve — no deinterlacing filter"</option>
+                        <option value="yadif">"Yadif — apply deinterlacing"</option>
+                    </select>
+                </label>
+                <p class="field-help">"Preserve does not mean lossless or bit-for-bit video copying.
+                    Yadif changes the video; review whether deinterlacing is appropriate for this title."</p>
+                <label class="confirmation">
+                    <input type="checkbox" required prop:checked=move || reviewed.get()
+                        disabled=move || busy.get() || submitted.get() || existing()
+                        on:change=move |event| reviewed.set(event_target_checked(&event))/>
+                    "I reviewed this inspection and warnings, and explicitly chose this experimental treatment."
+                </label>
+                <button type="submit" disabled=move || busy.get() || submitted.get() || existing()
+                    || !reviewed.get() || treatment.get().is_empty()>
+                    {move || if busy.get() { "Queueing conversion..." } else { "Convert reviewed title" }}
+                </button>
+            </form>
+            {move || (submitted.get() || existing()).then(|| view! {
+                <p role="status" class="subtle">"Conversion queued or already exists. Follow its job below; publication is a separate step."</p>
+            })}
+            {move || error.get().map(|message| view! { <p role="alert" class="error">{message}</p> })}
+        </div>
+    }
+}
+
+fn validated_hash(job: &ConversionJob) -> Option<String> {
+    job.movie_sha256
+        .as_ref()
+        .filter(|hash| hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .cloned()
+}
+
+fn publication_metadata(
+    title: String,
+    year: String,
+    description: String,
+) -> Result<(String, Option<i32>, String), String> {
+    let title = title.trim().to_owned();
+    if title.is_empty() || title.len() > 512 {
+        return Err("Enter a nonempty movie title of at most 512 UTF-8 bytes.".into());
+    }
+    let year = if year.trim().is_empty() {
+        None
+    } else {
+        Some(
+            year.trim()
+                .parse::<i32>()
+                .map_err(|_| "Enter a valid year, or leave it blank.".to_owned())?,
+        )
+    };
+    if year.is_some_and(|year| !(1888..=2100).contains(&year)) {
+        return Err("Year must be between 1888 and 2100, or left blank.".into());
+    }
+    let description = description.trim().to_owned();
+    if description.len() > 16384 {
+        return Err("Description must be no longer than 16384 UTF-8 bytes.".into());
+    }
+    Ok((title, year, description))
+}
+
+#[component]
+fn ConversionReview(
+    id: String,
+    csrf: StoredValue<String>,
+    jobs: RwSignal<Vec<ConversionJob>>,
+    movies: RwSignal<Vec<Movie>>,
+    watch_movie: Callback<Movie>,
+) -> impl IntoView {
+    let id = StoredValue::new(id);
+    let job = Signal::derive(move || jobs.get().into_iter().find(|job| job.id == id.get_value()));
+    let title = RwSignal::new(String::new());
+    let year = RwSignal::new(String::new());
+    let description = RwSignal::new(String::new());
+    let confirmed = RwSignal::new(false);
+    let busy = RwSignal::new(false);
+    let submitted = RwSignal::new(false);
+    let watching = RwSignal::new(false);
+    let error = RwSignal::new(None::<String>);
+    let scope = admin_scope();
+    let ready = move || {
+        job.get().is_some_and(|job| {
+            job.state == ConversionState::NeedsReview && validated_hash(&job).is_some()
+        })
+    };
+    let can_publish = move || {
+        ready()
+            && confirmed.get()
+            && !busy.get()
+            && !submitted.get()
+            && publication_metadata(title.get(), year.get(), description.get()).is_ok()
+    };
+    Effect::new(move |previous: Option<Option<String>>| {
+        let hash = job.get().and_then(|job| validated_hash(&job));
+        if previous.as_ref() != Some(&hash) {
+            confirmed.set(false);
+        }
+        hash
+    });
+    let publish = move |event: web_sys::SubmitEvent| {
+        event.prevent_default();
+        if busy.get_untracked() || submitted.get_untracked() {
+            return;
+        }
+        let Some(current) = job.get_untracked() else {
+            return;
+        };
+        let Some(movie_sha256) = validated_hash(&current) else {
+            error.set(Some(
+                "This job has no validated movie digest and cannot be published.".into(),
+            ));
+            return;
+        };
+        if current.state != ConversionState::NeedsReview || !confirmed.get_untracked() {
+            error.set(Some(
+                "Review a validated conversion and deliberately confirm publication first.".into(),
+            ));
+            return;
+        }
+        let (title, year, description) = match publication_metadata(
+            title.get_untracked(),
+            year.get_untracked(),
+            description.get_untracked(),
+        ) {
+            Ok(metadata) => metadata,
+            Err(message) => {
+                error.set(Some(message));
+                return;
+            }
+        };
+        let request = PublishRequest {
+            title,
+            year,
+            description,
+            movie_sha256,
+            confirm: true,
+        };
+        let url = format!(
+            "/api/v1/admin/conversions/{}/publish",
+            js_sys::encode_uri_component(&current.id)
+                .as_string()
+                .unwrap_or_default()
+        );
+        busy.set(true);
+        error.set(None);
+        spawn_local(async move {
+            let result =
+                admin_post::<ConversionJob>(scope, &url, &csrf.get_value(), &request).await;
+            if busy.try_update(|busy| *busy = false).is_none() {
+                return;
+            }
+            match result {
+                Ok(job) => {
+                    submitted.set(true);
+                    confirmed.set(false);
+                    update_conversion(jobs, job);
+                }
+                Err(message) => error.set(Some(message)),
+            }
+        });
+    };
+    let watch = move |_| {
+        if watching.get_untracked() {
+            return;
+        }
+        let Some(movie_id) = job
+            .get_untracked()
+            .filter(|job| job.state == ConversionState::Published)
+            .and_then(|job| job.movie_id)
+        else {
+            return;
+        };
+        watching.set(true);
+        error.set(None);
+        spawn_local(async move {
+            let result = admin_get::<Library>(scope, "/api/v1/movies").await;
+            if watching.try_update(|watching| *watching = false).is_none() {
+                return;
+            }
+            match result {
+                Ok(library) => {
+                    let chosen = library
+                        .movies
+                        .iter()
+                        .find(|movie| movie.id == movie_id)
+                        .cloned();
+                    movies.set(library.movies);
+                    if let Some(chosen) = chosen {
+                        watch_movie.run(chosen);
+                    } else {
+                        error.set(Some("Published movie is not visible in the library yet. Refresh status and retry.".into()));
+                    }
+                }
+                Err(message) => error.set(Some(format!(
+                    "Could not load the published movie: {message}"
+                ))),
+            }
+        });
+    };
+    let refreshed = RwSignal::new(false);
+    Effect::new(move |_| {
+        let published = job
+            .get()
+            .is_some_and(|job| job.state == ConversionState::Published);
+        if published && !refreshed.get_untracked() {
+            refreshed.set(true);
+            spawn_local(async move {
+                let result = admin_get::<Library>(scope, "/api/v1/movies").await;
+                if scope.try_get_value().is_none() {
+                    return;
+                }
+                match result {
+                    Ok(library) => movies.set(library.movies),
+                    Err(message) => error.set(Some(format!(
+                        "Published, but the library refresh failed: {message}"
+                    ))),
+                }
+            });
+        }
+    });
+    view! {
+        <article class="job conversion-job" data-testid="conversion-job" data-job-id=id.get_value()>
+            <h3>"Conversion "{id.get_value()}</h3>
+            {move || job.get().map(|job| {
+                let missing_hash = job.state == ConversionState::NeedsReview && validated_hash(&job).is_none();
+                let state = match job.state {
+                    ConversionState::Queued => "Queued for conversion",
+                    ConversionState::Converting => "Converting — this can take a long time",
+                    ConversionState::NeedsReview => "Conversion needs review — not published",
+                    ConversionState::QueuedPublication => "Publication queued — waiting for worker",
+                    ConversionState::Publishing => "Publishing to the local library",
+                    ConversionState::Published => "Published to the local library",
+                    ConversionState::Failed => "Failed — ISO, original tracks, reports and logs retained",
+                };
+                view! {
+                    <p class="inspection-state" role="status">{state}</p>
+                    <p class="subtle">"Inspection job: "{job.probe_job_id}
+                        " · Video treatment: "{match job.video_treatment {
+                            VideoTreatment::Preserve => "Preserve (no deinterlacing filter)",
+                            VideoTreatment::Yadif => "Yadif (deinterlacing)",
+                        }}</p>
+                    {job.phase.map(|phase| view! { <p>"Phase: "{phase}</p> })}
+                    {job.attempt_id.map(|attempt| view! { <p class="attempt">"Attempt: "{attempt}</p> })}
+                    {job.error.map(|message| view! { <p role="alert" class="error">{message}</p> })}
+                    {missing_hash.then(|| view! {
+                        <p class="error">"Validated movie digest is unavailable. Publication is disabled."</p>
+                    })}
+                }
+            })}
+            <Show when=move || job.get().is_some_and(|job| job.report.is_some())>
+                <details>
+                    <summary>"Conversion / validation report and warnings (JSON)"</summary>
+                    <pre>{move || job.get().and_then(|job| job.report).map(|report| format!("{report:#}"))}</pre>
+                </details>
+            </Show>
+            <Show when=ready>
+                <div class="publication-review">
+                    <h4>"Review metadata and publish"</h4>
+                    <p class="notice">"Inspect the validation report and warnings before publication.
+                        The worker rechecks this job's validated movie digest.
+                        Publishing adds experimental playback to this local library only — not production approval.
+                        Original tracks stay retained; image subtitles and OCR captions are not available for playback."</p>
+                    <form on:submit=publish>
+                        <label>"Movie title"<input required maxlength="512" bind:value=title
+                            on:input=move |_| confirmed.set(false)
+                            disabled=move || busy.get() || submitted.get()/></label>
+                        <label>"Year (optional)"<input type="number" min="1888" max="2100" bind:value=year
+                            on:input=move |_| confirmed.set(false)
+                            disabled=move || busy.get() || submitted.get()/></label>
+                        <label>"Description"<textarea maxlength="16384" rows="3" bind:value=description
+                            on:input=move |_| confirmed.set(false)
+                            disabled=move || busy.get() || submitted.get()/></label>
+                        {move || publication_metadata(title.get(), year.get(), description.get()).err()
+                            .map(|message| view! { <p class="field-help">{message}</p> })}
+                        <label class="confirmation">
+                            <input type="checkbox" required prop:checked=move || confirmed.get()
+                                disabled=move || busy.get() || submitted.get()
+                                on:change=move |event| confirmed.set(event_target_checked(&event))/>
+                            "I reviewed the validated conversion, warnings and metadata, and confirm publishing this movie to the local library."
+                        </label>
+                        <button type="submit" disabled=move || !can_publish()>
+                            {move || if busy.get() { "Queueing publication..." } else { "Publish to local library" }}
+                        </button>
+                    </form>
+                </div>
+            </Show>
+            <Show when=move || job.get().is_some_and(|job| job.state == ConversionState::Published)>
+                <button on:click=watch disabled=move || watching.get()>
+                    {move || if watching.get() { "Loading library..." } else { "Watch published movie" }}
+                </button>
+            </Show>
+            {move || error.get().map(|message| view! { <p role="alert" class="error">{message}</p> })}
+        </article>
     }
 }
 

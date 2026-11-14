@@ -15,6 +15,265 @@ use wetube_worker::imports::{ImportConfig, tick};
 const ORIGIN: &str = "http://wetube.test";
 const PASSWORD: &str = "a household test password";
 
+#[tokio::test]
+async fn conversion_publication_and_scan_selection_require_admin_csrf_and_bound_review() {
+    let mut fixture = Fixture::new().await;
+    let artifacts = tempfile::tempdir().unwrap();
+    let scratch = artifacts.path().join("scratch");
+    let media = artifacts.path().join("media");
+    std::fs::create_dir(&scratch).unwrap();
+    std::fs::create_dir(&media).unwrap();
+    fixture.app = wetube_server::router_with_conversions(
+        fixture.pool.clone(),
+        ORIGIN,
+        fixture._directory.path(),
+        None,
+        Some(wetube_backend::preview::PreviewRoot::open(&media).unwrap()),
+        Some(&scratch),
+    )
+    .await
+    .unwrap();
+    let (admin, session) = fixture.login("admin").await;
+    let (viewer, viewer_session) = fixture.login("viewer").await;
+    let probe = uuid::Uuid::new_v4().to_string();
+    sqlx::query("INSERT INTO probe_jobs(id,requested_by,name,source_identity,title,angle,state,created_at,attempt_id,report) VALUES(?,?,'a.iso','identity',1,1,'failed',1,?,'{}')")
+        .bind(&probe).bind(&session.user.id).bind(uuid::Uuid::new_v4().to_string()).execute(&fixture.pool).await.unwrap();
+    let conversion = serde_json::json!({"probe_job_id":probe,"video_treatment":"preserve"});
+    for path in ["/api/v1/admin/scans", "/api/v1/admin/conversions"] {
+        assert_eq!(
+            fixture.send("GET", path, "", None, None).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            fixture
+                .send("GET", path, "", Some(&viewer), None)
+                .await
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+    let publish_path = format!("/api/v1/admin/conversions/{probe}/publish");
+    let inspect_path = format!("/api/v1/admin/scans/{probe}/inspect");
+    for (path,body) in [
+        ("/api/v1/admin/conversions",conversion.to_string()),
+        ("/api/v1/admin/scans",serde_json::json!({"name":"a.iso","identity":"id","copy_complete":true}).to_string()),
+        (&inspect_path,serde_json::json!({"title":1,"angle":1}).to_string()),
+        (&publish_path,serde_json::json!({"title":"Movie","year":2026,"description":"","movie_sha256":"a".repeat(64),"confirm":true}).to_string()),
+    ] {
+        assert_eq!(fixture.send("POST",path,&body,Some(&viewer),Some(&viewer_session.csrf_token)).await.status(),StatusCode::FORBIDDEN);
+        assert_eq!(fixture.send("POST",path,&body,Some(&admin),None).await.status(),StatusCode::FORBIDDEN);
+        let wrong_origin = Request::builder().method("POST").uri(path)
+            .header(header::HOST,"wetube.test").header(header::ORIGIN,"http://evil.test")
+            .header(header::CONTENT_TYPE,"application/json").header(header::COOKIE,&admin)
+            .header("x-csrf-token",&session.csrf_token).body(Body::from(body)).unwrap();
+        assert_eq!(fixture.app.clone().oneshot(wrong_origin).await.unwrap().status(),StatusCode::FORBIDDEN);
+    }
+    assert_eq!(
+        fixture
+            .send(
+                "POST",
+                "/api/v1/admin/conversions",
+                &conversion.to_string(),
+                Some(&admin),
+                Some(&session.csrf_token)
+            )
+            .await
+            .status(),
+        StatusCode::CONFLICT
+    );
+    sqlx::query("UPDATE probe_jobs SET state='needs_review'")
+        .execute(&fixture.pool)
+        .await
+        .unwrap();
+    let response = fixture
+        .send(
+            "POST",
+            "/api/v1/admin/conversions",
+            &conversion.to_string(),
+            Some(&admin),
+            Some(&session.csrf_token),
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let job: wetube_core::ConversionJob =
+        serde_json::from_slice(&to_bytes(response.into_body(), 32768).await.unwrap()).unwrap();
+    assert_eq!(
+        fixture
+            .send(
+                "POST",
+                "/api/v1/admin/conversions",
+                &conversion.to_string(),
+                Some(&admin),
+                Some(&session.csrf_token)
+            )
+            .await
+            .status(),
+        StatusCode::CONFLICT
+    );
+    let publish_path = format!("/api/v1/admin/conversions/{}/publish", job.id);
+    let publication = serde_json::json!({"title":"Movie","year":2026,"description":"","movie_sha256":"a".repeat(64),"confirm":true});
+    assert_eq!(
+        fixture
+            .send(
+                "POST",
+                &publish_path,
+                &publication.to_string(),
+                Some(&admin),
+                Some(&session.csrf_token)
+            )
+            .await
+            .status(),
+        StatusCode::CONFLICT
+    );
+    sqlx::query("UPDATE conversion_jobs SET state='needs_review',movie_sha256=?")
+        .bind("a".repeat(64))
+        .execute(&fixture.pool)
+        .await
+        .unwrap();
+    for (field, value) in [
+        ("confirm", serde_json::json!(false)),
+        ("title", serde_json::json!(" ")),
+        ("year", serde_json::json!(1700)),
+        ("movie_sha256", serde_json::json!("invalid")),
+    ] {
+        let mut bad = publication.clone();
+        bad[field] = value;
+        assert_eq!(
+            fixture
+                .send(
+                    "POST",
+                    &publish_path,
+                    &bad.to_string(),
+                    Some(&admin),
+                    Some(&session.csrf_token)
+                )
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+    let mut wrong_hash = publication.clone();
+    wrong_hash["movie_sha256"] = serde_json::json!("b".repeat(64));
+    assert_eq!(
+        fixture
+            .send(
+                "POST",
+                &publish_path,
+                &wrong_hash.to_string(),
+                Some(&admin),
+                Some(&session.csrf_token)
+            )
+            .await
+            .status(),
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        fixture
+            .send(
+                "POST",
+                &publish_path,
+                &publication.to_string(),
+                Some(&admin),
+                Some(&session.csrf_token)
+            )
+            .await
+            .status(),
+        StatusCode::ACCEPTED
+    );
+    assert_eq!(
+        fixture
+            .send(
+                "POST",
+                &publish_path,
+                &publication.to_string(),
+                Some(&admin),
+                Some(&session.csrf_token)
+            )
+            .await
+            .status(),
+        StatusCode::CONFLICT
+    );
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM movies")
+        .fetch_one(&fixture.pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 0, "enqueue never synchronously publishes");
+    let scan_id = uuid::Uuid::new_v4().to_string();
+    let scan_attempt = uuid::Uuid::new_v4().to_string();
+    let report = serde_json::json!({"titles":[{"title":4,"duration_seconds":1800.0,"chapter_count":2,"audio_count":1,"subtitle_count":0,"audio_languages":["en"],"subtitle_languages":[],"angles":[1,2],"main_feature_candidate":true}]});
+    sqlx::query("INSERT INTO scan_jobs(id,requested_by,name,source_identity,state,created_at,attempt_id,sha256,size_bytes,report) VALUES(?,?,'a.iso','identity','needs_review',1,?,'hash',10,?)")
+        .bind(&scan_id).bind(&session.user.id).bind(&scan_attempt).bind(report.to_string()).execute(&fixture.pool).await.unwrap();
+    let inspect = format!("/api/v1/admin/scans/{scan_id}/inspect");
+    for request in [
+        serde_json::json!({"title":1,"angle":1}),
+        serde_json::json!({"title":4,"angle":3}),
+    ] {
+        assert_eq!(
+            fixture
+                .send(
+                    "POST",
+                    &inspect,
+                    &request.to_string(),
+                    Some(&admin),
+                    Some(&session.csrf_token)
+                )
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+    let selected = fixture
+        .send(
+            "POST",
+            &inspect,
+            r#"{"title":4,"angle":2}"#,
+            Some(&admin),
+            Some(&session.csrf_token),
+        )
+        .await;
+    assert_eq!(selected.status(), StatusCode::ACCEPTED);
+    let selected: ProbeJob =
+        serde_json::from_slice(&to_bytes(selected.into_body(), 32768).await.unwrap()).unwrap();
+    assert_eq!((selected.title, selected.angle), (4, 2));
+    assert_eq!(selected.attempt_id.as_deref(), Some(scan_attempt.as_str()));
+    assert_eq!(selected.report.unwrap()["sha256"], "hash");
+    sqlx::query("UPDATE probe_jobs SET state='needs_review' WHERE id=?")
+        .bind(&selected.id)
+        .execute(&fixture.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        fixture
+            .send(
+                "POST",
+                &inspect,
+                r#"{"title":4,"angle":2}"#,
+                Some(&admin),
+                Some(&session.csrf_token)
+            )
+            .await
+            .status(),
+        StatusCode::CONFLICT
+    );
+    let other = fixture
+        .send(
+            "POST",
+            &inspect,
+            r#"{"title":4,"angle":1}"#,
+            Some(&admin),
+            Some(&session.csrf_token),
+        )
+        .await;
+    assert_eq!(other.status(), StatusCode::ACCEPTED);
+    let other: ProbeJob =
+        serde_json::from_slice(&to_bytes(other.into_body(), 32768).await.unwrap()).unwrap();
+    assert_eq!(
+        other.attempt_id.as_deref(),
+        Some(scan_attempt.as_str()),
+        "distinct selections share the verified staged ISO"
+    );
+}
+
 struct Fixture {
     _directory: tempfile::TempDir,
     pool: SqlitePool,
@@ -81,7 +340,8 @@ async fn incoming_probes_require_admin_confirmation_and_exclude_concurrent_jobs(
     assert!(listing.configured);
     assert_eq!(listing.files.len(), 1);
     assert_eq!(listing.files[0].name, file.name);
-    assert_eq!(listing.files[0].identity, file.identity);
+    // DrvFS may finalize ctime after creation; confirmations use the refreshed identity.
+    assert_eq!(listing.files[0].size_bytes, file.size_bytes);
     assert_eq!(
         fixture
             .send(

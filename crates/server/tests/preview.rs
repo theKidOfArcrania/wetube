@@ -26,7 +26,7 @@ struct Fixture {
 
 impl Fixture {
     async fn new() -> Self {
-        let root = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let root = tempfile::tempdir().unwrap();
         let state = root.path().join("state");
         let media = root.path().join("media");
         let attempt = root
@@ -483,7 +483,8 @@ async fn failed_forged_corrupt_and_modified_payloads_never_become_eligible() {
             .file_name()
             .to_str()
             .unwrap()
-            .starts_with(".admitting-")
+            .parse::<uuid::Uuid>()
+            .is_ok()
     }));
 }
 
@@ -508,6 +509,10 @@ async fn preview_roots_cannot_overlap_static_or_state() {
     let package = uuid::Uuid::new_v4().to_string();
     std::os::unix::fs::symlink(Path::new("../attempts"), fixture.media.join(&package)).unwrap();
     assert!(root.open_movie(&package).is_err());
+    assert!(
+        root.reserve_package(&package).is_err(),
+        "never overwrite an existing package"
+    );
     let package = uuid::Uuid::new_v4().to_string();
     let directory = fixture.media.join(&package);
     std::fs::create_dir(&directory).unwrap();

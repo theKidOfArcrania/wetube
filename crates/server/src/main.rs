@@ -57,6 +57,8 @@ enum Command {
         incoming_dir: Option<PathBuf>,
         #[arg(long, env = "WETUBE_MEDIA_DIR")]
         media_dir: Option<PathBuf>,
+        #[arg(long, env = "WETUBE_SCRATCH_DIR", requires = "media_dir")]
+        scratch_dir: Option<PathBuf>,
     },
     /// Admit an operator-confirmed experimental MP4 for LOCAL preview; stop services first.
     AdmitPreview {
@@ -154,6 +156,7 @@ async fn main() -> Result<()> {
             static_dir,
             incoming_dir,
             media_dir,
+            scratch_dir,
         } => {
             let _services = ServiceLock::acquire(&cli.state_dir, false)?;
             anyhow::ensure!(
@@ -169,8 +172,15 @@ async fn main() -> Result<()> {
                 .as_deref()
                 .map(wetube_backend::preview::PreviewRoot::open)
                 .transpose()?;
-            let app = wetube_server::router_with_media(pool, &origin, &static_dir, incoming, media)
-                .await?;
+            let app = wetube_server::router_with_conversions(
+                pool,
+                &origin,
+                &static_dir,
+                incoming,
+                media,
+                scratch_dir.as_deref(),
+            )
+            .await?;
             let listener = tokio::net::TcpListener::bind(bind)
                 .await
                 .context("bind HTTP listener")?;

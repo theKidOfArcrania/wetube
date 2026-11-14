@@ -22,6 +22,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    #[command(hide = true)]
+    ScanMetadata,
     /// Print media-tool capabilities without accessing any ISO or database.
     Doctor,
     /// Inspect one completed ISO copy without conversion, publication, or deletion.
@@ -36,7 +38,7 @@ enum Command {
         #[arg(long, required = true)]
         copy_complete: bool,
     },
-    /// Process durable diagnostic and staged inspection jobs. No conversion or deletion.
+    /// Process durable inspection, conversion, and local publication jobs. Never deletes sources.
     Run {
         #[arg(long)]
         once: bool,
@@ -44,6 +46,14 @@ enum Command {
         incoming_dir: Option<PathBuf>,
         #[arg(long, env = "WETUBE_SCRATCH_DIR", requires = "incoming_dir")]
         scratch_dir: Option<PathBuf>,
+        #[arg(long, env = "WETUBE_MEDIA_DIR", requires = "scratch_dir")]
+        media_dir: Option<PathBuf>,
+        #[arg(long, default_value_t = 14400, value_parser = clap::value_parser!(u64).range(1..=86400))]
+        tool_timeout_secs: u64,
+        #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u8).range(1..=16))]
+        threads: u8,
+        #[arg(long, default_value_t = 8 * 1024 * 1024 * 1024u64)]
+        max_output_bytes: u64,
         #[arg(long, env = "WETUBE_MAX_ISO_BYTES", default_value_t = 16 * 1024 * 1024 * 1024u64)]
         max_iso_bytes: u64,
         #[arg(long, env = "WETUBE_MAX_SCRATCH_BYTES", default_value_t = 32 * 1024 * 1024 * 1024u64)]
@@ -53,17 +63,39 @@ enum Command {
     },
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
     let cli = Cli::parse();
+    if matches!(cli.command, Command::ScanMetadata) {
+        // The scanner is single-threaded here, before any async runtime exists.
+        unsafe {
+            std::env::set_var("DVDCSS_CACHE", "off");
+        }
+        let report = wetube_worker::dvdnav::scan_stdin()?;
+        unsafe {
+            libc::fflush(std::ptr::null_mut());
+        }
+        println!(
+            "\nWETUBE_DVD_SCAN_JSON\n{}",
+            serde_json::to_string(&report)?
+        );
+        return Ok(());
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run(cli))
+}
+
+async fn run(cli: Cli) -> Result<()> {
     match cli.command {
+        Command::ScanMetadata => unreachable!("scanner does not initialize async runtime"),
         Command::Doctor => {
             let report = wetube_worker::diagnose().await;
             println!("{}", serde_json::to_string_pretty(&report)?);
-            if report.tools.iter().any(|tool| !tool.available) {
+            if !report.required_tools_available() {
                 std::process::exit(1);
             }
         }
@@ -83,6 +115,10 @@ async fn main() -> Result<()> {
             once,
             incoming_dir,
             scratch_dir,
+            media_dir,
+            tool_timeout_secs,
+            threads,
+            max_output_bytes,
             max_iso_bytes,
             max_scratch_bytes,
             staging_timeout_secs,
@@ -91,6 +127,25 @@ async fn main() -> Result<()> {
             let _lock = MaintenanceLock::acquire(&cli.state_dir)?;
             let pool = db::connect(&cli.state_dir).await?;
             db::check_version(&pool).await?;
+            let media = media_dir
+                .as_deref()
+                .map(wetube_backend::preview::PreviewRoot::open)
+                .transpose()?;
+            if let Some(media) = &media {
+                media.require_separate(&cli.state_dir)?;
+                if let Some(incoming) = &incoming_dir {
+                    media.require_separate(incoming)?;
+                }
+                if let Some(scratch) = &scratch_dir {
+                    media.require_separate(scratch)?;
+                }
+            }
+            let limits = wetube_worker::conversions::Limits {
+                timeout: Duration::from_secs(tool_timeout_secs),
+                threads,
+                max_output_bytes,
+            };
+            limits.validate()?;
             let imports = match (incoming_dir, scratch_dir) {
                 (Some(incoming), Some(scratch)) => {
                     Some(Arc::new(wetube_worker::imports::ImportConfig::open(
@@ -104,8 +159,17 @@ async fn main() -> Result<()> {
                 (None, None) => None,
                 _ => anyhow::bail!("incoming and scratch directories must be configured together"),
             };
+            let _scratch_lock = imports
+                .as_ref()
+                .map(|config| {
+                    config.require_separate(&cli.state_dir)?;
+                    config.acquire_scratch_lock()
+                })
+                .transpose()?;
             wetube_worker::recover(&pool).await?;
             wetube_worker::imports::recover(&pool).await?;
+            wetube_worker::conversions::recover(&pool).await?;
+            wetube_worker::scans::recover(&pool).await?;
             let mut interval = tokio::time::interval(Duration::from_secs(2));
             let shutdown = shutdown();
             tokio::pin!(shutdown);
@@ -118,7 +182,12 @@ async fn main() -> Result<()> {
                 let work = async {
                     wetube_worker::tick(&pool).await?;
                     if let Some(config) = &imports {
+                        wetube_worker::scans::tick(&pool, config.clone()).await?;
                         wetube_worker::imports::tick(&pool, config.clone()).await?;
+                        if let Some(media) = &media {
+                            wetube_worker::conversions::tick(&pool, config.clone(), media, &limits)
+                                .await?;
+                        }
                     }
                     anyhow::Ok(())
                 };

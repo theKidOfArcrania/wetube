@@ -71,6 +71,25 @@ impl PreviewRoot {
         Ok(file)
     }
 
+    pub fn reserve_package(&self, package: &str) -> Result<File> {
+        ensure!(
+            uuid::Uuid::parse_str(package)?.to_string() == package,
+            "invalid package ID"
+        );
+        let name = CString::new(package)?;
+        ensure!(
+            unsafe { libc::mkdirat(self.directory.as_raw_fd(), name.as_ptr(), 0o700) } == 0,
+            "reserve package without overwrite: {}",
+            std::io::Error::last_os_error()
+        );
+        self.directory.sync_all()?;
+        open_at(&self.directory, package, true)
+    }
+
+    pub fn sync(&self) -> Result<()> {
+        self.directory.sync_all().context("sync media root")
+    }
+
     pub fn finalize(&self, staging: &str, package: &str) -> Result<()> {
         ensure!(
             uuid::Uuid::parse_str(package)?.to_string() == package

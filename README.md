@@ -5,18 +5,20 @@ reviewed architecture and safety requirements.
 
 ## Current scope
 
-This is a runnable foundation, not a DVD player yet:
+This is a runnable local website preview, not a production TrueNAS deployment:
 
 - Rust/Axum API with SQLite, local admin/viewer accounts, and cookie sessions.
-- Leptos/WASM login, library search, and administrator diagnostic results.
+- Leptos/WASM login, library search, authenticated MP4 playback/seeking, and
+  per-user resume.
 - Persistent, restart-recoverable diagnostic jobs and a single-owner worker.
-- Read-only checks for FFmpeg, ffprobe, DVD-Video support, and English Tesseract data.
-- Local, read-only inspection of an explicitly selected DVD ISO title and angle.
-- Administrator-selected incoming copies, durable staging/inspection jobs,
-  checksum verification, and retained reports for manual review.
+- Read-only checks for required media capabilities and optional English OCR.
+- DVD program discovery with duration/track information and title/angle dropdowns.
+- Administrator-selected incoming copies, checksum-verified private staging,
+  inspection, explicit conversion, and separate reviewed local-library publication.
+- Preserved original audio/image-subtitle sidecars and retained failed attempts.
 
-The library starts empty. Production conversion, publication, playback, captions, TMDB,
-scheduled backups/restore, and trash are not implemented. Inspection never
+The library starts empty. The complete production publication protocol, captions,
+TMDB, scheduled backups/restore, and trash are not implemented. Inspection never
 modifies or deletes incoming files and does not add movies to the library.
 Automatic ISO deletion remains disabled pending the design's safety gates.
 Docker packaging is intentionally deferred.
@@ -42,10 +44,12 @@ separate development origin. If multiple Rust distributions are installed, use
 the same toolchain for Cargo, Trunk, and the WASM target; `rustup run stable`
 can select the standard Rust toolchain.
 
-Media tools are optional for starting the foundation. Diagnostics require
-`ffmpeg` and `ffprobe` with the `dvdvideo` demuxer, plus `tesseract` with `eng`
-trained data. Missing capabilities produce a failed diagnostic with details;
-installed tools alone do not prove that a particular ISO can be imported.
+Media tools are optional for starting the website. Scanning/conversion require
+`ffmpeg` and `ffprobe` with DVD-Video support, H.264/AAC encoding, and the native
+`libdvdnav`/`libdvdread` libraries. Discovery uses a bounded native helper, not a
+mandatory `lsdvd` subprocess. Tesseract with `eng` trained data is optional and
+does not determine conversion readiness; caption OCR itself is not implemented.
+Installed tools alone do not prove that a particular ISO can be imported.
 
 ## Initialize and run
 
@@ -74,7 +78,7 @@ target/debug/wetube-worker run
 Open `http://localhost:8080` and sign in. An administrator can queue a read-only
 diagnostic in the Media readiness panel. Jobs remain queued while the worker is
 offline. The worker's `doctor` command runs the same checks without opening the
-database, and `run --once` processes at most one diagnostic and one inspection.
+database. Jobs require the worker to be running.
 
 ```sh
 target/debug/wetube-worker doctor
@@ -117,10 +121,11 @@ guarantee. This inspection does not stage/hash an import, bypass encryption,
 publish media, or authorize cleanup. Representative real DVDs are still needed
 to prove feasibility before implementing conversion.
 
-## Stage and inspect from the admin UI
+## Scan, convert, and publish from the admin UI
 
 Use the same finished-copy incoming directory for both processes, and a
-separate scratch directory with filesystem-managed access controls. Never
+separate scratch and prepared-media directories with filesystem-managed access
+controls. Create the directories before starting either process. Never
 configure the original archive
 or an HTTP static directory as either root. The scratch parent must already
 exist; a new scratch root requests mode 0700. Existing scratch roots must not be
@@ -131,22 +136,41 @@ outside SMB exports, including ancestor shares; local mode bits alone do not
 establish the NAS's deployed ACL behavior.
 
 ```sh
-target/debug/wetube-server serve --incoming-dir /path/to/incoming
-target/debug/wetube-worker run --incoming-dir /path/to/incoming --scratch-dir /private/path/to/scratch
+target/debug/wetube-server serve --incoming-dir /mnt/share/staging --scratch-dir /mnt/c/TempPrivate/website-staging --media-dir /mnt/c/TempPrivate/website-media
+target/debug/wetube-worker run --incoming-dir /mnt/share/staging --scratch-dir /mnt/c/TempPrivate/website-staging --media-dir /mnt/c/TempPrivate/website-media
 ```
 
-In the admin panel, refresh incoming files, select an ordinary non-empty ISO
-from the root (no recursion/symlinks), specify a title and angle, and acknowledge
-copy completion. There is no automatic longest-title selection. Listing is
-limited to 1,000 candidate ISOs / 10,000 directory entries; split larger batches.
-Only one inspection may be queued or active. Missing worker staging configuration
-leaves inspection jobs queued; diagnostics still work.
+Use matching state, incoming, scratch, and media roots for both processes; keep
+state, static assets, incoming, scratch, and media separate and non-overlapping.
+On this development host, all large ISO, conversion, and publication artifacts
+belong on C:, never in `/tmp` or another Linux staging directory. Small SQLite
+state is separate.
+
+1. Refresh incoming files, select an ordinary non-empty ISO from the root
+   (no recursion/symlinks), acknowledge the completed copy, and choose **Scan DVD**.
+2. Select a discovered DVD title using its duration, chapters, and tracks.
+   The longest program is only a main-feature candidate, not an automatic choice.
+   Choose an angle if the selected program has multiple angles.
+3. Choose **Inspect selected title**. Review its report and warnings, explicitly
+   select Preserve or Yadif, acknowledge the experimental treatment, and convert.
+4. After full decoding and output validation succeed, review the title, optional
+   year, description, and warnings. Confirm **Publish to local library** separately.
+5. After publication succeeds, choose **Watch published movie** or open it from
+   the library.
+
+Listing is limited to 1,000 candidate ISOs / 10,000 directory entries; split
+larger batches. Jobs are serialized by the worker. Missing worker staging
+configuration leaves jobs queued; diagnostics still work.
 
 The worker checks the confirmed source identity, persists a unique attempt ID,
 copies through a pinned read-only descriptor while computing SHA-256, checks
 the source handle and root-relative pathname again, fsyncs, and rehashes the
-private staged bytes. ffprobe then inspects that copy. Successful inspection
-ends at **Needs review**, never publication or cleanup. Metadata/content checks
+private staged bytes. Scan, selected inspection, and conversion reuse the same
+staged input. Successful inspection ends at **Needs review**, never publication
+or cleanup. Conversion fully decodes the source and output, records hashes, and
+retains `movie.mp4`, `original-tracks.mkv`, reports, and logs in the attempt.
+Publication independently verifies the copied package before registration.
+Metadata/content checks
 detect changes under the trusted-household protocol; they are not a guarantee
 against malicious writers or proof of SMB writer exclusion.
 
@@ -167,26 +191,30 @@ scratch limits. The admin history shows the latest 20 jobs and their attempt
 IDs; older rows remain in SQLite. An attempt that failed before directory
 creation may have no corresponding directory. Inspect scratch/attempt-ID
 manually, with services stopped, before any operator-managed cleanup. No
-automatic cleanup or report-approval action exists yet.
+automatic cleanup exists. Failed conversion reports and their output files are
+not accepted as validated media.
 
 SIGTERM/Ctrl-C drains the worker's current work before releasing ownership,
 including blocking copy I/O; allow time for staging and inspection to finish.
 The worker heartbeat continues during active jobs. Force-killed jobs retain
 their inputs; children retain the ownership lock until they exit.
 
-## Upgrade pre-preview state
+## Upgrade local state
 
 Stop both services before running `wetube-server init` with this release.
-Initialization upgrades schema 1 or 2 to schema 3 only after a consistent `VACUUM INTO`
+Initialization upgrades supported older schemas to schema 4 only after a consistent `VACUUM INTO`
 snapshot is written and synced in a private `pre-upgrade-UUID` directory under
 the state root. Newer/unknown versions fail closed. Repeating initialization
 does not create another snapshot once the upgrade succeeds.
 
-This is a narrow pre-upgrade safeguard for the pre-preview schemas, which have no
-published asset registry. It is not the design's complete daily, off-device,
-asset-aware backup/restore system. Keep these snapshots until an operator has
+This is a narrow SQLite-only pre-upgrade safeguard, not the design's complete
+daily, off-device, asset-aware backup/restore system. Schema 3 can already
+reference media: retain those asset files unchanged and in place so its snapshot
+can still refer to the original assets. Changing media roots is not a database
+migration; files need independent verification/admission, not rewritten fingerprints.
+Keep these snapshots until an operator has
 verified recovery; there is no automatic retention or restore command. To
-rehearse a schema-1 or schema-2 snapshot, copy it into a separate private state directory
+rehearse a snapshot, copy it into a separate private state directory
 with services stopped and use the matching old release, not the live database.
 Do not roll an old binary forward onto the upgraded live state.
 
@@ -199,7 +227,8 @@ Do not roll an old binary forward onto the upgraded live state.
 | `WETUBE_ORIGIN` | `http://localhost:8080` | Exact browser origin and accepted Host authority. |
 | `WETUBE_STATIC_DIR` | `dist` | Built frontend directory. |
 | `WETUBE_INCOMING_DIR` | Disabled | Finished-copy root for server and worker; same directory on both. |
-| `WETUBE_SCRATCH_DIR` | Disabled | Worker-private staging root; required together with worker incoming. |
+| `WETUBE_SCRATCH_DIR` | Disabled | Private staging root; configure the same root for server and worker. |
+| `WETUBE_MEDIA_DIR` | Disabled | Prepared local-library packages; configure the same separate root for server and worker. |
 | `WETUBE_MAX_ISO_BYTES` | `17179869184` | Worker's per-input staging byte limit (16 GiB). |
 | `WETUBE_MAX_SCRATCH_BYTES` | `34359738368` | Worker's total retained scratch byte limit (32 GiB). |
 | `WETUBE_STAGING_TIMEOUT_SECS` | `600` | Combined copy/rehash cooperative budget, 1-3,600 seconds. |
@@ -220,9 +249,11 @@ production-ready TrueNAS deployment.
 
 ## Next integration checkpoint
 
-The application's production workflow stops at staged inspection; the standalone
-experiment below does not enable production conversion. Before encoding profiles or
-Docker/TrueNAS packaging, supply disposable, completed ISO copies covering:
+The local website now connects scanning through validated publication and
+playback. Six Chromium scenarios include an authored two-title DVD end to end;
+this is not acceptance of full-length real discs, production publication, or
+TrueNAS. Before Docker/TrueNAS packaging, supply disposable, completed ISO copies
+covering:
 
 | Input | Evidence to collect |
 | --- | --- |
@@ -365,18 +396,29 @@ This is an experimental local playback adapter, not the complete production
 publication/backup/subtitle-asset protocol.
 
 The Chromium browser suite builds the real server and frontend, creates an
-eight-second synthetic H.264/AAC fixture and isolated accounts, admits the
-fixture through the CLI, and tests actual browser playback, saved resume,
-end/back navigation, save-failure feedback, and admin diagnostic/inspection
-flows through a real worker using an isolated invalid ISO.
+eight-second H.264/AAC fixture and a tiny two-title DVD ISO with isolated
+accounts, and tests playback, saved resume, end/back navigation, save-failure
+feedback, failed-scan retention, and successful scan/inspect/convert/publish
+through the real worker. A separate mocked-contract case covers title/angle
+dropdowns and review confirmations; it is not converter acceptance evidence.
 It never touches the real NAS import or starts Docker:
 
 ```sh
 cd tests/e2e
 npm ci --ignore-scripts
 npm run install-browser
-npm test
+WETUBE_E2E_ARTIFACTS_DIR=/mnt/c/TempPrivate npm test
 ```
+
+This development harness requires an explicit, existing artifacts directory
+under /mnt/c/TempPrivate and checks its resolved location before building or
+generating media. It never falls back to Linux ISO staging. Only the small test
+database uses Linux temporary storage.
+
+The real-DVD fixture requires `dvdauthor` and `genisoimage`, in addition to the
+existing FFmpeg and browser prerequisites. These authoring tools are test-only;
+runtime DVD discovery uses the installed DVD navigation library. Stop and
+explain any needed apt installation before proceeding.
 
 The suite uses safe-exec to generate its bounded fixture report and sha256sum
 to stream payload hashes without Rhai blob-size limits; native test

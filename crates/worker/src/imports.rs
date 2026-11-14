@@ -31,6 +31,10 @@ impl ImportConfig {
         staging_timeout: Duration,
     ) -> Result<Self> {
         ensure!(
+            incoming.is_absolute() && scratch.is_absolute(),
+            "incoming and scratch roots must be explicit absolute paths"
+        );
+        ensure!(
             max_iso_bytes > 0 && max_scratch_bytes >= max_iso_bytes,
             "invalid staging byte limits"
         );
@@ -65,6 +69,20 @@ impl ImportConfig {
 
     pub(crate) fn scratch_path(&self) -> PathBuf {
         PathBuf::from(format!("/proc/self/fd/{}", self.scratch.as_raw_fd()))
+    }
+
+    pub fn acquire_scratch_lock(&self) -> Result<wetube_backend::lock::MaintenanceLock> {
+        wetube_backend::lock::MaintenanceLock::acquire(&self.scratch_path())
+    }
+
+    pub fn require_separate(&self, other: &Path) -> Result<()> {
+        let scratch = self.scratch_path().canonicalize()?;
+        let other = other.canonicalize()?;
+        ensure!(
+            !scratch.starts_with(&other) && !other.starts_with(&scratch),
+            "scratch and state roots must not overlap"
+        );
+        Ok(())
     }
 
     pub(crate) fn require_capacity(&self, bytes: u64) -> Result<()> {
@@ -120,6 +138,7 @@ pub(crate) struct Staged {
     pub sha256: String,
     pub size_bytes: u64,
     pub identity: String,
+    pub(crate) _directory: Option<File>,
 }
 
 impl Staged {
@@ -228,7 +247,57 @@ pub(crate) fn stage(
         sha256: digest,
         size_bytes: count,
         identity: staged_identity,
+        _directory: None,
     })
+}
+
+pub(crate) fn revalidate(config: &ImportConfig, probe: &wetube_core::ProbeJob) -> Result<Staged> {
+    let report = probe.report.as_ref().context("probe has no report")?;
+    let attempt = uuid::Uuid::parse_str(
+        report["staged_attempt_id"]
+            .as_str()
+            .or(probe.attempt_id.as_deref())
+            .context("probe has no staged attempt")?,
+    )?;
+    let expected = report["sha256"]
+        .as_str()
+        .context("probe has no staged checksum")?;
+    let size = report["size_bytes"]
+        .as_u64()
+        .context("probe has no staged size")?;
+    ensure!(
+        size > 0 && size <= config.max_iso_bytes,
+        "staged size exceeds input quota"
+    );
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(config.scratch_path().join(attempt.to_string()))?;
+    let path = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd())).join("input.iso");
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&path)?;
+    ensure!(
+        file.metadata()?.is_file() && file.metadata()?.len() == size,
+        "staged input size changed"
+    );
+    let before = wetube_backend::incoming::identity(&file.metadata()?);
+    let sha256 = super::experimental::bounded_hash(&mut file, size, config.staging_timeout)?;
+    ensure!(
+        sha256 == expected,
+        "staged input checksum mismatch; prior outputs cannot be reused"
+    );
+    let staged = Staged {
+        path,
+        file,
+        sha256,
+        size_bytes: size,
+        identity: before,
+        _directory: Some(directory),
+    };
+    staged.verify()?;
+    Ok(staged)
 }
 
 pub async fn recover(pool: &SqlitePool) -> Result<()> {
@@ -244,9 +313,10 @@ pub async fn recover(pool: &SqlitePool) -> Result<()> {
 pub async fn tick(pool: &SqlitePool, config: Arc<ImportConfig>) -> Result<bool> {
     let attempt = uuid::Uuid::new_v4().to_string();
     let row = sqlx::query(
-        "UPDATE probe_jobs SET state = 'staging', attempt_id = ?
+        "UPDATE probe_jobs SET state = CASE WHEN scan_job_id IS NULL THEN 'staging' ELSE 'probing' END,
+         attempt_id = CASE WHEN scan_job_id IS NULL THEN ? ELSE attempt_id END
          WHERE id = (SELECT id FROM probe_jobs WHERE state = 'queued'
-         ORDER BY created_at, rowid LIMIT 1) RETURNING id, name, source_identity, title, angle",
+         ORDER BY created_at, rowid LIMIT 1) RETURNING *",
     )
     .bind(&attempt)
     .fetch_optional(pool)
@@ -261,14 +331,20 @@ pub async fn tick(pool: &SqlitePool, config: Arc<ImportConfig>) -> Result<bool> 
     let angle = u8::try_from(row.get::<i64, _>("angle"))?;
     let stage_attempt = attempt.clone();
     let stage_config = config.clone();
+    let staged_probe = wetube_backend::probe_jobs::from_row(&row)?;
+    let reuse = row.try_get::<Option<String>, _>("scan_job_id")?.is_some();
     let result: Result<serde_json::Value> = async {
         let staged = tokio::task::spawn_blocking(move || {
-            stage(&stage_config, &name, &expected, &stage_attempt)
+            if reuse { revalidate(&stage_config,&staged_probe) } else { stage(&stage_config, &name, &expected, &stage_attempt) }
         })
         .await
         .context("staging task failed")??;
         let staged_report = serde_json::json!({
             "sha256": staged.sha256, "size_bytes": staged.size_bytes,
+            "staged_attempt_id": if reuse {
+                row.try_get::<Option<String>,_>("report")?.map(|report|serde_json::from_str::<serde_json::Value>(&report)).transpose()?
+                    .and_then(|report|report["staged_attempt_id"].as_str().map(str::to_owned))
+            } else { Some(attempt.clone()) },
         });
         sqlx::query("UPDATE probe_jobs SET state = 'probing', report = ? WHERE id = ?")
             .bind(staged_report.to_string())
@@ -282,6 +358,7 @@ pub async fn tick(pool: &SqlitePool, config: Arc<ImportConfig>) -> Result<bool> 
         Ok(serde_json::json!({
             "sha256": staged_report["sha256"],
             "size_bytes": staged.size_bytes,
+            "staged_attempt_id": staged_report["staged_attempt_id"],
             "inspection": inspection,
         }))
     }
@@ -306,6 +383,108 @@ pub async fn tick(pool: &SqlitePool, config: Arc<ImportConfig>) -> Result<bool> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn scanned_selection_rehashes_the_same_staged_input_without_recopying_nas() -> Result<()>
+    {
+        use wetube_core::{InspectRequest, ScanRequest};
+        let root = tempfile::tempdir()?;
+        let state = root.path().join("state");
+        let incoming = root.path().join("incoming");
+        let scratch = root.path().join("scratch");
+        std::fs::create_dir(&state)?;
+        std::fs::create_dir(&incoming)?;
+        std::fs::write(incoming.join("movie.iso"), b"original invalid DVD")?;
+        let config = Arc::new(ImportConfig::open(
+            &incoming,
+            &scratch,
+            1024,
+            1024 * 1024,
+            Duration::from_secs(30),
+        )?);
+        let confirmed = config.incoming.open_file("movie.iso")?.1;
+        wetube_backend::db::initialize(&state).await?;
+        let pool = wetube_backend::db::connect(&state).await?;
+        sqlx::query("INSERT INTO users VALUES('admin','admin','hash','admin')")
+            .execute(&pool)
+            .await?;
+        let scan = wetube_backend::scans::enqueue(
+            &pool,
+            "admin",
+            &ScanRequest {
+                name: confirmed.name.clone(),
+                identity: confirmed.identity.clone(),
+                copy_complete: true,
+            },
+        )
+        .await?
+        .context("scan not queued")?;
+        let attempt = uuid::Uuid::new_v4().to_string();
+        let staged_path = scratch.join(&attempt);
+        std::fs::create_dir(&staged_path)?;
+        std::fs::write(staged_path.join("input.iso"), b"original invalid DVD")?;
+        File::open(staged_path.join("input.iso"))?.sync_all()?;
+        let checksum = hex::encode(Sha256::digest(b"original invalid DVD"));
+        let report = serde_json::json!({"titles":[{"title":4,"duration_seconds":30.0,"chapter_count":1,"audio_count":0,"subtitle_count":0,
+            "audio_languages":[],"subtitle_languages":[],"angles":[1],"main_feature_candidate":true}]});
+        sqlx::query("UPDATE scan_jobs SET state='needs_review',attempt_id=?,sha256=?,size_bytes=?,report=? WHERE id=?")
+            .bind(&attempt).bind(checksum).bind(b"original invalid DVD".len() as i64).bind(report.to_string()).bind(&scan.id).execute(&pool).await?;
+        std::fs::write(
+            incoming.join("movie.iso"),
+            b"changed NAS copy: never stage it for this selection",
+        )?;
+        let selected = wetube_backend::scans::inspect(
+            &pool,
+            "admin",
+            &scan.id,
+            &InspectRequest { title: 4, angle: 1 },
+        )
+        .await?
+        .context("selection not queued")?;
+        assert!(tick(&pool, config.clone()).await?);
+        let failed = wetube_backend::probe_jobs::list(&pool).await?.remove(0);
+        assert_eq!(failed.id, selected.id);
+        assert_eq!(failed.state, wetube_core::ProbeState::Failed);
+        assert!(
+            failed.error.as_ref().unwrap().contains("DVD inspection"),
+            "{:?}",
+            failed.error
+        );
+        assert_eq!(
+            failed.report.as_ref().unwrap()["staged_attempt_id"],
+            attempt
+        );
+        assert_eq!(
+            std::fs::read(scratch.join(&attempt).join("input.iso"))?,
+            b"original invalid DVD"
+        );
+        assert_eq!(
+            failed.attempt_id.as_deref(),
+            Some(attempt.as_str()),
+            "selection must reuse the scan attempt"
+        );
+        assert_eq!(
+            std::fs::read_dir(&scratch)?
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| entry.path().is_dir())
+                .count(),
+            1,
+            "selection must not allocate another staging copy"
+        );
+        let revalidated = revalidate(&config, &failed)?;
+        revalidated.verify()?;
+        drop(revalidated);
+        std::fs::write(
+            scratch.join(&attempt).join("input.iso"),
+            b"tampered invalid DVD",
+        )?;
+        assert!(
+            revalidate(&config, &failed).is_err(),
+            "fresh metadata alone cannot authorize changed content"
+        );
+        pool.close().await;
+        Ok(())
+    }
 
     #[test]
     fn rejects_a_replaced_verified_staging_file() {
@@ -423,21 +602,17 @@ mod tests {
         use wetube_backend::{db, probe_jobs};
         use wetube_core::{ProbeRequest, ProbeState};
         let dir = tempfile::tempdir().unwrap();
-        let incoming = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let incoming = dir.path().join("incoming");
         let scratch = dir.path().join("scratch");
-        std::fs::write(incoming.path().join("movie.iso"), b"not a DVD").unwrap();
+        std::fs::create_dir(&state).unwrap();
+        std::fs::create_dir(&incoming).unwrap();
+        std::fs::write(incoming.join("movie.iso"), b"not a DVD").unwrap();
         let config = Arc::new(
-            ImportConfig::open(
-                incoming.path(),
-                &scratch,
-                1024,
-                4096,
-                Duration::from_secs(600),
-            )
-            .unwrap(),
+            ImportConfig::open(&incoming, &scratch, 1024, 4096, Duration::from_secs(600)).unwrap(),
         );
-        db::initialize(dir.path()).await.unwrap();
-        let pool = db::connect(dir.path()).await.unwrap();
+        db::initialize(&state).await.unwrap();
+        let pool = db::connect(&state).await.unwrap();
         sqlx::query("INSERT INTO users VALUES ('admin', 'admin', 'test hash', 'admin')")
             .execute(&pool)
             .await
@@ -462,7 +637,7 @@ mod tests {
         let retained = scratch.join(failed.attempt_id.unwrap()).join("input.iso");
         assert_eq!(std::fs::read(&retained).unwrap(), b"not a DVD");
         assert_eq!(
-            std::fs::read(incoming.path().join("movie.iso")).unwrap(),
+            std::fs::read(incoming.join("movie.iso")).unwrap(),
             b"not a DVD"
         );
 
@@ -470,7 +645,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        std::fs::write(incoming.path().join("movie.iso"), b"changed copy").unwrap();
+        std::fs::write(incoming.join("movie.iso"), b"changed copy").unwrap();
         tick(&pool, config.clone()).await.unwrap();
         let second = probe_jobs::list(&pool)
             .await

@@ -1,16 +1,17 @@
 import { expect, test, type Page } from '@playwright/test';
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { randomBytes, randomUUID } from 'node:crypto';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const title = 'E2E Test Movie';
 const password = randomBytes(24).toString('base64url');
 let root: string | undefined;
+let artifactsRoot: string | undefined;
 let server: ChildProcess | undefined;
 let worker: ChildProcess | undefined;
 let baseURL: string;
@@ -18,11 +19,13 @@ let movieId: string;
 let serverLog = '';
 let retainState = false;
 let incomingFile: string;
+let dvdIncomingFile: string;
 
-function command(program: string, args: string[], input?: string, cwd = repo): string {
+function command(program: string, args: string[], input?: string, cwd = repo, extraEnv: NodeJS.ProcessEnv = {}): string {
   const result = spawnSync(program, args, {
     cwd,
     input,
+    env: { ...process.env, ...extraEnv },
     encoding: 'utf8',
     timeout: 180_000,
     maxBuffer: 4 * 1024 * 1024,
@@ -31,6 +34,16 @@ function command(program: string, args: string[], input?: string, cwd = repo): s
     throw new Error(`${program} failed: ${result.error ?? result.stderr}`);
   }
   return result.stdout.trim();
+}
+
+function fixture(args: string[]) {
+  const preview = spawnSync('safe-exec', [...args, '--preview'], {
+    cwd: repo, encoding: 'utf8', timeout: 10_000, maxBuffer: 1024 * 1024,
+  });
+  if (preview.error || (preview.status !== 0 && preview.status !== 7)) {
+    throw new Error(`Fixture preview failed: ${preview.error ?? preview.stderr}`);
+  }
+  command('safe-exec', args);
 }
 
 async function stopProcess(child?: ChildProcess) {
@@ -47,26 +60,42 @@ async function stopProcess(child?: ChildProcess) {
 
 test.beforeAll(async ({}, testInfo) => {
   test.setTimeout(240_000);
+  const requestedArtifacts = process.env.WETUBE_E2E_ARTIFACTS_DIR;
+  if (!requestedArtifacts) {
+    throw new Error('Set WETUBE_E2E_ARTIFACTS_DIR to an existing directory under /mnt/c/TempPrivate; Linux ISO staging is prohibited.');
+  }
+  if (lstatSync(requestedArtifacts).isSymbolicLink()) {
+    throw new Error('WETUBE_E2E_ARTIFACTS_DIR must not be a symbolic link.');
+  }
+  const allowedArtifacts = realpathSync('/mnt/c/TempPrivate');
+  const artifactsBase = realpathSync(requestedArtifacts);
+  const location = relative(allowedArtifacts, artifactsBase);
+  if (location === '..' || location.startsWith(`..${sep}`) || isAbsolute(location)) {
+    throw new Error('WETUBE_E2E_ARTIFACTS_DIR must resolve under /mnt/c/TempPrivate; Linux ISO staging is prohibited.');
+  }
   retainState = testInfo.config.metadata.retainState === true;
   command('cargo', ['build', '--locked', '--package', 'wetube-server', '--package', 'wetube-worker']);
   command('rustup', ['run', 'stable', '/home/henry/.cargo/bin/trunk', 'build', '--release', '--locked'], undefined, join(repo, 'crates/web'));
   root = mkdtempSync(join(tmpdir(), 'wetube-browser-e2e-'));
+  artifactsRoot = mkdtempSync(join(artifactsBase, 'wetube-media-e2e-'));
   if (retainState) {
     const credentials = join(root, 'login.txt');
     writeFileSync(credentials, `Username: e2e-admin\nPassword: ${password}\nViewer: e2e-viewer (same test password)\n`, {
       flag: 'wx', mode: 0o600,
     });
     console.log(`Retained preview directory: ${root}`);
+    console.log(`Retained media directory: ${artifactsRoot}`);
     console.log(`Local test credentials: ${credentials}`);
   }
   const state = join(root, 'state');
-  const media = join(root, 'media');
-  const incoming = join(root, 'incoming');
-  const scratch = join(root, 'scratch');
+  const media = join(artifactsRoot, 'media');
+  const incoming = join(artifactsRoot, 'incoming');
+  const scratch = join(artifactsRoot, 'scratch');
   mkdirSync(incoming, { mode: 0o700 });
+  mkdirSync(scratch, { mode: 0o700 });
   incomingFile = join(incoming, 'browser-invalid.iso');
   const attempt = randomUUID();
-  const attemptDir = join(root, attempt);
+  const attemptDir = join(artifactsRoot, attempt);
   mkdirSync(media, { mode: 0o700 });
   mkdirSync(attemptDir, { mode: 0o700 });
   const movie = join(attemptDir, 'movie.mp4');
@@ -80,9 +109,31 @@ test.beforeAll(async ({}, testInfo) => {
   ]);
   // Stream the payload hash rather than loading it into a size-limited Rhai blob.
   const digest = command('sha256sum', [movie]).split(/\s+/, 1)[0];
-  command('safe-exec', [
+  fixture([
     join(repo, 'tests/e2e/fixture-report.rhai'), report, incomingFile, '--arg', `attempt=${attempt}`,
   ]);
+  const dvdSource = join(artifactsRoot, 'dvd-source');
+  const dvdDirectory = join(artifactsRoot, 'authored-dvd');
+  mkdirSync(dvdSource, { mode: 0o700 });
+  const longVob = join(dvdSource, 'long.vob');
+  const shortVob = join(dvdSource, 'short.vob');
+  for (const [vob, seconds] of [[longVob, '6'], [shortVob, '3']]) {
+    command('ffmpeg', [
+      '-hide_banner', '-nostdin', '-v', 'error',
+      '-f', 'lavfi', '-i', 'testsrc2=size=720x480:rate=30000/1001',
+      '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000',
+      '-t', seconds, '-target', 'ntsc-dvd', '-aspect', '4:3', '-threads', '2',
+      '-c:a', 'ac3', '-b:a', '192k', '-ac', '2', vob,
+    ]);
+  }
+  const dvdXml = join(dvdSource, 'dvd.xml');
+  fixture([
+    join(repo, 'tests/e2e/fixture-dvd.rhai'), dvdXml,
+    '--arg', `long_file=${longVob}`, '--arg', `short_file=${shortVob}`,
+  ]);
+  command('dvdauthor', ['-o', dvdDirectory, '-x', dvdXml], undefined, repo, { VIDEO_FORMAT: 'NTSC' });
+  dvdIncomingFile = join(incoming, 'browser-valid.iso');
+  command('genisoimage', ['-quiet', '-dvd-video', '-o', dvdIncomingFile, dvdDirectory]);
   const binary = join(repo, 'target/debug/wetube-server');
   command(binary, ['--state-dir', state, 'init']);
   command(binary, ['--state-dir', state, 'add-user', '--username', 'e2e-admin', '--admin', '--password-stdin'], `${password}\n`);
@@ -111,11 +162,13 @@ test.beforeAll(async ({}, testInfo) => {
     '--state-dir', state, 'serve', '--bind', `127.0.0.1:${port}`,
     '--origin', baseURL,
     '--static-dir', join(repo, 'dist'), '--media-dir', media, '--incoming-dir', incoming,
+    '--scratch-dir', scratch,
   ], { cwd: repo, stdio: ['ignore', 'pipe', 'pipe'] });
   server.stdout?.on('data', chunk => { serverLog = (serverLog + chunk).slice(-16_384); });
   server.stderr?.on('data', chunk => { serverLog = (serverLog + chunk).slice(-16_384); });
   worker = spawn(join(repo, 'target/debug/wetube-worker'), [
     '--state-dir', state, 'run', '--incoming-dir', incoming, '--scratch-dir', scratch,
+    '--media-dir', media,
   ], { cwd: repo, stdio: ['ignore', 'ignore', 'pipe'] });
   worker.stderr?.on('data', chunk => { serverLog = (serverLog + chunk).slice(-16_384); });
   const deadline = Date.now() + 20_000;
@@ -134,6 +187,7 @@ test.beforeAll(async ({}, testInfo) => {
 test.afterAll(async () => {
   await stopProcess(worker);
   await stopProcess(server);
+  if (artifactsRoot && !retainState) rmSync(artifactsRoot, { recursive: true, force: true });
   if (root && !retainState) rmSync(root, { recursive: true, force: true });
 });
 
@@ -233,7 +287,7 @@ test('failed resume save still allows returning to the library with a warning', 
   await expect(page.getByRole('alert')).toContainText(/resume|playback position/i);
 });
 
-test('admin diagnostics and ISO selection reach persisted worker results without publication', async ({ page }) => {
+test('admin diagnostics and ISO scanning retain failed input without publication', async ({ page }) => {
   await login(page, 'e2e-admin');
   await expect(page.getByText('Worker connected', { exact: true })).toBeVisible();
   await page.getByRole('button', { name: 'Run read-only diagnostics', exact: true }).click();
@@ -241,24 +295,224 @@ test('admin diagnostics and ISO selection reach persisted worker results without
     const jobs = await (await page.request.get(`${baseURL}/api/v1/jobs`)).json();
     return jobs.some(job => job.state === 'succeeded' || job.state === 'failed');
   }).toBe(true);
-  await expect(page.getByText(/Media prerequisites (available|need attention)/)).toBeVisible();
-  const original = (await (await page.request.get(`${baseURL}/api/v1/admin/incoming`)).json()).files[0];
+  await expect(page.getByText('Required scan, inspection and conversion capabilities available. Optional OCR does not determine readiness.', { exact: true })).toBeVisible();
+  const original = (await (await page.request.get(`${baseURL}/api/v1/admin/incoming`)).json()).files.find(file => file.name === 'browser-invalid.iso');
   const originalHash = command('sha256sum', [incomingFile]).split(/\s+/, 1)[0];
   await page.getByRole('button', { name: 'Refresh incoming files', exact: true }).click();
   await page.getByLabel('Completed ISO copy', { exact: true }).selectOption({ index: 1 });
-  await page.getByLabel('DVD title (1-99)', { exact: true }).fill('1');
-  await page.getByLabel('Angle (1-9)', { exact: true }).fill('1');
   await page.getByRole('checkbox', { name: /I confirm this copy is finished/ }).check();
-  await page.getByRole('button', { name: 'Stage and inspect selected title', exact: true }).click();
+  await page.getByRole('button', { name: 'Scan DVD', exact: true }).click();
   await expect.poll(async () => {
-    const jobs = await (await page.request.get(`${baseURL}/api/v1/admin/probes`)).json();
+    const { jobs } = await (await page.request.get(`${baseURL}/api/v1/admin/scans`)).json();
     return jobs.some(job => job.name === 'browser-invalid.iso' && job.state === 'failed');
   }).toBe(true);
-  await expect(page.getByText('Failed - inputs retained', { exact: true })).toBeVisible();
-  const jobs = await (await page.request.get(`${baseURL}/api/v1/admin/probes`)).json();
-  expect(jobs.find(job => job.name === 'browser-invalid.iso').report.sha256).toBe(originalHash);
+  await expect(page.getByText('Scan failed — ISO, reports and logs retained', { exact: true })).toBeVisible();
+  const { jobs } = await (await page.request.get(`${baseURL}/api/v1/admin/scans`)).json();
+  const failed = jobs.find(job => job.name === 'browser-invalid.iso');
+  expect(failed.attempt_id).toBeTruthy();
+  expect(command('sha256sum', [join(artifactsRoot!, 'scratch', failed.attempt_id, 'input.iso')]).split(/\s+/, 1)[0]).toBe(originalHash);
   expect(command('sha256sum', [incomingFile]).split(/\s+/, 1)[0]).toBe(originalHash);
-  const retained = (await (await page.request.get(`${baseURL}/api/v1/admin/incoming`)).json()).files[0];
+  const retained = (await (await page.request.get(`${baseURL}/api/v1/admin/incoming`)).json()).files.find(file => file.name === original.name);
   expect(retained.identity).toBe(original.identity);
   expect((await (await page.request.get(`${baseURL}/api/v1/movies`)).json()).movies).toHaveLength(1);
+});
+
+test('scanned title and angle choices gate conversion and explicit publication through mocked contracts', async ({ page }) => {
+  const scanId = randomUUID();
+  const probeId = randomUUID();
+  const conversionId = randomUUID();
+  const digest = 'a'.repeat(64);
+  const scan = {
+    id: scanId, name: 'browser-invalid.iso', state: 'needs_review',
+    created_at: Math.floor(Date.now() / 1000), attempt_id: randomUUID(), error: null,
+    report: { titles: [
+      { title: 1, duration_seconds: 8, chapter_count: 1, audio_count: 1, subtitle_count: 0,
+        audio_languages: ['en'], subtitle_languages: [], angles: [1], main_feature_candidate: false },
+      { title: 2, duration_seconds: 60, chapter_count: 3, audio_count: 2, subtitle_count: 1,
+        audio_languages: ['en', 'fr'], subtitle_languages: ['en'], angles: [1, 2], main_feature_candidate: true },
+    ] },
+  };
+  const probe = {
+    id: probeId, name: scan.name, title: 2, angle: 2, state: 'needs_review',
+    created_at: scan.created_at, attempt_id: scan.attempt_id, error: null,
+    report: { sha256: digest, inspection: { warnings: [], metadata: {
+      format: { duration: '60' },
+      streams: [
+        { codec_type: 'video', codec_name: 'mpeg2video', width: 720, height: 480 },
+        { codec_type: 'audio', codec_name: 'ac3', channels: 2, tags: { language: 'en' } },
+      ],
+    } } },
+  };
+  let inspected = false;
+  let conversionState: string | undefined;
+  let conversionPolls = 0;
+  const conversion = () => ({
+    id: conversionId, probe_job_id: probeId, state: conversionState,
+    created_at: scan.created_at, attempt_id: randomUUID(), video_treatment: 'yadif',
+    phase: conversionState === 'needs_review' ? 'awaiting_review' : conversionState,
+    error: null, movie_id: conversionState === 'published' ? movieId : null,
+    movie_sha256: conversionState === 'needs_review' || conversionState === 'published' ? digest : null,
+    report: {
+      experimental: true, published: false, source_deletion_enabled: false,
+      status: 'verified_experimental_output', warnings: [],
+      profile: { video_treatment: 'yadif' },
+      validation: { source_decoded_frames: 192, output_decoded_frames: 192,
+        source_decoded_seconds: 8, output_decoded_seconds: 8,
+        movie: { format: { duration: '8' }, streams: [
+          { codec_type: 'video', codec_name: 'h264', width: 160, height: 90, pix_fmt: 'yuv420p' },
+          { codec_type: 'audio', codec_name: 'aac', channels: 2 },
+        ] } },
+    },
+  });
+  await page.route('**/api/v1/admin/scans', route => route.fulfill({ json: { jobs: [scan] } }));
+  await page.route(`**/api/v1/admin/scans/${scanId}/inspect`, async route => {
+    expect(route.request().postDataJSON()).toEqual({ title: 2, angle: 2 });
+    expect(route.request().headers()['x-csrf-token']).toBeTruthy();
+    inspected = true;
+    await route.fulfill({ status: 202, json: probe });
+  });
+  await page.route('**/api/v1/admin/probes', route => route.fulfill({ json: inspected ? [probe] : [] }));
+  await page.route('**/api/v1/admin/conversions', async route => {
+    if (route.request().method() === 'POST') {
+      expect(route.request().postDataJSON()).toEqual({ probe_job_id: probeId, video_treatment: 'yadif' });
+      expect(route.request().headers()['x-csrf-token']).toBeTruthy();
+      conversionState = 'queued';
+      await route.fulfill({ status: 202, json: conversion() });
+    } else {
+      if (conversionState === 'queued' || conversionState === 'converting') {
+        conversionState = ++conversionPolls >= 2 ? 'needs_review' : 'converting';
+      } else if (conversionState === 'queued_publication') {
+        conversionState = 'published';
+      }
+      await route.fulfill({ json: { jobs: conversionState ? [conversion()] : [] } });
+    }
+  });
+  await page.route(`**/api/v1/admin/conversions/${conversionId}/publish`, async route => {
+    expect(route.request().postDataJSON()).toEqual({
+      title: 'Reviewed DVD title', year: 2002, description: 'Reviewed metadata',
+      movie_sha256: digest, confirm: true,
+    });
+    expect(route.request().headers()['x-csrf-token']).toBeTruthy();
+    conversionState = 'queued_publication';
+    await route.fulfill({ status: 202, json: conversion() });
+  });
+
+  await login(page, 'e2e-admin');
+  const scanCard = page.locator(`[data-testid="scan-job"][data-job-id="${scanId}"]`);
+  const titleSelect = scanCard.getByRole('combobox', { name: 'DVD title', exact: true });
+  await expect(titleSelect.locator('option')).toHaveCount(3);
+  await titleSelect.selectOption('1');
+  await expect(scanCard.getByRole('combobox', { name: 'DVD angle', exact: true })).toHaveCount(0);
+  await titleSelect.selectOption('2');
+  const angleSelect = scanCard.getByRole('combobox', { name: 'DVD angle', exact: true });
+  await expect(angleSelect.locator('option')).toHaveCount(3);
+  await angleSelect.selectOption('2');
+  await scanCard.getByRole('button', { name: 'Inspect selected title', exact: true }).click();
+
+  const probeCard = page.locator(`[data-testid="probe-job"][data-job-id="${probeId}"]`);
+  const convert = probeCard.getByRole('button', { name: 'Convert reviewed title', exact: true });
+  await expect(convert).toBeDisabled();
+  await probeCard.getByRole('combobox', { name: 'Video treatment', exact: true }).selectOption('yadif');
+  await probeCard.getByRole('checkbox', { name: /I reviewed this inspection and warnings/ }).check();
+  await convert.click();
+
+  const conversionCard = page.locator(`[data-testid="conversion-job"][data-job-id="${conversionId}"]`);
+  await expect(conversionCard.getByText('Conversion needs review — not published', { exact: true })).toBeVisible();
+  const publish = conversionCard.getByRole('button', { name: 'Publish to local library', exact: true });
+  await expect(publish).toBeDisabled();
+  await conversionCard.getByRole('textbox', { name: 'Movie title', exact: true }).fill('Reviewed DVD title');
+  await conversionCard.getByRole('spinbutton', { name: 'Year (optional)', exact: true }).fill('2002');
+  await conversionCard.getByRole('textbox', { name: 'Description', exact: true }).fill('Reviewed metadata');
+  await expect(publish).toBeDisabled();
+  await conversionCard.getByRole('checkbox', { name: /I reviewed the validated conversion, warnings and metadata/ }).check();
+  await page.waitForResponse(response => response.url().endsWith('/api/v1/admin/conversions') && response.request().method() === 'GET');
+  await expect(conversionCard.getByRole('textbox', { name: 'Movie title', exact: true })).toHaveValue('Reviewed DVD title');
+  await publish.click();
+  await expect(conversionCard.getByText('Published to the local library', { exact: true })).toBeVisible();
+  await conversionCard.getByRole('button', { name: 'Watch published movie', exact: true }).click();
+  await expect(page.getByTestId('movie-player')).toBeVisible();
+});
+
+test('real DVD scan, selected inspection, conversion, publication and playback preserve inputs', async ({ page }) => {
+  test.setTimeout(120_000);
+  await login(page, 'e2e-admin');
+  const original = (await (await page.request.get(`${baseURL}/api/v1/admin/incoming`)).json()).files.find(file => file.name === 'browser-valid.iso');
+  const originalHash = command('sha256sum', [dvdIncomingFile]).split(/\s+/, 1)[0];
+  await page.getByRole('button', { name: 'Refresh incoming files', exact: true }).click();
+  const incomingSelect = page.getByRole('combobox', { name: 'Completed ISO copy', exact: true });
+  const selectedValue = await incomingSelect.locator('option').filter({ hasText: 'browser-valid.iso' }).getAttribute('value');
+  expect(selectedValue).toBeTruthy();
+  await incomingSelect.selectOption(selectedValue!);
+  await page.getByRole('checkbox', { name: /I confirm this copy is finished/ }).check();
+  const scanResponse = page.waitForResponse(response => response.url().endsWith('/api/v1/admin/scans') && response.request().method() === 'POST');
+  await page.getByRole('button', { name: 'Scan DVD', exact: true }).click();
+  const scan = await (await scanResponse).json();
+  const scanCard = page.locator(`[data-testid="scan-job"][data-job-id="${scan.id}"]`);
+  const titleSelect = scanCard.getByRole('combobox', { name: 'DVD title', exact: true });
+  await expect(titleSelect.locator('option')).toHaveCount(3, { timeout: 30_000 });
+  const { jobs: scans } = await (await page.request.get(`${baseURL}/api/v1/admin/scans`)).json();
+  const completedScan = scans.find(job => job.id === scan.id);
+  await titleSelect.selectOption('2');
+  await expect(scanCard.getByRole('combobox', { name: 'DVD angle', exact: true })).toHaveCount(0);
+
+  const probeResponse = page.waitForResponse(response => response.url().endsWith(`/admin/scans/${scan.id}/inspect`) && response.request().method() === 'POST');
+  await scanCard.getByRole('button', { name: 'Inspect selected title', exact: true }).click();
+  const probe = await (await probeResponse).json();
+  expect(probe.attempt_id).toBe(completedScan.attempt_id);
+  const probeCard = page.locator(`[data-testid="probe-job"][data-job-id="${probe.id}"]`);
+  const convert = probeCard.getByRole('button', { name: 'Convert reviewed title', exact: true });
+  await expect(convert).toBeVisible({ timeout: 30_000 });
+  await probeCard.getByRole('combobox', { name: 'Video treatment', exact: true }).selectOption('preserve');
+  await probeCard.getByRole('checkbox', { name: /I reviewed this inspection and warnings/ }).check();
+  const conversionResponse = page.waitForResponse(response => response.url().endsWith('/api/v1/admin/conversions') && response.request().method() === 'POST');
+  await convert.click();
+  const queued = await (await conversionResponse).json();
+  await expect.poll(async () => {
+    const { jobs } = await (await page.request.get(`${baseURL}/api/v1/admin/conversions`)).json();
+    const current = jobs.find(job => job.id === queued.id);
+    if (current?.state === 'failed') throw new Error(`DVD conversion failed: ${current.error}`);
+    return current?.state;
+  }, { timeout: 45_000 }).toBe('needs_review');
+  const { jobs: convertedJobs } = await (await page.request.get(`${baseURL}/api/v1/admin/conversions`)).json();
+  const converted = convertedJobs.find(job => job.id === queued.id);
+  expect(converted.report.input_sha256).toBe(originalHash);
+  expect(converted.report.validation.output_decoded_frames).toBe(converted.report.validation.source_decoded_frames);
+  expect(converted.movie_sha256).toMatch(/^[a-f0-9]{64}$/);
+
+  const convertedCard = page.locator(`[data-testid="conversion-job"][data-job-id="${queued.id}"]`);
+  await convertedCard.getByRole('textbox', { name: 'Movie title', exact: true }).fill('E2E Converted DVD');
+  await convertedCard.getByRole('spinbutton', { name: 'Year (optional)', exact: true }).fill('2002');
+  await convertedCard.getByRole('textbox', { name: 'Description', exact: true }).fill('Generated DVD fixture; not a NAS movie.');
+  await convertedCard.getByRole('checkbox', { name: /I reviewed the validated conversion, warnings and metadata/ }).check();
+  await convertedCard.getByRole('button', { name: 'Publish to local library', exact: true }).click();
+  await expect.poll(async () => {
+    const { jobs } = await (await page.request.get(`${baseURL}/api/v1/admin/conversions`)).json();
+    const current = jobs.find(job => job.id === queued.id);
+    if (current?.state === 'failed') throw new Error(`DVD publication failed: ${current.error}`);
+    return current?.state;
+  }, { timeout: 30_000 }).toBe('published');
+  const library = await (await page.request.get(`${baseURL}/api/v1/movies`)).json();
+  const published = library.movies.filter(movie => movie.title === 'E2E Converted DVD');
+  expect(published).toHaveLength(1);
+  expect(library.movies).toHaveLength(2);
+  const range = await page.request.get(`${baseURL}/api/v1/movies/${published[0].id}/video`, { headers: { Range: 'bytes=0-31' } });
+  expect(range.status()).toBe(206);
+  expect((await range.body()).length).toBe(32);
+  const browserMedia = page.waitForResponse(response =>
+    response.url().endsWith(`/api/v1/movies/${published[0].id}/video`)
+    && response.request().resourceType() === 'media');
+  await convertedCard.getByRole('button', { name: 'Watch published movie', exact: true }).click();
+  expect((await browserMedia).status()).toBe(206);
+  const video = page.getByTestId('movie-player');
+  await expect.poll(() => video.evaluate((element: HTMLVideoElement) => element.readyState)).toBeGreaterThanOrEqual(1);
+  expect(await video.evaluate((element: HTMLVideoElement) => element.duration)).toBeGreaterThan(2);
+  expect(await video.evaluate((element: HTMLVideoElement) => element.duration)).toBeLessThan(4);
+  await video.evaluate(async (element: HTMLVideoElement) => { element.muted = true; await element.play(); });
+  await expect.poll(() => video.evaluate((element: HTMLVideoElement) => element.currentTime)).toBeGreaterThan(0.25);
+
+  expect(command('sha256sum', [dvdIncomingFile]).split(/\s+/, 1)[0]).toBe(originalHash);
+  const retained = (await (await page.request.get(`${baseURL}/api/v1/admin/incoming`)).json()).files.find(file => file.name === original.name);
+  expect(retained.identity).toBe(original.identity);
+  const media = join(artifactsRoot!, 'media');
+  expect(readdirSync(media).some(packageName => existsSync(join(media, packageName, 'original-tracks.mkv')))).toBe(true);
 });

@@ -5,11 +5,15 @@ use tokio::process::Command;
 use wetube_backend::now;
 use wetube_core::{DiagnosticReport, ToolCheck};
 
+pub mod admission;
+pub mod conversions;
+pub mod dvdnav;
 pub mod experimental;
 pub mod imports;
 pub mod preview;
 pub mod probe;
 mod process;
+pub mod scans;
 
 const OUTPUT_LIMIT: usize = 64 * 1024;
 
@@ -47,6 +51,7 @@ pub async fn diagnose() -> DiagnosticReport {
     for (name, args) in [
         ("ffmpeg", vec!["-version"]),
         ("ffprobe", vec!["-version"]),
+        ("lsdvd", vec!["-V"]),
         ("tesseract", vec!["--version"]),
     ] {
         let output = tool_output(name, &args).await;
@@ -63,6 +68,21 @@ pub async fn diagnose() -> DiagnosticReport {
             },
         });
     }
+    let native = dvdnav::available();
+    let fallback = tools
+        .iter()
+        .any(|tool| tool.name == "lsdvd" && tool.available);
+    tools.push(ToolCheck {
+        name: "DVD discovery".into(),
+        available: native.is_ok() || fallback,
+        detail: match native {
+            Ok(()) => "Integrated libdvdnav title/chapter/angle inventory is available".into(),
+            Err(_) if fallback => "Optional lsdvd inventory fallback is available".into(),
+            Err(error) => {
+                format!("DVD discovery unavailable: {error}; optional lsdvd fallback missing")
+            }
+        },
+    });
     let mut dvdvideo_available = true;
     for program in ["ffmpeg", "ffprobe"] {
         dvdvideo_available &= tool_output(program, &["-hide_banner", "-h", "demuxer=dvdvideo"])
@@ -122,7 +142,7 @@ pub async fn tick(pool: &SqlitePool) -> Result<bool> {
         return Ok(false);
     };
     let report = diagnose().await;
-    let healthy = report.tools.iter().all(|tool| tool.available);
+    let healthy = report.required_tools_available();
     sqlx::query(
         "UPDATE diagnostic_jobs SET state = ?, finished_at = ?, report = ?, error = ?
          WHERE id = ? AND state = 'running'",
@@ -130,7 +150,11 @@ pub async fn tick(pool: &SqlitePool) -> Result<bool> {
     .bind(if healthy { "succeeded" } else { "failed" })
     .bind(now())
     .bind(serde_json::to_string(&report)?)
-    .bind((!healthy).then_some("One or more media prerequisites are unavailable"))
+    .bind(
+        (!healthy).then_some(
+            "One or more required scan/conversion tools are unavailable; OCR is optional",
+        ),
+    )
     .bind(id)
     .execute(pool)
     .await?;

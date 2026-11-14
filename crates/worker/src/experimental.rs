@@ -166,6 +166,7 @@ fn dvd_input(command: &mut Command, options: &Options, file: &File) -> Result<()
 
 fn ffmpeg() -> Command {
     let mut command = Command::new("ffmpeg");
+    command.env("DVDCSS_CACHE", "off");
     command.args([
         "-hide_banner",
         "-nostdin",
@@ -392,6 +393,7 @@ async fn media_pipeline(
     file: &mut File,
     dvd: bool,
     cancel: &mut watch::Receiver<bool>,
+    job: Option<(&sqlx::SqlitePool, &str)>,
 ) -> Result<Value> {
     let timeout = Duration::from_secs(options.tool_timeout_secs);
     file.rewind()?;
@@ -410,6 +412,7 @@ async fn media_pipeline(
             ])
             .stdin(Stdio::from(file.try_clone()?));
     }
+    phase(job, "source_decode").await?;
     let source_progress = tool(
         "source-decode",
         decode.args([
@@ -528,6 +531,7 @@ async fn media_pipeline(
             &descriptor(tracks),
         ]);
     }
+    phase(job, "encoding").await?;
     tool("encode", &mut encode, timeout, cancel, directory).await?;
     let after_encode = file.metadata()?;
     ensure!(
@@ -549,6 +553,13 @@ async fn media_pipeline(
     drop(movie);
     drop(tracks);
     File::open(directory)?.sync_all()?;
+    let movie_snapshot = identity(&open_input(&movie_path)?.metadata()?);
+    let tracks_snapshot = if has_tracks {
+        Some(identity(&open_input(&tracks_path)?.metadata()?))
+    } else {
+        None
+    };
+    phase(job, "validating").await?;
     let movie_metadata = probe_output(
         &movie_path,
         "mov",
@@ -577,11 +588,21 @@ async fn media_pipeline(
 
     let movie = open_input(&movie_path)?;
     let movie_identity = identity(&movie.metadata()?);
+    ensure!(
+        movie_identity == movie_snapshot,
+        "movie changed during probe validation"
+    );
     let tracks = if has_tracks {
         Some(open_input(&tracks_path)?)
     } else {
         None
     };
+    if let Some(tracks) = &tracks {
+        ensure!(
+            Some(identity(&tracks.metadata()?)) == tracks_snapshot,
+            "original tracks changed during probe validation"
+        );
+    }
     let mut verify = ffmpeg();
     verify
         .args([
@@ -638,6 +659,13 @@ async fn media_pipeline(
             && identity(&std::fs::symlink_metadata(&movie_path)?) == movie_identity,
         "movie changed during verification"
     );
+    if let Some(tracks) = &tracks {
+        ensure!(
+            Some(identity(&tracks.metadata()?)) == tracks_snapshot
+                && Some(identity(&std::fs::symlink_metadata(&tracks_path)?)) == tracks_snapshot,
+            "original tracks changed during verification"
+        );
+    }
     ensure!(
         output_frames == source_frames,
         "decoded output frame count changed: {output_frames} versus {source_frames}"
@@ -647,6 +675,7 @@ async fn media_pipeline(
         "source_decoded_frames": source_frames, "source_decoded_seconds": source_seconds,
         "output_decoded_frames": output_frames, "output_decoded_seconds": output_seconds,
         "movie": movie_metadata, "original_tracks": tracks_metadata,
+        "movie_identity":movie_snapshot,"original_tracks_identity":tracks_snapshot,
     }))
 }
 
@@ -737,6 +766,7 @@ fn resume_staged(
         sha256,
         size_bytes: size,
         identity: before,
+        _directory: None,
     })
 }
 
@@ -819,6 +849,7 @@ async fn run_inner(options: Options, mut cancel: watch::Receiver<bool>) -> Resul
             options
                 .max_output_bytes
                 .checked_mul(2)
+                .and_then(|bytes|bytes.checked_add(32*1024*1024))
                 .context("output reservation overflow")?,
         )?;
         staged.verify()?;
@@ -835,6 +866,7 @@ async fn run_inner(options: Options, mut cancel: watch::Receiver<bool>) -> Resul
             &mut staged.file,
             true,
             &mut cancel,
+            None,
         )
         .await?;
         staged.verify()?;
@@ -885,6 +917,181 @@ pub async fn run(options: Options) -> Result<PathBuf> {
             work.await
         },
     }
+}
+
+async fn phase(job: Option<(&sqlx::SqlitePool, &str)>, phase: &str) -> Result<()> {
+    if let Some((pool, id)) = job {
+        sqlx::query("UPDATE conversion_jobs SET phase=? WHERE id=? AND state='converting'")
+            .bind(phase)
+            .bind(id)
+            .execute(pool)
+            .await?;
+    }
+    Ok(())
+}
+
+pub(crate) fn bounded_hash(file: &mut File, size: u64, timeout: Duration) -> Result<String> {
+    file.rewind()?;
+    let before = identity(&file.metadata()?);
+    let deadline = Instant::now() + timeout;
+    let mut digest = Sha256::new();
+    let mut count = 0u64;
+    let mut buffer = [0u8; 128 * 1024];
+    loop {
+        ensure!(
+            Instant::now() < deadline,
+            "checksum verification deadline exceeded"
+        );
+        let bytes = file.read(&mut buffer)?;
+        if bytes == 0 {
+            break;
+        }
+        count = count.checked_add(bytes as u64).context("hash overflow")?;
+        ensure!(count <= size, "input grew during checksum verification");
+        digest.update(&buffer[..bytes]);
+    }
+    ensure!(
+        count == size && identity(&file.metadata()?) == before,
+        "input changed during checksum verification"
+    );
+    file.rewind()?;
+    Ok(hex::encode(digest.finalize()))
+}
+
+pub(crate) async fn convert(
+    pool: &sqlx::SqlitePool,
+    config: Arc<super::imports::ImportConfig>,
+    job: &wetube_core::ConversionJob,
+    probe: &wetube_core::ProbeJob,
+    limits: &super::conversions::Limits,
+) -> Result<Value> {
+    let attempt = job
+        .attempt_id
+        .as_deref()
+        .context("missing conversion attempt")?;
+    let directory = config.scratch_path().join(attempt);
+    std::fs::DirBuilder::new().mode(0o700).create(&directory)?;
+    File::open(config.scratch_path())?.sync_all()?;
+    let mut report = json!({
+        "experimental":true,"published":false,"source_deletion_enabled":false,
+        "attempt_id":attempt,"probe_job_id":probe.id,"source_name":probe.name,
+        "title":probe.title,"angle":probe.angle,"profile":{"video_treatment":job.video_treatment},
+        "warnings":["Local-library profile only. Original inputs and tracks retained; no OCR or source cleanup."]
+    });
+    let result: Result<()> = async {
+        let staged_config = config.clone();
+        let staged_probe = probe.clone();
+        phase(Some((pool, &job.id)), "revalidating_input").await?;
+        let mut staged = tokio::task::spawn_blocking(move || {
+            super::imports::revalidate(&staged_config, &staged_probe)
+        })
+        .await??;
+        report["input_sha256"] = json!(staged.sha256);
+        report["input_size_bytes"] = json!(staged.size_bytes);
+        report["staged_identity"] = json!(staged.identity);
+        report["staged_attempt_id"] = probe
+            .report
+            .as_ref()
+            .and_then(|report| report.get("staged_attempt_id"))
+            .cloned()
+            .unwrap_or_else(|| json!(probe.attempt_id));
+        config.require_capacity(
+            limits
+                .max_output_bytes
+                .checked_mul(2)
+                .and_then(|bytes| bytes.checked_add(32 * 1024 * 1024))
+                .context("output overflow")?,
+        )?;
+        staged.verify()?;
+        let inspection =
+            super::probe::inspect_open_iso(&staged.path, &staged.file, probe.title, probe.angle)
+                .await?;
+        staged.verify()?;
+        report["inspection"] = inspection;
+        let options = Options {
+            iso: staged.path.clone(),
+            scratch_dir: config.scratch_path(),
+            title: probe.title,
+            angle: probe.angle,
+            copy_complete: true,
+            video_treatment: match job.video_treatment {
+                wetube_core::VideoTreatment::Preserve => VideoTreatment::Preserve,
+                wetube_core::VideoTreatment::Yadif => VideoTreatment::Yadif,
+            },
+            staging_timeout_secs: 600,
+            tool_timeout_secs: limits.timeout.as_secs(),
+            threads: limits.threads,
+            max_output_bytes: limits.max_output_bytes,
+            max_scratch_bytes: 0,
+            resume_attempt: None,
+        };
+        let (_sender, mut cancel) = watch::channel(false);
+        report["validation"] = media_pipeline(
+            &options,
+            &directory,
+            &report["inspection"]["metadata"],
+            &mut staged.file,
+            true,
+            &mut cancel,
+            Some((pool, &job.id)),
+        )
+        .await?;
+        staged.verify()?;
+        for name in ["movie.mp4", "original-tracks.mkv"] {
+            let path = directory.join(name);
+            if name == "original-tracks.mkv" && report["validation"]["original_tracks"].is_null() {
+                continue;
+            }
+            let mut file = open_input(&path)?;
+            let before = identity(&file.metadata()?);
+            let expected_identity = report["validation"][if name == "movie.mp4" {
+                "movie_identity"
+            } else {
+                "original_tracks_identity"
+            }]
+            .as_str()
+            .context("validation missing output identity")?;
+            ensure!(
+                before == expected_identity,
+                "validated output changed before final hashing"
+            );
+            let size = file.metadata()?.len();
+            let timeout = limits.timeout;
+            let digest =
+                tokio::task::spawn_blocking(move || bounded_hash(&mut file, size, timeout))
+                    .await??;
+            ensure!(
+                identity(&open_input(&path)?.metadata()?) == before,
+                "output replaced while hashing"
+            );
+            report[if name == "movie.mp4" {
+                "movie_sha256"
+            } else {
+                "original_tracks_sha256"
+            }] = json!(digest);
+        }
+        staged.verify()?;
+        Ok(())
+    }
+    .await;
+    report["status"] = json!(if result.is_ok() {
+        "verified_experimental_output"
+    } else {
+        "failed"
+    });
+    if let Err(error) = &result {
+        report["error"] = json!(format!("{error:#}"));
+    }
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(directory.join("report.json"))?;
+    file.write_all(&serde_json::to_vec_pretty(&report)?)?;
+    file.sync_all()?;
+    File::open(&directory)?.sync_all()?;
+    // The caller persists even failed reports, never treating old output as a successful retry.
+    Ok(report)
 }
 
 #[cfg(test)]
@@ -1179,6 +1386,7 @@ mod tests {
             &mut input,
             false,
             &mut cancel,
+            None,
         )
         .await?;
         assert_eq!(validation["source_decoded_frames"], 50);
@@ -1204,6 +1412,110 @@ mod tests {
         );
         assert!(dir.path().join("movie.mp4").metadata()?.len() > 0);
         assert!(dir.path().join("original-tracks.mkv").metadata()?.len() > 0);
+        let library = tempfile::tempdir()?;
+        let state = library.path().join("state");
+        let media = library.path().join("media");
+        let incoming = library.path().join("incoming");
+        std::fs::create_dir(&state)?;
+        std::fs::create_dir(&media)?;
+        std::fs::create_dir(&incoming)?;
+        wetube_backend::db::initialize(&state).await?;
+        let pool = wetube_backend::db::connect(&state).await?;
+        sqlx::query("INSERT INTO users VALUES ('admin','admin','hash','admin')")
+            .execute(&pool)
+            .await?;
+        sqlx::query("INSERT INTO probe_jobs(id,requested_by,name,source_identity,title,angle,state,created_at,attempt_id,report) VALUES('probe','admin','fixture.iso','identity',1,1,'needs_review',1,'staged','{}')")
+            .execute(&pool).await?;
+        let attempt = uuid::Uuid::new_v4().to_string();
+        let output_directory = dir.path().join(&attempt);
+        std::fs::create_dir(&output_directory)?;
+        // Move only generated outputs to the UUID attempt layout used by admission.
+        for name in ["movie.mp4", "original-tracks.mkv"] {
+            std::fs::rename(dir.path().join(name), output_directory.join(name))?;
+        }
+        let movie_bytes = std::fs::read(output_directory.join("movie.mp4"))?;
+        let tracks_bytes = std::fs::read(output_directory.join("original-tracks.mkv"))?;
+        let movie_digest = hex::encode(Sha256::digest(&movie_bytes));
+        let report = json!({
+            "experimental":true,"published":false,"source_deletion_enabled":false,
+            "status":"verified_experimental_output","attempt_id":attempt,"validation":validation,
+            "movie_sha256":movie_digest,"original_tracks_sha256":hex::encode(Sha256::digest(&tracks_bytes))
+        });
+        std::fs::write(
+            output_directory.join("report.json"),
+            serde_json::to_vec_pretty(&report)?,
+        )?;
+        let job = wetube_backend::conversions::enqueue(
+            &pool,
+            "admin",
+            &wetube_core::ConversionRequest {
+                probe_job_id: "probe".into(),
+                video_treatment: wetube_core::VideoTreatment::Yadif,
+            },
+        )
+        .await?
+        .context("conversion not queued")?;
+        sqlx::query("UPDATE conversion_jobs SET state='needs_review',attempt_id=?,report=?,movie_sha256=? WHERE id=?")
+            .bind(&attempt).bind(report.to_string()).bind(&movie_digest).bind(&job.id).execute(&pool).await?;
+        wetube_backend::conversions::publish(
+            &pool,
+            &job.id,
+            &wetube_core::PublishRequest {
+                title: "Verified fixture".into(),
+                year: Some(2026),
+                description: "Generated media".into(),
+                movie_sha256: movie_digest,
+                confirm: true,
+            },
+        )
+        .await?
+        .context("publication not queued")?;
+        let config = Arc::new(super::super::imports::ImportConfig::open(
+            &incoming,
+            dir.path(),
+            1024 * 1024,
+            64 * 1024 * 1024,
+            Duration::from_secs(30),
+        )?);
+        let media = wetube_backend::preview::PreviewRoot::open(&media)?;
+        let limits = super::super::conversions::Limits {
+            timeout: Duration::from_secs(30),
+            threads: 1,
+            max_output_bytes: 8 * 1024 * 1024,
+        };
+        assert!(super::super::conversions::tick(&pool, config.clone(), &media, &limits).await?);
+        let published = wetube_backend::conversions::list(&pool).await?.remove(0);
+        assert_eq!(
+            published.state,
+            wetube_core::ConversionState::Published,
+            "{:?}",
+            published.error
+        );
+        let package: String =
+            sqlx::query_scalar("SELECT package_id FROM preview_media WHERE movie_id=?")
+                .bind(published.movie_id.as_ref())
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(
+            std::fs::read(media.path().join(&package).join("movie.mp4"))?,
+            movie_bytes
+        );
+        assert_eq!(
+            std::fs::read(media.path().join(&package).join("original-tracks.mkv"))?,
+            tracks_bytes
+        );
+        assert_eq!(
+            std::fs::read(output_directory.join("movie.mp4"))?,
+            movie_bytes
+        );
+        assert!(path.exists(), "generated input retained");
+        super::super::conversions::recover(&pool).await?;
+        assert!(!super::super::conversions::tick(&pool, config, &media, &limits).await?);
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM movies WHERE status='ready'")
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(count, 1, "publication and completion commit exactly once");
+        pool.close().await;
         let failed = tempfile::tempdir()?;
         options.max_output_bytes = 1024;
         assert!(
@@ -1214,6 +1526,7 @@ mod tests {
                 &mut input,
                 false,
                 &mut cancel,
+                None,
             )
             .await
             .is_err()

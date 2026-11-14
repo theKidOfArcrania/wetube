@@ -10,7 +10,7 @@ This design was reviewed before application implementation.
 
 The local preview supports login, library search, authenticated progressive
 MP4 playback/seeking, per-user resume, and the existing administrator diagnostic
-and staged-inspection workflow. An operator explicitly admits a successful
+and staged-inspection workflow. An operator can also explicitly admit a successful
 experimental MP4 through a separate CLI, supplying its digest; the actual
 copied media is independently decoded and checked before catalogue eligibility.
 The standalone experimental importer itself still does not publish.
@@ -18,9 +18,46 @@ The standalone experimental importer itself still does not publish.
 This deliberately narrow adapter enables real-browser website E2E on the local
 development host. It is not production conversion orchestration or approval of
 the complete publication, subtitle-asset, backup, browser-matrix, or four-stream
-protocols below. Automatic conversion, OCR, and incoming-source deletion remain
+protocols below. Unattended conversion, OCR, and incoming-source deletion remain
 disabled. Real-disc and TrueNAS acceptance remain separate from synthetic
 browser-test acceptance.
+
+### Local scan, convert, review, publish extension
+
+This implemented extension connects the existing media pipeline to the website
+without enabling source
+deletion or claiming production deployment acceptance.
+
+An administrator selects a completed incoming ISO and confirms its SMB writers
+are closed. A durable scan job makes one verified private copy, discovers the
+available DVD programs and angles, and presents title choices with durations
+and available track information. DVD programs often lack meaningful names;
+the longest program is only a main-feature candidate. Single-angle discs do
+not require a technical angle choice.
+
+Inspection of the selected program and subsequent conversion reuse that
+checksum-bound staged copy rather than copying the NAS ISO again. Conversion
+requires an explicit video-treatment choice and runs in the bounded,
+single-worker queue. Source decode, encoding, and complete output validation
+must succeed before the result becomes available for publication review.
+
+Publication is a separate administrator action bound to the validated output
+digest, with reviewed title, year, and description. The worker independently
+checks and durably registers the package before library eligibility. Preserve
+the original audio/subtitle sidecar and all source ISOs. Failures and
+interruptions retain attempts and never expose unvalidated media.
+
+An authored two-title DVD passes browser scan, inspection, conversion,
+publication, and playback. Full-length real-disc validation, Docker integration,
+and deployment acceptance remain separate gates; a failed retained attempt is
+not publication evidence.
+
+On this development host, incoming files are in /mnt/share/staging. ISO staging
+is exclusively in /mnt/c/TempPrivate/website-staging; new prepared media belongs
+in /mnt/c/TempPrivate/website-media. Do not use /tmp or another Linux directory
+for ISO staging or a processing-copy workaround. The small application
+database is separate from media storage. Windows-backed metadata behavior
+must be resolved without simply disabling identity or content checks.
 
 ## 1. Goals and scope
 

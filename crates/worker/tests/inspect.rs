@@ -1,6 +1,77 @@
 use std::process::Command;
 
 #[tokio::test]
+async fn integrated_scan_failure_retains_staged_input_logs_and_no_movies() -> anyhow::Result<()> {
+    use anyhow::{Context, ensure};
+    use wetube_backend::{db, incoming::IncomingRoot, scans};
+    use wetube_core::{ScanRequest, ScanState};
+    let root = tempfile::tempdir()?;
+    let state = root.path().join("state");
+    let incoming = root.path().join("incoming");
+    let scratch = root.path().join("scratch");
+    std::fs::create_dir(&state)?;
+    std::fs::create_dir(&incoming)?;
+    let contents = b"completed fixture, not a DVD";
+    std::fs::write(incoming.join("invalid.iso"), contents)?;
+    std::fs::File::open(incoming.join("invalid.iso"))?.sync_all()?;
+    assert_eq!(std::fs::read(incoming.join("invalid.iso"))?, contents);
+    // Let DrvFS finalize newly-created fixture metadata before confirming identity.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    db::initialize(&state).await?;
+    let pool = db::connect(&state).await?;
+    sqlx::query("INSERT INTO users VALUES('admin','admin','hash','admin')")
+        .execute(&pool)
+        .await?;
+    let file = IncomingRoot::open(&incoming)?.list()?.remove(0);
+    let job = scans::enqueue(
+        &pool,
+        "admin",
+        &ScanRequest {
+            name: file.name,
+            identity: file.identity,
+            copy_complete: true,
+        },
+    )
+    .await?
+    .context("scan not queued")?;
+    let output = Command::new(env!("CARGO_BIN_EXE_wetube-worker"))
+        .arg("--state-dir")
+        .arg(&state)
+        .args(["run", "--once", "--incoming-dir"])
+        .arg(&incoming)
+        .arg("--scratch-dir")
+        .arg(&scratch)
+        .output()?;
+    ensure!(
+        output.status.success(),
+        "worker startup failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let failed = scans::list(&pool).await?.remove(0);
+    assert_eq!(failed.id, job.id);
+    assert_eq!(failed.state, ScanState::Failed);
+    let attempt = scratch.join(failed.attempt_id.context("missing retained attempt")?);
+    assert_eq!(
+        std::fs::read(attempt.join("input.iso"))
+            .with_context(|| format!("scan error: {:?}", failed.error))?,
+        contents
+    );
+    assert_eq!(std::fs::read(incoming.join("invalid.iso"))?, contents);
+    assert!(attempt.join("scan.stderr.txt").is_file());
+    assert!(attempt.join("scan.stdout.txt").is_file());
+    assert!(
+        failed.report.is_none(),
+        "invalid ISO never yields invented title choices"
+    );
+    let movies: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM movies")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(movies, 0);
+    pool.close().await;
+    Ok(())
+}
+
+#[tokio::test]
 #[ignore = "requires an explicitly confirmed real DVD copy and retains scratch output"]
 async fn real_dvd_copy_reaches_review_without_changing_incoming() -> anyhow::Result<()> {
     use anyhow::{Context, ensure};
@@ -140,6 +211,9 @@ fn invalid_dvd_fails_without_emitting_a_report_or_changing_the_input() {
     let path = dir.path().join("incomplete.iso");
     let contents = b"this is an incomplete DVD copy";
     std::fs::write(&path, contents).unwrap();
+    std::fs::File::open(&path).unwrap().sync_all().unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), contents);
+    std::thread::sleep(std::time::Duration::from_millis(500));
     let output = Command::new(env!("CARGO_BIN_EXE_wetube-worker"))
         .args(["inspect-dvd", "--title", "1", "--copy-complete", "--iso"])
         .arg(&path)
@@ -161,9 +235,20 @@ async fn configured_worker_persists_staged_failure_and_keeps_both_copies() {
     use wetube_core::{ProbeRequest, ProbeState};
     let state = tempfile::tempdir().unwrap();
     let incoming = tempfile::tempdir().unwrap();
-    let scratch = state.path().join("scratch");
+    let scratch_root = tempfile::tempdir().unwrap();
+    let scratch = scratch_root.path().join("scratch");
     let contents = b"completed but invalid DVD copy";
     std::fs::write(incoming.path().join("movie.iso"), contents).unwrap();
+    std::fs::File::open(incoming.path().join("movie.iso"))
+        .unwrap()
+        .sync_all()
+        .unwrap();
+    assert_eq!(
+        std::fs::read(incoming.path().join("movie.iso")).unwrap(),
+        contents
+    );
+    // Let DrvFS finalize newly-created fixture metadata before confirming identity.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     db::initialize(state.path()).await.unwrap();
     let pool = db::connect(state.path()).await.unwrap();
     sqlx::query("INSERT INTO users VALUES ('admin', 'admin', 'test hash', 'admin')")
@@ -217,7 +302,13 @@ async fn configured_worker_persists_staged_failure_and_keeps_both_copies() {
     );
     let job = probe_jobs::list(&pool).await.unwrap().remove(0);
     assert_eq!(job.state, ProbeState::Failed);
-    assert!(job.report.unwrap()["sha256"].is_string());
+    assert!(
+        job.report.as_ref().unwrap_or_else(|| panic!(
+            "expected verified staging before inspection failure: {:?}",
+            job.error
+        ))["sha256"]
+            .is_string()
+    );
     assert_eq!(
         std::fs::read(scratch.join(job.attempt_id.unwrap()).join("input.iso")).unwrap(),
         contents

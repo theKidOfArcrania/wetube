@@ -96,6 +96,7 @@ pub(crate) async fn inspect_open_iso(
     let identity = Identity::from(file.metadata()?);
     let output = super::process::run(
         Command::new("ffprobe")
+            .env("DVDCSS_CACHE", "off")
             .args([
                 "-v",
                 "error",

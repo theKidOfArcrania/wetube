@@ -20,11 +20,12 @@ use tokio_util::io::ReaderStream;
 use tower_http::services::ServeDir;
 use uuid::Uuid;
 use wetube_backend::preview::PreviewRoot;
-use wetube_backend::{accounts, db, incoming::IncomingRoot, now, probe_jobs};
+use wetube_backend::{accounts, conversions, db, incoming::IncomingRoot, now, probe_jobs, scans};
 use wetube_core::{
-    APP_VERSION, ApiError, DiagnosticJob, IncomingFiles, JobState, Library, LoginRequest, Movie,
-    MovieDetails, PlaybackProgress, ProbeJob, ProbeRequest, Role, Session, SystemStatus,
-    UpdatePlaybackProgress,
+    APP_VERSION, ApiError, ConversionJob, ConversionJobs, ConversionRequest, DiagnosticJob,
+    IncomingFiles, InspectRequest, JobState, Library, LoginRequest, Movie, MovieDetails,
+    PlaybackProgress, ProbeJob, ProbeRequest, PublishRequest, Role, ScanJob, ScanJobs, ScanRequest,
+    Session, SystemStatus, UpdatePlaybackProgress,
 };
 
 pub mod admission;
@@ -44,6 +45,7 @@ struct AppState {
     password_slots: Arc<Semaphore>,
     incoming: Option<Arc<IncomingRoot>>,
     media: Option<Arc<PreviewRoot>>,
+    conversion_enabled: bool,
 }
 
 pub async fn router(pool: SqlitePool, origin: &str, static_dir: &Path) -> anyhow::Result<Router> {
@@ -66,8 +68,49 @@ pub async fn router_with_media(
     incoming: Option<IncomingRoot>,
     media: Option<PreviewRoot>,
 ) -> anyhow::Result<Router> {
+    router_with_conversions(pool, origin, static_dir, incoming, media, None).await
+}
+
+pub async fn router_with_conversions(
+    pool: SqlitePool,
+    origin: &str,
+    static_dir: &Path,
+    incoming: Option<IncomingRoot>,
+    media: Option<PreviewRoot>,
+    scratch_dir: Option<&Path>,
+) -> anyhow::Result<Router> {
     db::check_version(&pool).await?;
+    let scratch = scratch_dir
+        .map(|path| {
+            anyhow::ensure!(
+                path.is_absolute(),
+                "scratch root must be an explicit absolute path"
+            );
+            PreviewRoot::open(path)
+        })
+        .transpose()?;
+    if let Some(scratch) = &scratch {
+        scratch.require_separate(static_dir)?;
+        if let Some(incoming) = &incoming {
+            scratch.require_separate(&incoming.path()?)?;
+        }
+        for (_, _, file) in sqlx::query_as::<_, (i64, String, String)>("PRAGMA database_list")
+            .fetch_all(&pool)
+            .await?
+        {
+            if !file.is_empty() {
+                scratch.require_separate(
+                    Path::new(&file)
+                        .parent()
+                        .ok_or_else(|| anyhow::anyhow!("invalid state database path"))?,
+                )?;
+            }
+        }
+    }
     if let Some(media) = &media {
+        if let Some(scratch) = scratch_dir {
+            media.require_separate(scratch)?;
+        }
         media.require_separate(static_dir)?;
         let databases = sqlx::query("PRAGMA database_list").fetch_all(&pool).await?;
         for database in databases {
@@ -109,6 +152,7 @@ pub async fn router_with_media(
         login_window: Arc::new(Mutex::new((Instant::now(), 0))),
         password_slots: Arc::new(Semaphore::new(2)),
         incoming: incoming.map(Arc::new),
+        conversion_enabled: scratch_dir.is_some() && media.is_some(),
         media: media.map(Arc::new),
     };
 
@@ -128,6 +172,13 @@ pub async fn router_with_media(
         .route("/jobs/diagnostics", post(queue_diagnostics))
         .route("/admin/incoming", get(incoming_files))
         .route("/admin/probes", get(probes).post(queue_probe))
+        .route(
+            "/admin/conversions",
+            get(conversion_jobs).post(queue_conversion),
+        )
+        .route("/admin/conversions/{id}/publish", post(queue_publication))
+        .route("/admin/scans", get(scan_jobs).post(queue_scan))
+        .route("/admin/scans/{id}/inspect", post(queue_scanned_inspection))
         .fallback(|| async { HttpError(StatusCode::NOT_FOUND, "Unknown API route".into()) });
 
     Ok(Router::new()
@@ -135,7 +186,7 @@ pub async fn router_with_media(
         .route("/health/ready", get(ready))
         .nest("/api/v1", api)
         .fallback_service(ServeDir::new(static_dir).append_index_html_on_directories(true))
-        .layer(DefaultBodyLimit::max(16 * 1024))
+        .layer(DefaultBodyLimit::max(32 * 1024))
         .layer(middleware::from_fn_with_state(state.clone(), boundary))
         .with_state(state))
 }
@@ -610,9 +661,177 @@ async fn status(
     Ok(Json(SystemStatus {
         version: APP_VERSION.into(),
         worker_last_seen,
-        conversion_enabled: false,
+        conversion_enabled: state.conversion_enabled,
         iso_deletion_enabled: false,
     }))
+}
+
+async fn conversion_jobs(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<ConversionJobs>, HttpError> {
+    admin(&state, &headers).await?;
+    Ok(Json(ConversionJobs {
+        jobs: conversions::list(&state.pool).await.map_err(internal)?,
+    }))
+}
+
+async fn scan_jobs(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<ScanJobs>, HttpError> {
+    admin(&state, &headers).await?;
+    Ok(Json(ScanJobs {
+        jobs: scans::list(&state.pool).await.map_err(internal)?,
+    }))
+}
+
+async fn queue_scan(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<ScanRequest>,
+) -> Result<(StatusCode, Json<ScanJob>), HttpError> {
+    let current = admin(&state, &headers).await?;
+    check_csrf(&current, &headers)?;
+    if !request.copy_complete {
+        return Err(HttpError(
+            StatusCode::BAD_REQUEST,
+            "Confirm the ISO copy has finished".into(),
+        ));
+    }
+    wetube_backend::incoming::validate_name(&request.name)
+        .map_err(|error| HttpError(StatusCode::BAD_REQUEST, error.to_string()))?;
+    let root = state.incoming.clone().ok_or_else(|| {
+        HttpError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Incoming root is not configured".into(),
+        )
+    })?;
+    let name = request.name.clone();
+    let actual =
+        tokio::task::spawn_blocking(move || root.open_file(&name).map(|(_, entry)| entry.identity))
+            .await
+            .map_err(internal)?
+            .map_err(|_| {
+                HttpError(
+                    StatusCode::CONFLICT,
+                    "Input unavailable; refresh incoming list".into(),
+                )
+            })?;
+    if actual != request.identity {
+        return Err(HttpError(
+            StatusCode::CONFLICT,
+            "Input changed; refresh and reconfirm completion".into(),
+        ));
+    }
+    let job = scans::enqueue(&state.pool, &current.user.id, &request)
+        .await
+        .map_err(internal)?
+        .ok_or_else(|| {
+            HttpError(
+                StatusCode::CONFLICT,
+                "A DVD scan is already queued or running".into(),
+            )
+        })?;
+    Ok((StatusCode::ACCEPTED, Json(job)))
+}
+
+async fn queue_scanned_inspection(
+    State(state): State<AppState>,
+    RoutePath(id): RoutePath<String>,
+    headers: HeaderMap,
+    Json(request): Json<InspectRequest>,
+) -> Result<(StatusCode, Json<ProbeJob>), HttpError> {
+    let current = admin(&state, &headers).await?;
+    check_csrf(&current, &headers)?;
+    if Uuid::parse_str(&id).is_err()
+        || !(1..=99).contains(&request.title)
+        || !(1..=9).contains(&request.angle)
+    {
+        return Err(HttpError(
+            StatusCode::BAD_REQUEST,
+            "Select a discovered title and angle".into(),
+        ));
+    }
+    let job = scans::inspect(&state.pool, &current.user.id, &id, &request)
+        .await
+        .map_err(|error| HttpError(StatusCode::BAD_REQUEST, error.to_string()))?
+        .ok_or_else(|| {
+            HttpError(
+                StatusCode::CONFLICT,
+                "Select a successful scan; another inspection may already be active".into(),
+            )
+        })?;
+    Ok((StatusCode::ACCEPTED, Json(job)))
+}
+
+fn conversions_enabled(state: &AppState) -> Result<(), HttpError> {
+    if !state.conversion_enabled {
+        return Err(HttpError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Conversion requires configured scratch and local media roots".into(),
+        ));
+    }
+    Ok(())
+}
+
+async fn queue_conversion(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<ConversionRequest>,
+) -> Result<(StatusCode, Json<ConversionJob>), HttpError> {
+    let current = admin(&state, &headers).await?;
+    check_csrf(&current, &headers)?;
+    conversions_enabled(&state)?;
+    if Uuid::parse_str(&request.probe_job_id).is_err() {
+        return Err(HttpError(
+            StatusCode::BAD_REQUEST,
+            "Invalid probe job ID".into(),
+        ));
+    }
+    let job = conversions::enqueue(&state.pool, &current.user.id, &request)
+        .await
+        .map_err(internal)?
+        .ok_or_else(|| {
+            HttpError(
+                StatusCode::CONFLICT,
+                "Select a completed reviewed probe without an existing conversion".into(),
+            )
+        })?;
+    Ok((StatusCode::ACCEPTED, Json(job)))
+}
+
+async fn queue_publication(
+    State(state): State<AppState>,
+    RoutePath(id): RoutePath<String>,
+    headers: HeaderMap,
+    Json(request): Json<PublishRequest>,
+) -> Result<(StatusCode, Json<ConversionJob>), HttpError> {
+    let current = admin(&state, &headers).await?;
+    check_csrf(&current, &headers)?;
+    conversions_enabled(&state)?;
+    if !request.confirm
+        || request.title.trim().is_empty()
+        || request.title.len() > 512
+        || request.description.len() > 16384
+        || request
+            .year
+            .is_some_and(|year| !(1888..=2100).contains(&year))
+        || request.movie_sha256.len() != 64
+        || !request
+            .movie_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+        || Uuid::parse_str(&id).is_err()
+    {
+        return Err(HttpError(
+            StatusCode::BAD_REQUEST,
+            "Confirm reviewed output, hash, and valid movie metadata".into(),
+        ));
+    }
+    let job = conversions::publish(&state.pool,&id,&request).await.map_err(internal)?
+        .ok_or_else(||HttpError(StatusCode::CONFLICT,"Publication requires an unpublished successful conversion and its exact validated hash".into()))?;
+    Ok((StatusCode::ACCEPTED, Json(job)))
 }
 
 async fn queue_diagnostics(
