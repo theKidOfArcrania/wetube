@@ -28,7 +28,7 @@ RUN curl --fail --show-error --location --proto '=https' --tlsv1.2 \
     && printf 'FFmpeg source: https://ffmpeg.org/releases/ffmpeg-%s.tar.xz\nSHA256: %s\n' \
       "$FFMPEG_VERSION" "$FFMPEG_SHA256" > /opt/ffmpeg/share/source.txt
 
-FROM rust:1.94.0-slim-bookworm AS app-builder
+FROM rust:1.96.1-slim-bookworm AS app-builder
 
 ARG BUILD_JOBS=2
 # hadolint ignore=DL3008
@@ -63,7 +63,7 @@ COPY --from=app-builder /build/target/release/wetube-server /build/target/releas
 COPY --from=app-builder /build/dist/ /opt/wetube/dist/
 COPY --chmod=755 docker/entrypoint.sh docker/check-media.sh /usr/local/bin/
 RUN /usr/local/bin/check-media.sh \
-    && { printf 'Rust: 1.94.0\nTrunk: 0.22.1\n'; \
+    && { printf 'Rust: 1.96.0\nTrunk: 0.22.1\n'; \
          wetube-server --version; \
          wetube-worker --version; \
          sha256sum /usr/local/bin/wetube-server /usr/local/bin/wetube-worker; \
