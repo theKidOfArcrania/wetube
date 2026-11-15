@@ -127,7 +127,8 @@ pub(crate) fn parse_inventory(bytes: &[u8]) -> Result<DvdScanReport> {
 }
 
 pub async fn recover(pool: &SqlitePool) -> Result<()> {
-    sqlx::query("UPDATE scan_jobs SET state='failed',error='Worker interrupted. Staged input and logs retained; no automatic retry.' WHERE state IN ('staging','scanning')")
+    sqlx::query("UPDATE scan_jobs SET state='failed',error='Worker interrupted. Staged input and logs retained; no automatic retry.' WHERE state IN ('staging','scanning')
+        AND NOT EXISTS(SELECT 1 FROM processing_queue WHERE job_id=scan_jobs.id AND kind='scan' AND state IN ('running','cancelling') AND finish_state IS NOT NULL)")
         .execute(pool).await?;
     Ok(())
 }
@@ -140,12 +141,21 @@ fn integrated_command() -> Command {
 }
 
 pub async fn tick(pool: &SqlitePool, config: Arc<super::imports::ImportConfig>) -> Result<bool> {
-    let attempt = uuid::Uuid::new_v4().to_string();
-    let row = sqlx::query("UPDATE scan_jobs SET state='staging',attempt_id=? WHERE id=(SELECT id FROM scan_jobs WHERE state='queued' ORDER BY created_at,rowid LIMIT 1) RETURNING *")
-        .bind(&attempt).fetch_optional(pool).await?;
-    let Some(row) = row else {
+    let Some(claim) = wetube_backend::queue::next(pool, "scan").await? else {
         return Ok(false);
     };
+    let key = claim.key;
+    let result = run(pool, config, claim.row).await;
+    wetube_backend::queue::finish(pool, key).await?;
+    result
+}
+
+pub(crate) async fn run(
+    pool: &SqlitePool,
+    config: Arc<super::imports::ImportConfig>,
+    row: sqlx::sqlite::SqliteRow,
+) -> Result<bool> {
+    let attempt: String = row.try_get("attempt_id")?;
     let id: String = row.try_get("id")?;
     let name: String = row.try_get("name")?;
     let expected: String = row.try_get("source_identity")?;
@@ -235,18 +245,20 @@ pub async fn tick(pool: &SqlitePool, config: Arc<super::imports::ImportConfig>) 
     .await;
     match result {
         Ok(report) => {
-            sqlx::query("UPDATE scan_jobs SET state='needs_review',report=?,error=NULL WHERE id=?")
+            sqlx::query("UPDATE scan_jobs SET report=? WHERE id=?")
                 .bind(serde_json::to_string(&report)?)
-                .bind(id)
+                .bind(&id)
                 .execute(pool)
                 .await?;
+            wetube_backend::queue::defer_finish(pool, "scan", &id, "needs_review").await?;
         }
         Err(error) => {
-            sqlx::query("UPDATE scan_jobs SET state='failed',error=? WHERE id=?")
+            sqlx::query("UPDATE scan_jobs SET error=? WHERE id=?")
                 .bind(format!("{error:#}").chars().take(4096).collect::<String>())
-                .bind(id)
+                .bind(&id)
                 .execute(pool)
                 .await?;
+            wetube_backend::queue::defer_finish(pool, "scan", &id, "failed").await?;
         }
     }
     recording.finish().await;

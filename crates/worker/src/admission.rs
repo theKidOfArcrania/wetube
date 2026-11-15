@@ -53,6 +53,9 @@ fn copy_and_hash_progress(
     let mut count = 0u64;
     let mut buffer = [0u8; 128 * 1024];
     loop {
+        if let Some(progress) = progress {
+            progress.check()?;
+        }
         ensure!(Instant::now() < deadline, "preview copy deadline exceeded");
         let bytes = source.read(&mut buffer)?;
         if bytes == 0 {
@@ -83,6 +86,9 @@ fn hash_copy_progress(
     let mut count = 0u64;
     let mut buffer = [0u8; 128 * 1024];
     loop {
+        if let Some(progress) = progress {
+            progress.check()?;
+        }
         ensure!(Instant::now() < deadline, "preview hash deadline exceeded");
         let bytes = file.read(&mut buffer)?;
         if bytes == 0 {
@@ -224,6 +230,7 @@ async fn admit_inner(
     // UUID directory exclusively, create every file without overwrite, and
     // publish only through the final atomic SQLite registry transaction.
     let package_directory = root.reserve_package(&package)?;
+    super::coordinator::record_media_package(&package);
     let staging = std::path::PathBuf::from(format!(
         "/proc/self/fd/{}",
         std::os::fd::AsRawFd::as_raw_fd(&package_directory)
@@ -415,7 +422,10 @@ async fn admit_inner(
     if let Some(progress) = progress {
         progress.stage(6, "Durably registering verified package", None, "");
     }
-    let mut transaction = pool.begin().await?;
+    if let Some(progress) = progress {
+        progress.check()?;
+    }
+    let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
     register_movie(&mut transaction, job_id, &movie_id, &options).await?;
     sqlx::query("INSERT INTO preview_media VALUES (?,?,?,?,?,?,?)")
         .bind(&movie_id)
@@ -480,7 +490,8 @@ async fn register_movie(
     let linked = if let Some(id) = job_id {
         let row = sqlx::query(
             "SELECT c.publication,p.name FROM conversion_jobs c JOIN probe_jobs p ON p.id=c.probe_job_id
-             WHERE c.id=? AND c.state='publishing'",
+             WHERE c.id=? AND c.state='publishing'
+             AND NOT EXISTS(SELECT 1 FROM processing_queue WHERE kind='publication' AND job_id=c.id AND state IN ('cancelling','cancelled'))",
         ).bind(id).fetch_one(&mut *connection).await?;
         let publication: wetube_core::PublishRequest =
             serde_json::from_str(&row.try_get::<String, _>("publication")?)?;
@@ -534,6 +545,97 @@ async fn register_movie(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn processing_queue_cancel_and_publication_registration_are_atomic() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        wetube_backend::db::initialize(directory.path()).await?;
+        let pool = wetube_backend::db::connect(directory.path()).await?;
+        sqlx::query("INSERT INTO users VALUES('admin','admin','hash','admin')")
+            .execute(&pool)
+            .await?;
+        let publication = wetube_core::PublishRequest {
+            title: "Kept movie".into(),
+            year: None,
+            description: "".into(),
+            movie_sha256: "a".repeat(64),
+            confirm: true,
+            tmdb: None,
+        };
+        for id in ["cancel-first", "commit-first"] {
+            sqlx::query("INSERT INTO probe_jobs(id,requested_by,name,source_identity,title,angle,state,created_at) VALUES(?,'admin','retained.iso','bound',1,1,'needs_review',1)").bind(id).execute(&pool).await?;
+            sqlx::query("INSERT INTO conversion_jobs(id,probe_job_id,requested_by,state,created_at,video_treatment,publication) VALUES(?,?,'admin','needs_review',1,'preserve',?)")
+                .bind(id).bind(id).bind(serde_json::to_string(&publication)?).execute(&pool).await?;
+            sqlx::query("UPDATE conversion_jobs SET state='queued_publication' WHERE id=?")
+                .bind(id)
+                .execute(&pool)
+                .await?;
+        }
+        let options = Admission {
+            report: Path::new("unused"),
+            title: "Kept movie",
+            year: None,
+            description: "",
+            movie_sha256: "unused",
+            max_bytes: 1,
+            timeout: Duration::from_secs(1),
+        };
+        let jobs = wetube_backend::queue::snapshot(&pool).await?.jobs;
+        let cancelled = &jobs[0];
+        wetube_backend::queue::claim(&pool, cancelled.key)
+            .await?
+            .unwrap();
+        assert!(wetube_backend::queue::cancel(&pool, cancelled.key).await?);
+        let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
+        assert!(
+            register_movie(
+                &mut transaction,
+                Some(&cancelled.id),
+                "must-not-exist",
+                &options
+            )
+            .await
+            .is_err()
+        );
+        transaction.rollback().await?;
+        wetube_backend::queue::finish(&pool, cancelled.key).await?;
+        let committed = &jobs[1];
+        wetube_backend::queue::claim(&pool, committed.key)
+            .await?
+            .unwrap();
+        let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
+        register_movie(&mut transaction, Some(&committed.id), "kept", &options).await?;
+        transaction.commit().await?;
+        assert!(!wetube_backend::queue::cancel(&pool, committed.key).await?);
+        let _owner = wetube_backend::lock::MaintenanceLock::acquire(directory.path())?;
+        super::super::coordinator::recover(&pool).await?;
+        super::super::coordinator::recover(&pool).await?;
+        assert!(!wetube_backend::queue::cancel(&pool, committed.key).await?);
+        let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
+        assert!(
+            register_movie(&mut transaction, Some(&committed.id), "duplicate", &options)
+                .await
+                .is_err()
+        );
+        transaction.rollback().await?;
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT id FROM movies")
+                .fetch_one(&pool)
+                .await?,
+            "kept"
+        );
+        assert_eq!(
+            wetube_backend::conversions::list(&pool)
+                .await?
+                .iter()
+                .find(|job| job.id == cancelled.id)
+                .unwrap()
+                .state,
+            wetube_core::ConversionState::Cancelled
+        );
+        pool.close().await;
+        Ok(())
+    }
     use wetube_core::{PublishRequest, TmdbSource};
 
     #[tokio::test]

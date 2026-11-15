@@ -9,6 +9,7 @@ pub mod lock;
 pub mod metadata;
 pub mod preview;
 pub mod probe_jobs;
+pub mod queue;
 pub mod scans;
 pub mod simple_imports;
 

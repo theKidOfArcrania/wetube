@@ -35,6 +35,7 @@ pub mod admission;
 mod labels;
 pub mod metadata;
 mod posters;
+mod queue;
 mod trash;
 
 const COOKIE_NAME: &str = "wetube_session";
@@ -183,6 +184,10 @@ pub async fn router_with_conversions(
         .route("/movies/{id}/playback", post(trash::start))
         .route("/movies/{id}/playback/{lease}", post(trash::renew))
         .route("/admin/trash", get(trash::list))
+        .route("/admin/queue", get(queue::get))
+        .route("/admin/queue/settings", post(queue::settings))
+        .route("/admin/queue/order", post(queue::order))
+        .route("/admin/queue/{key}/cancel", post(queue::cancel))
         .route("/admin/movies/{id}/trash", post(trash::delete))
         .route("/admin/movies/{id}/restore", post(trash::restore))
         .route(
@@ -1136,7 +1141,8 @@ async fn queue_diagnostics(
     let inserted = sqlx::query(
         "INSERT INTO diagnostic_jobs (id, requested_by, state, created_at)
          SELECT ?, ?, 'queued', ? WHERE NOT EXISTS
-         (SELECT 1 FROM diagnostic_jobs WHERE state IN ('queued', 'running'))",
+         (SELECT 1 FROM diagnostic_jobs WHERE state IN ('queued', 'running'))
+         AND (SELECT COUNT(*) FROM processing_queue WHERE state='waiting')<100",
     )
     .bind(&id)
     .bind(&current.user.id)
@@ -1169,18 +1175,22 @@ async fn jobs(
 ) -> Result<Json<Vec<DiagnosticJob>>, HttpError> {
     admin(&state, &headers).await?;
     let rows = sqlx::query(
-        "SELECT id, state, created_at, finished_at, report, error FROM diagnostic_jobs ORDER BY created_at DESC, rowid DESC LIMIT 20",
+        "SELECT id, state, cancelled, created_at, finished_at, report, error FROM diagnostic_jobs ORDER BY created_at DESC, rowid DESC LIMIT 20",
     )
     .fetch_all(&state.pool)
     .await
     .map_err(internal)?;
     let mut jobs = Vec::with_capacity(rows.len());
     for row in rows {
-        let job_state = match row.get::<&str, _>("state") {
+        let job_state = match wetube_backend::queue::job_state(&row)
+            .map_err(internal)?
+            .as_str()
+        {
             "queued" => JobState::Queued,
             "running" => JobState::Running,
             "succeeded" => JobState::Succeeded,
             "failed" => JobState::Failed,
+            "cancelled" => JobState::Cancelled,
             _ => return Err(internal("invalid diagnostic state")),
         };
         let report = row

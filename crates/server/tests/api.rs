@@ -16,6 +16,184 @@ const ORIGIN: &str = "http://wetube.test";
 const PASSWORD: &str = "a household test password";
 
 #[tokio::test]
+async fn processing_queue_admin_origin_csrf_controls_and_conflicts() {
+    let fixture = Fixture::new().await;
+    let (admin, session) = fixture.login("admin").await;
+    let (viewer, viewer_session) = fixture.login("viewer").await;
+    sqlx::query("INSERT INTO diagnostic_jobs(id,requested_by,state,created_at) SELECT 'waiting',id,'queued',1 FROM users WHERE username='admin'").execute(&fixture.pool).await.unwrap();
+    let initial = wetube_backend::queue::snapshot(&fixture.pool)
+        .await
+        .unwrap();
+    let key = initial.jobs[0].key;
+    for (path, payload) in [
+        (
+            "/api/v1/admin/queue/settings".to_owned(),
+            serde_json::json!({"revision":initial.revision,"paused":true,"maximum":2}),
+        ),
+        (
+            "/api/v1/admin/queue/order".to_owned(),
+            serde_json::json!({"revision":initial.revision,"waiting":[key]}),
+        ),
+        (
+            format!("/api/v1/admin/queue/{key}/cancel"),
+            serde_json::Value::Null,
+        ),
+    ] {
+        let body = payload.to_string();
+        for (cookie, csrf, status) in [
+            (None, None, StatusCode::UNAUTHORIZED),
+            (
+                Some(viewer.as_str()),
+                Some(viewer_session.csrf_token.as_str()),
+                StatusCode::FORBIDDEN,
+            ),
+            (Some(admin.as_str()), None, StatusCode::FORBIDDEN),
+            (Some(admin.as_str()), Some("wrong"), StatusCode::FORBIDDEN),
+        ] {
+            assert_eq!(
+                fixture
+                    .send("POST", &path, &body, cookie, csrf)
+                    .await
+                    .status(),
+                status
+            );
+        }
+        for origin in [None, Some("http://elsewhere.test")] {
+            let mut request = Request::builder()
+                .method("POST")
+                .uri(&path)
+                .header(header::HOST, "wetube.test")
+                .header(header::COOKIE, &admin)
+                .header("x-csrf-token", &session.csrf_token)
+                .header(header::CONTENT_TYPE, "application/json");
+            if let Some(origin) = origin {
+                request = request.header(header::ORIGIN, origin);
+            }
+            assert_eq!(
+                fixture
+                    .app
+                    .clone()
+                    .oneshot(request.body(Body::from(body.clone())).unwrap())
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::FORBIDDEN
+            );
+        }
+    }
+    assert_eq!(
+        fixture
+            .send("GET", "/api/v1/admin/queue", "", Some(&viewer), None)
+            .await
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    let settings =
+        serde_json::json!({"revision":initial.revision,"paused":true,"maximum":2}).to_string();
+    assert_eq!(
+        fixture
+            .send(
+                "POST",
+                "/api/v1/admin/queue/settings",
+                &settings,
+                Some(&admin),
+                Some(&session.csrf_token)
+            )
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert!(
+        wetube_backend::queue::claim(&fixture.pool, key)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        fixture
+            .send(
+                "POST",
+                "/api/v1/admin/queue/settings",
+                &settings,
+                Some(&admin),
+                Some(&session.csrf_token)
+            )
+            .await
+            .status(),
+        StatusCode::CONFLICT
+    );
+    let current = wetube_backend::queue::snapshot(&fixture.pool)
+        .await
+        .unwrap();
+    for maximum in [0, 17] {
+        let body =
+            serde_json::json!({"revision":current.revision,"paused":false,"maximum":maximum})
+                .to_string();
+        assert_eq!(
+            fixture
+                .send(
+                    "POST",
+                    "/api/v1/admin/queue/settings",
+                    &body,
+                    Some(&admin),
+                    Some(&session.csrf_token)
+                )
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+    let duplicate =
+        serde_json::json!({"revision":current.revision,"waiting":[key,key]}).to_string();
+    assert_eq!(
+        fixture
+            .send(
+                "POST",
+                "/api/v1/admin/queue/order",
+                &duplicate,
+                Some(&admin),
+                Some(&session.csrf_token)
+            )
+            .await
+            .status(),
+        StatusCode::CONFLICT
+    );
+    let path = format!("/api/v1/admin/queue/{key}/cancel");
+    assert_eq!(
+        fixture
+            .send(
+                "POST",
+                &path,
+                "null",
+                Some(&admin),
+                Some(&session.csrf_token)
+            )
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        fixture
+            .send(
+                "POST",
+                &path,
+                "null",
+                Some(&admin),
+                Some(&session.csrf_token)
+            )
+            .await
+            .status(),
+        StatusCode::CONFLICT
+    );
+    let response = fixture
+        .send("GET", "/api/v1/jobs", "", Some(&admin), None)
+        .await;
+    let jobs: Vec<DiagnosticJob> =
+        serde_json::from_slice(&to_bytes(response.into_body(), 8192).await.unwrap()).unwrap();
+    assert_eq!(jobs[0].state, wetube_core::JobState::Cancelled);
+}
+
+#[tokio::test]
 async fn movie_labels_normalize_unicode_updates_catalog_reuse_and_assignment_filters() {
     use serde_json::json;
     let fixture = Fixture::new().await;

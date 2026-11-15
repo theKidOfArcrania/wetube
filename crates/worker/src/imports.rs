@@ -6,7 +6,7 @@ use std::{
     io::{Read, Seek, Write},
     os::{
         fd::AsRawFd,
-        unix::fs::{DirBuilderExt, OpenOptionsExt},
+        unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
     },
     path::{Path, PathBuf},
     sync::Arc,
@@ -105,6 +105,28 @@ impl ImportConfig {
             "insufficient scratch space; reserve at least the requested bytes plus 1 GiB"
         );
         Ok(())
+    }
+
+    pub(crate) fn source_size(&self, name: &str, expected: &str) -> Result<u64> {
+        let (_, entry) = self.incoming.open_file(name)?;
+        ensure!(
+            entry.size_bytes <= self.max_iso_bytes,
+            "ISO exceeds the configured per-file byte limit"
+        );
+        ensure!(
+            entry.identity == expected,
+            "source changed since confirmation; refresh and reconfirm"
+        );
+        Ok(entry.size_bytes)
+    }
+
+    pub(crate) fn storage(&self) -> Result<(u64, u64, u64, u64)> {
+        Ok((
+            self.scratch.metadata()?.dev(),
+            fs2::available_space(self.scratch_path())?,
+            usage(&self.scratch_path(), 0, &mut 0)?,
+            self.max_scratch_bytes,
+        ))
     }
 }
 
@@ -206,6 +228,9 @@ pub(crate) fn stage_progress(
     let mut hash = Sha256::new();
     let mut count = 0u64;
     loop {
+        if let Some(progress) = progress {
+            progress.check()?;
+        }
         ensure!(
             Instant::now() < deadline,
             "staging exceeded its configured copy/verification budget while copying"
@@ -253,6 +278,9 @@ pub(crate) fn stage_progress(
         );
     }
     loop {
+        if let Some(progress) = progress {
+            progress.check()?;
+        }
         ensure!(
             Instant::now() < deadline,
             "staging exceeded its configured copy/verification budget while verifying"
@@ -364,26 +392,29 @@ pub async fn recover(pool: &SqlitePool) -> Result<()> {
     sqlx::query(
         "UPDATE probe_jobs SET state = 'failed',
          error = 'Worker interrupted. Any attempt is retained; refresh and reconfirm the source for a new job.'
-         WHERE state IN ('staging', 'probing')",
+         WHERE state IN ('staging', 'probing')
+         AND NOT EXISTS(SELECT 1 FROM processing_queue WHERE job_id=probe_jobs.id AND kind='probe' AND state IN ('running','cancelling') AND finish_state IS NOT NULL)",
     ).execute(pool).await?;
     Ok(())
 }
 
-/// Hold worker ownership and drain this future on shutdown: blocking filesystem I/O cannot be cancelled.
+/// Drain this future on shutdown and cancellation; blocking I/O cooperates between chunks.
 pub async fn tick(pool: &SqlitePool, config: Arc<ImportConfig>) -> Result<bool> {
-    let attempt = uuid::Uuid::new_v4().to_string();
-    let row = sqlx::query(
-        "UPDATE probe_jobs SET state = CASE WHEN scan_job_id IS NULL THEN 'staging' ELSE 'probing' END,
-         attempt_id = CASE WHEN scan_job_id IS NULL THEN ? ELSE attempt_id END
-         WHERE id = (SELECT id FROM probe_jobs WHERE state = 'queued'
-         ORDER BY created_at, rowid LIMIT 1) RETURNING *",
-    )
-    .bind(&attempt)
-    .fetch_optional(pool)
-    .await?;
-    let Some(row) = row else {
+    let Some(claim) = wetube_backend::queue::next(pool, "probe").await? else {
         return Ok(false);
     };
+    let key = claim.key;
+    let result = run(pool, config, claim.row).await;
+    wetube_backend::queue::finish(pool, key).await?;
+    result
+}
+
+pub(crate) async fn run(
+    pool: &SqlitePool,
+    config: Arc<ImportConfig>,
+    row: sqlx::sqlite::SqliteRow,
+) -> Result<bool> {
+    let attempt: String = row.try_get("attempt_id")?;
     let id: String = row.get("id");
     let name: String = row.get("name");
     let expected: String = row.get("source_identity");
@@ -442,16 +473,21 @@ pub async fn tick(pool: &SqlitePool, config: Arc<ImportConfig>) -> Result<bool> 
     .await;
     match result {
         Ok(report) => {
-            sqlx::query("UPDATE probe_jobs SET state = 'needs_review', report = ?, error = NULL WHERE id = ?")
-                .bind(report.to_string()).bind(id).execute(pool).await?;
+            sqlx::query("UPDATE probe_jobs SET report=? WHERE id=?")
+                .bind(report.to_string())
+                .bind(&id)
+                .execute(pool)
+                .await?;
+            wetube_backend::queue::defer_finish(pool, "probe", &id, "needs_review").await?;
         }
         Err(error) => {
             let message: String = format!("{error:#}").chars().take(4096).collect();
-            sqlx::query("UPDATE probe_jobs SET state = 'failed', error = ? WHERE id = ?")
+            sqlx::query("UPDATE probe_jobs SET error = ? WHERE id = ?")
                 .bind(message)
-                .bind(id)
+                .bind(&id)
                 .execute(pool)
                 .await?;
+            wetube_backend::queue::defer_finish(pool, "probe", &id, "failed").await?;
         }
     }
     recording.finish().await;

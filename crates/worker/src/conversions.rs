@@ -4,6 +4,7 @@ use std::{sync::Arc, time::Duration};
 use wetube_backend::{conversions, preview::PreviewRoot, probe_jobs};
 use wetube_core::PublishRequest;
 
+#[derive(Clone)]
 pub struct Limits {
     pub timeout: Duration,
     pub threads: u8,
@@ -26,7 +27,8 @@ impl Limits {
 pub async fn recover(pool: &SqlitePool) -> Result<()> {
     // Publication and registration commit together. An interrupted pre-commit
     // package is deliberately not retried or made ready.
-    sqlx::query("UPDATE conversion_jobs SET state='failed',error='Worker interrupted. All attempts/packages retained; no automatic retry or publication.' WHERE state IN ('converting','publishing')")
+    sqlx::query("UPDATE conversion_jobs SET state='failed',error='Worker interrupted. All attempts/packages retained; no automatic retry or publication.' WHERE state IN ('converting','publishing')
+        AND NOT EXISTS(SELECT 1 FROM processing_queue WHERE job_id=conversion_jobs.id AND kind IN ('conversion','publication') AND state IN ('running','cancelling') AND finish_state IS NOT NULL)")
         .execute(pool).await?;
     wetube_backend::metadata::expire(pool, wetube_backend::now()).await?;
     Ok(())
@@ -40,16 +42,26 @@ pub async fn tick(
 ) -> Result<bool> {
     limits.validate()?;
     wetube_backend::metadata::expire(pool, wetube_backend::now()).await?;
-    let row = sqlx::query(
-        "UPDATE conversion_jobs SET state=CASE state WHEN 'queued' THEN 'converting' ELSE 'publishing' END,
-         phase=CASE state WHEN 'queued' THEN 'revalidating_input' ELSE 'publishing' END,
-         attempt_id=CASE state WHEN 'queued' THEN ? ELSE attempt_id END
-         WHERE id=(SELECT id FROM conversion_jobs WHERE state IN ('queued','queued_publication') ORDER BY created_at,rowid LIMIT 1)
-         RETURNING *"
-    ).bind(uuid::Uuid::new_v4().to_string()).fetch_optional(pool).await?;
-    let Some(row) = row else {
+    let claim = match wetube_backend::queue::next(pool, "conversion").await? {
+        Some(claim) => Some(claim),
+        None => wetube_backend::queue::next(pool, "publication").await?,
+    };
+    let Some(claim) = claim else {
         return Ok(false);
     };
+    let key = claim.key;
+    let result = run(pool, config, media, limits, claim.row).await;
+    wetube_backend::queue::finish(pool, key).await?;
+    result
+}
+
+pub(crate) async fn run(
+    pool: &SqlitePool,
+    config: Arc<super::imports::ImportConfig>,
+    media: &PreviewRoot,
+    limits: &Limits,
+    row: sqlx::sqlite::SqliteRow,
+) -> Result<bool> {
     let job = conversions::from_row(&row)?;
     let recording = super::progress::Recording::start(
         pool,
@@ -74,8 +86,9 @@ pub async fn tick(
                 .bind(report.to_string()).bind(&job.id).execute(pool).await?;
             ensure!(report["status"] == "verified_experimental_output", "{}",report["error"].as_str().unwrap_or("conversion failed"));
             let digest = report["movie_sha256"].as_str().context("successful conversion missing digest")?;
-            sqlx::query("UPDATE conversion_jobs SET state='needs_review',phase='awaiting_review',movie_sha256=?,error=NULL WHERE id=? AND state='converting'")
+            sqlx::query("UPDATE conversion_jobs SET movie_sha256=?,error=NULL WHERE id=? AND state='converting'")
                 .bind(digest).bind(&job.id).execute(pool).await?;
+            wetube_backend::queue::defer_finish(pool,"conversion",&job.id,"needs_review").await?;
         } else {
             let publication: PublishRequest = serde_json::from_str(&row.try_get::<String,_>("publication")?)?;
             if let Some(source) = &publication.tmdb {
@@ -93,12 +106,21 @@ pub async fn tick(
     }.await;
     if let Err(error) = result {
         let error: String = format!("{error:#}").chars().take(4096).collect();
-        sqlx::query(
-            "UPDATE conversion_jobs SET state='failed',error=? WHERE id=? AND state!='published'",
+        sqlx::query("UPDATE conversion_jobs SET error=? WHERE id=? AND state!='published'")
+            .bind(error)
+            .bind(&job.id)
+            .execute(pool)
+            .await?;
+        wetube_backend::queue::defer_finish(
+            pool,
+            if job.state == wetube_core::ConversionState::Converting {
+                "conversion"
+            } else {
+                "publication"
+            },
+            &job.id,
+            "failed",
         )
-        .bind(error)
-        .bind(&job.id)
-        .execute(pool)
         .await?;
     }
     recording.finish().await;

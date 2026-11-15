@@ -311,6 +311,27 @@ pub async fn tick(
     scratch: Option<&PreviewRoot>,
     at: i64,
 ) -> Result<bool> {
+    tick_inner(pool, media, scratch, at, false).await
+}
+
+/// Start opportunistically without active leases; later starts remain protected
+/// by the durable purge claim and transactionally checked per-output references.
+pub(crate) async fn tick_quiescent(
+    pool: &SqlitePool,
+    media: &PreviewRoot,
+    scratch: Option<&PreviewRoot>,
+    at: i64,
+) -> Result<bool> {
+    tick_inner(pool, media, scratch, at, true).await
+}
+
+async fn tick_inner(
+    pool: &SqlitePool,
+    media: &PreviewRoot,
+    scratch: Option<&PreviewRoot>,
+    at: i64,
+    quiescent: bool,
+) -> Result<bool> {
     // The durable claim survives crashes; restore and authorization cannot cross it.
     let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     sqlx::query("DELETE FROM playback_leases WHERE expires_at<=?")
@@ -318,12 +339,13 @@ pub async fn tick(
         .execute(&mut *tx)
         .await?;
     let busy: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM scan_jobs WHERE state IN('queued','staging','scanning'))
-        OR EXISTS(SELECT 1 FROM probe_jobs WHERE state IN('queued','staging','probing'))
-        OR EXISTS(SELECT 1 FROM conversion_jobs WHERE state IN('queued','converting','queued_publication','publishing'))
-        OR EXISTS(SELECT 1 FROM comparison_jobs WHERE state IN('queued','running'))
-        OR EXISTS(SELECT 1 FROM diagnostic_jobs WHERE state IN('queued','running'))")
-        .fetch_one(&mut *tx).await?;
+        "SELECT EXISTS(SELECT 1 FROM processing_queue WHERE state IN ('running','cancelling'))
+        OR EXISTS(SELECT 1 FROM scan_jobs WHERE state IN('staging','scanning') OR (?=0 AND state='queued'))
+        OR EXISTS(SELECT 1 FROM probe_jobs WHERE state IN('staging','probing') OR (?=0 AND state='queued'))
+        OR EXISTS(SELECT 1 FROM conversion_jobs WHERE state IN('converting','publishing') OR (?=0 AND state IN ('queued','queued_publication')))
+        OR EXISTS(SELECT 1 FROM comparison_jobs WHERE state='running' OR (?=0 AND state='queued'))
+        OR EXISTS(SELECT 1 FROM diagnostic_jobs WHERE state='running' OR (?=0 AND state='queued'))")
+        .bind(quiescent).bind(quiescent).bind(quiescent).bind(quiescent).bind(quiescent).fetch_one(&mut *tx).await?;
     if busy {
         tx.commit().await?;
         return Ok(false);

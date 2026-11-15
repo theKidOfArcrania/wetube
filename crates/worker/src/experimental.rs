@@ -1018,6 +1018,9 @@ pub(crate) fn bounded_hash_progress(
     let mut count = 0u64;
     let mut buffer = [0u8; 128 * 1024];
     loop {
+        if let Some(progress) = progress {
+            progress.check()?;
+        }
         ensure!(
             Instant::now() < deadline,
             "checksum verification deadline exceeded"

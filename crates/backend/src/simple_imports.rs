@@ -83,7 +83,7 @@ pub async fn enqueue(
         sqlx::query(
             "INSERT INTO scan_jobs(id,requested_by,name,source_identity,state,created_at,simple_state)
              SELECT ?,?,?,?,'queued',?,'scan'
-             WHERE NOT EXISTS(SELECT 1 FROM scan_jobs WHERE state IN ('queued','staging','scanning'))
+             WHERE (SELECT COUNT(*) FROM processing_queue WHERE state='waiting')<100
              RETURNING *",
         )
         .bind(uuid::Uuid::new_v4().to_string())
@@ -219,7 +219,7 @@ pub async fn validate_scan_authorization(pool: &SqlitePool, scan: &str) -> Resul
 /// Called only by the single owning worker, including after interrupted-job recovery.
 pub async fn advance(pool: &SqlitePool) -> Result<()> {
     let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
-    let scans = sqlx::query("SELECT s.*,u.role FROM scan_jobs s JOIN users u ON u.id=s.simple_requested_by WHERE simple_state IN ('scan','inspection','conversion')")
+    let scans = sqlx::query("SELECT s.*,u.role FROM scan_jobs s JOIN users u ON u.id=s.simple_requested_by WHERE simple_state IN ('scan','inspection','conversion') ORDER BY s.created_at,s.rowid")
         .fetch_all(&mut *tx).await?;
     for scan in scans {
         let id: String = scan.try_get("id")?;
@@ -249,7 +249,7 @@ pub async fn advance(pool: &SqlitePool) -> Result<()> {
                             "INSERT INTO probe_jobs(id,requested_by,name,source_identity,title,angle,state,created_at,attempt_id,scan_job_id,report)
                              SELECT ?,simple_requested_by,name,source_identity,1,1,'queued',?,attempt_id,id,?
                              FROM scan_jobs WHERE id=? AND simple_state='scan'
-                             AND NOT EXISTS(SELECT 1 FROM probe_jobs WHERE state IN ('queued','staging','probing'))
+                             AND (SELECT COUNT(*) FROM processing_queue WHERE state='waiting')<100
                              AND NOT EXISTS(SELECT 1 FROM probe_jobs WHERE scan_job_id=?)
                              ON CONFLICT DO NOTHING",
                         ).bind(&probe_id).bind(super::now()).bind(report.to_string()).bind(&id).bind(&id)
@@ -290,7 +290,9 @@ pub async fn advance(pool: &SqlitePool) -> Result<()> {
                         let conversion_id = uuid::Uuid::new_v4().to_string();
                         let inserted = sqlx::query(
                             "INSERT INTO conversion_jobs(id,probe_job_id,requested_by,state,created_at,video_treatment)
-                             VALUES(?,?,?,'queued',?,'preserve') ON CONFLICT DO NOTHING",
+                             SELECT ?,?,?,'queued',?,'preserve'
+                             WHERE (SELECT COUNT(*) FROM processing_queue WHERE state='waiting')<100
+                             ON CONFLICT DO NOTHING",
                         ).bind(&conversion_id).bind(probe.try_get::<String,_>("id")?)
                             .bind(scan.try_get::<String,_>("simple_requested_by")?).bind(super::now())
                             .execute(&mut *tx).await?.rows_affected();
@@ -298,7 +300,15 @@ pub async fn advance(pool: &SqlitePool) -> Result<()> {
                             sqlx::query("UPDATE scan_jobs SET simple_state='conversion',simple_conversion_id=? WHERE id=? AND simple_state='inspection'")
                                 .bind(conversion_id).bind(&id).execute(&mut *tx).await?;
                         } else {
-                            stop = Some("A conversion already exists. Review it in Advanced; no second conversion was queued.".into());
+                            let exists: bool = sqlx::query_scalar(
+                                "SELECT EXISTS(SELECT 1 FROM conversion_jobs WHERE probe_job_id=?)",
+                            )
+                            .bind(probe.try_get::<String, _>("id")?)
+                            .fetch_one(&mut *tx)
+                            .await?;
+                            if exists {
+                                stop = Some("A conversion already exists. Review it in Advanced; no second conversion was queued.".into());
+                            }
                         }
                     } else {
                         let conversion: Option<String> =

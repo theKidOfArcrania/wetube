@@ -25,7 +25,8 @@ const CLIP_CAP: u64 = 32 * 1024 * 1024;
 const LOG_CAP: usize = 2 * 1024 * 1024;
 
 pub async fn recover(pool: &SqlitePool) -> Result<()> {
-    sqlx::query("UPDATE comparison_jobs SET state='failed',error='Worker interrupted; partial comparison retained, unregistered. Retry explicitly.' WHERE state='running'")
+    sqlx::query("UPDATE comparison_jobs SET state='failed',error='Worker interrupted; partial comparison retained, unregistered. Retry explicitly.' WHERE state='running'
+        AND NOT EXISTS(SELECT 1 FROM processing_queue WHERE job_id=comparison_jobs.id AND kind='comparison' AND state IN ('running','cancelling') AND finish_state IS NOT NULL)")
         .execute(pool).await?;
     Ok(())
 }
@@ -432,12 +433,21 @@ pub async fn tick(
     limits: &super::conversions::Limits,
 ) -> Result<bool> {
     limits.validate()?;
-    let row = sqlx::query("UPDATE comparison_jobs SET state='running',attempt_id=?
-        WHERE id=(SELECT id FROM comparison_jobs WHERE state='queued' ORDER BY created_at,rowid LIMIT 1) RETURNING *")
-        .bind(uuid::Uuid::new_v4().to_string()).fetch_optional(pool).await?;
-    let Some(row) = row else {
+    let Some(claim) = wetube_backend::queue::next(pool, "comparison").await? else {
         return Ok(false);
     };
+    let key = claim.key;
+    let result = run_job(pool, config, limits, claim.row).await;
+    wetube_backend::queue::finish(pool, key).await?;
+    result
+}
+
+pub(crate) async fn run_job(
+    pool: &SqlitePool,
+    config: Arc<super::imports::ImportConfig>,
+    limits: &super::conversions::Limits,
+    row: sqlx::sqlite::SqliteRow,
+) -> Result<bool> {
     let job = comparisons::from_row(&row)?;
     let recording = Recording::start(
         pool,
@@ -479,15 +489,13 @@ pub async fn tick(
             Some(format!("{error:#}").chars().take(4096).collect()),
         ),
     };
-    sqlx::query(
-        "UPDATE comparison_jobs SET state=?,report=?,error=? WHERE id=? AND state='running'",
-    )
-    .bind(state)
-    .bind(report)
-    .bind(error)
-    .bind(&job.id)
-    .execute(pool)
-    .await?;
+    sqlx::query("UPDATE comparison_jobs SET report=?,error=? WHERE id=? AND state='running'")
+        .bind(report)
+        .bind(error)
+        .bind(&job.id)
+        .execute(pool)
+        .await?;
+    wetube_backend::queue::defer_finish(pool, "comparison", &job.id, &state).await?;
     recording.finish().await;
     Ok(true)
 }

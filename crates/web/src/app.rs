@@ -546,7 +546,10 @@ fn LibraryPage(current: Session, session: RwSignal<Option<Session>>) -> impl Int
             children=move |movie| view! {
                 <MovieLabelsEditor movie=movie csrf=csrf movies=movies editing=editing_labels/>
             }/>
-        {is_admin.then(|| view! { <TrashPanel csrf=csrf movies=movies/> })}
+        {is_admin.then(|| view! {
+            <ProcessingQueuePanel csrf=csrf/>
+            <TrashPanel csrf=csrf movies=movies/>
+        })}
         <Show when=move || loading.get()>
             <p role="status" class="subtle">"Loading your library..."</p>
         </Show>
@@ -1162,6 +1165,7 @@ fn ReadinessCheck(id: String, jobs: RwSignal<Vec<DiagnosticJob>>, latest: bool) 
         job.get().map(|job| match job.state {
             JobState::Queued => "Queued — waiting for worker",
             JobState::Running => "Checking media tools",
+            JobState::Cancelled => "Cancelled — retained results kept",
             JobState::Succeeded | JobState::Failed => {
                 if job
                     .report
@@ -1614,6 +1618,184 @@ fn MoviePlayer(
     }
 }
 
+#[derive(serde::Serialize)]
+#[serde(untagged)]
+enum QueueMutation {
+    Settings(wetube_core::QueueSettings),
+    Order(wetube_core::QueueOrder),
+    Cancel,
+}
+
+#[component]
+fn ProcessingQueuePanel(csrf: StoredValue<String>) -> impl IntoView {
+    use wetube_core::{ProcessingQueue, QueueOrder, QueueSettings};
+    let scope = admin_scope();
+    let queue = RwSignal::new(None::<ProcessingQueue>);
+    let maximum = RwSignal::new("1".to_owned());
+    let busy = RwSignal::new(false);
+    let polling = RwSignal::new(false);
+    let generation = RwSignal::new(0_u64);
+    let message = RwSignal::new(None::<String>);
+    let confirm = RwSignal::new(None::<i64>);
+    let refresh = Callback::new(move |()| {
+        if busy.get_untracked() || polling.get_untracked() {
+            return;
+        }
+        polling.set(true);
+        let observed = generation.get_untracked();
+        spawn_local(async move {
+            let result = admin_get::<ProcessingQueue>(scope, "/api/v1/admin/queue").await;
+            if polling.try_set(false).is_some() || generation.try_get_untracked() != Some(observed)
+            {
+                return;
+            }
+            match result {
+                Ok(snapshot) => {
+                    if queue.get_untracked().is_none() {
+                        maximum.set(snapshot.maximum.to_string());
+                    }
+                    queue.set(Some(snapshot));
+                }
+                Err(error) => message.set(Some(error)),
+            }
+        });
+    });
+    refresh.run(());
+    let timer = StoredValue::new_local(Some(gloo_timers::callback::Interval::new(
+        2000,
+        move || refresh.run(()),
+    )));
+    on_cleanup(move || {
+        let _ = timer.try_update_value(|timer| timer.take());
+    });
+    let mutate = Callback::new(move |(path, body): (String, QueueMutation)| {
+        if busy.get_untracked() {
+            return;
+        }
+        generation.update(|generation| *generation += 1);
+        busy.set(true);
+        message.set(None);
+        spawn_local(async move {
+            let result =
+                admin_post::<ProcessingQueue>(scope, &path, &csrf.get_value(), &body).await;
+            if busy.try_update(|busy| *busy = false).is_none() {
+                return;
+            }
+            confirm.set(None);
+            match result {
+                Ok(snapshot) => {
+                    maximum.set(snapshot.maximum.to_string());
+                    queue.set(Some(snapshot));
+                    message.set(Some("Queue updated.".into()));
+                }
+                Err(error) => {
+                    message.set(Some(error));
+                    queue.set(None);
+                    refresh.run(());
+                }
+            }
+        });
+    });
+    let save = move |_| {
+        let Some(snapshot) = queue.get_untracked() else {
+            return;
+        };
+        let Ok(maximum) = maximum.get_untracked().parse::<u8>() else {
+            message.set(Some(
+                "Simultaneous jobs must be a whole number from 1 to 16.".into(),
+            ));
+            return;
+        };
+        if !(1..=16).contains(&maximum) {
+            message.set(Some("Simultaneous jobs must be between 1 and 16.".into()));
+            return;
+        }
+        mutate.run((
+            "/api/v1/admin/queue/settings".into(),
+            QueueMutation::Settings(QueueSettings {
+                revision: snapshot.revision,
+                paused: snapshot.paused,
+                maximum,
+            }),
+        ));
+    };
+    let pause = move |_| {
+        let Some(snapshot) = queue.get_untracked() else {
+            return;
+        };
+        mutate.run((
+            "/api/v1/admin/queue/settings".into(),
+            QueueMutation::Settings(QueueSettings {
+                revision: snapshot.revision,
+                paused: !snapshot.paused,
+                maximum: snapshot.maximum,
+            }),
+        ));
+    };
+    view! {
+        <section class="panel" aria-label="Processing queue" data-testid="processing-queue">
+            <h2>"Processing queue"</h2>
+            <p class="subtle">"Pausing or lowering the limit lets active jobs finish. Cancellation retains partial outputs and stops automatic continuation."</p>
+            <div class="toolbar">
+                <button disabled=move || busy.get() || queue.get().is_none() on:click=pause>
+                    {move || if queue.get().is_some_and(|queue|queue.paused) { "Resume new starts" } else { "Pause new starts" }}
+                </button>
+                <label>"Simultaneous jobs "
+                    <input type="number" min="1" max="16" step="1" bind:value=maximum disabled=move || busy.get()/>
+                </label>
+                <button disabled=move || busy.get() || queue.get().is_none() on:click=save>"Apply job limit"</button>
+                <button class="secondary" disabled=move || busy.get() || polling.get() on:click=move |_| refresh.run(())>"Refresh queue"</button>
+            </div>
+            <p role="status">{move || queue.get().map(|queue|format!("{} · limit {} · {} active",
+                if queue.paused { "New starts paused" } else { "New starts enabled" },queue.maximum,
+                queue.jobs.iter().filter(|job|matches!(job.state.as_str(),"running"|"cancelling")).count())).unwrap_or_else(||"Loading queue…".into())}</p>
+            <ol>
+                <For each=move || queue.get().map(|queue|queue.jobs).unwrap_or_default()
+                    key=|job|(job.key,job.state.clone(),job.reason.clone())
+                    children=move |job| {
+                        let key=job.key;
+                        let waiting=job.state=="waiting";
+                        let active=job.state=="running";
+                        let label=match job.kind.as_str() {
+                            "scan"=>"DVD scan","probe"=>"DVD inspection","diagnostic"=>"Tool diagnostics",
+                            "comparison"=>"Video comparison","conversion"=>"Conversion",_=>"Publication",
+                        };
+                        let move_job=Callback::new(move |up:bool| {
+                            let Some(snapshot)=queue.get_untracked() else { return };
+                            let mut waiting=snapshot.jobs.iter().filter(|job|job.state=="waiting").map(|job|job.key).collect::<Vec<_>>();
+                            let Some(index)=waiting.iter().position(|candidate|*candidate==key) else { return };
+                            let target=if up {index.checked_sub(1)} else {(index+1<waiting.len()).then_some(index+1)};
+                            let Some(target)=target else {return};
+                            waiting.swap(index,target);
+                            mutate.run(("/api/v1/admin/queue/order".into(),QueueMutation::Order(QueueOrder { revision:snapshot.revision,waiting })));
+                        });
+                        view! {
+                            <li>
+                                <strong>{job.name}</strong>" · "{label}" · "{job.state}
+                                <p class="subtle">{job.reason}</p>
+                                {waiting.then(||view! {
+                                    <button class="secondary" disabled=move || busy.get() on:click=move |_| move_job.run(true) aria-label="Move waiting job earlier">"Move earlier"</button>
+                                    <button class="secondary" disabled=move || busy.get() on:click=move |_| move_job.run(false) aria-label="Move waiting job later">"Move later"</button>
+                                })}
+                                {(waiting || active).then(||view! {
+                                    <button class="secondary" disabled=move || busy.get() on:click=move |_| confirm.set(Some(key))>
+                                        {if active {"Cancel active job"} else {"Cancel waiting job"}}
+                                    </button>
+                                    <Show when=move || confirm.get()==Some(key)>
+                                        <p>"Stop this job and its automatic continuation? Retained files and published movies are kept."</p>
+                                        <button disabled=move || busy.get() on:click=move |_| mutate.run((format!("/api/v1/admin/queue/{key}/cancel"),QueueMutation::Cancel))>"Confirm cancellation"</button>
+                                        <button class="secondary" disabled=move || busy.get() on:click=move |_| confirm.set(None)>"Keep job"</button>
+                                    </Show>
+                                })}
+                            </li>
+                        }
+                    }/>
+            </ol>
+            {move || message.get().map(|message|view!{<p role="alert">{message}</p>})}
+        </section>
+    }
+}
+
 #[component]
 fn ImportsPanel(
     csrf: StoredValue<String>,
@@ -2037,6 +2219,7 @@ fn import_label(entry: &ImportEntry) -> String {
                 }
                 ScanState::NeedsReview if entry.can_archive => "Inspection started — scan retained",
                 ScanState::NeedsReview => "Needs review — choose a title",
+                ScanState::Cancelled => "Cancelled — retained files kept",
                 ScanState::Failed => "Failed — inputs retained",
                 _ => "Active",
             },
@@ -2052,6 +2235,7 @@ fn import_label(entry: &ImportEntry) -> String {
                     "Conversion started — inspection retained"
                 }
                 ProbeState::NeedsReview => "Needs review — choose conversion treatment",
+                ProbeState::Cancelled => "Cancelled — retained files kept",
                 ProbeState::Failed => "Failed — inputs retained",
                 _ => "Active",
             },
@@ -2062,6 +2246,7 @@ fn import_label(entry: &ImportEntry) -> String {
             match job.state {
                 ConversionState::NeedsReview => "Needs review — publication decision",
                 ConversionState::Published => "Published",
+                ConversionState::Cancelled => "Cancelled — retained files kept",
                 ConversionState::Failed => "Failed — inputs retained",
                 _ => "Active",
             },
@@ -2212,6 +2397,9 @@ fn conversion_review_status(state: Option<ConversionState>) -> &'static str {
         Some(ConversionState::QueuedPublication) => "Publication queued after explicit approval.",
         Some(ConversionState::Publishing) => "Publication in progress.",
         Some(ConversionState::Published) => "Published to the local library.",
+        Some(ConversionState::Cancelled) => {
+            "Cancelled — retained files kept; no automatic continuation."
+        }
         Some(ConversionState::Failed) => {
             "Conversion failed — inputs and reports retained. Review the conversion error."
         }
@@ -2267,6 +2455,7 @@ fn ProbeReview(
                     ProbeState::Staging => "Copying and verifying private input",
                     ProbeState::Probing => "Inspecting the selected title",
                     ProbeState::NeedsReview => "Needs review - not published",
+                    ProbeState::Cancelled => "Cancelled — retained files kept",
                     ProbeState::Failed => "Failed - inputs retained",
                 };
                 view! {
@@ -2278,7 +2467,7 @@ fn ProbeReview(
                                 state=match job.state {
                                     ProbeState::Queued => MediaProgressState::Queued,
                                     ProbeState::NeedsReview => MediaProgressState::Complete,
-                                    ProbeState::Failed => MediaProgressState::Failed,
+                                    ProbeState::Failed | ProbeState::Cancelled => MediaProgressState::Failed,
                                     _ => MediaProgressState::Active,
                                 }/>
                         })}
@@ -2439,6 +2628,7 @@ fn ScanSelection(
                         Some("review") => "Conversion complete — review and publication approval required",
                         _ => "Scan complete — select a title for inspection",
                     },
+                    ScanState::Cancelled => "Cancelled — retained files kept",
                     ScanState::Failed => "Scan failed — ISO, reports and logs retained",
                 };
                 view! {
@@ -2448,7 +2638,7 @@ fn ScanSelection(
                         state=match scan.state {
                             ScanState::Queued => MediaProgressState::Queued,
                             ScanState::NeedsReview => MediaProgressState::Complete,
-                            ScanState::Failed => MediaProgressState::Failed,
+                            ScanState::Failed | ScanState::Cancelled => MediaProgressState::Failed,
                             _ => MediaProgressState::Active,
                         }/>
                     <p class="attempt">"Scan job: "{scan.id}</p>
@@ -2616,7 +2806,7 @@ fn ComparisonPreview(probe_id: String, csrf: StoredValue<String>) -> impl IntoVi
                 These H.264/AAC previews are not lossless, do not validate the full title or disc, and do not authorize publication."</p>
             <div class="probe-options">
                 <button type="button" on:click=submit disabled=move || !loaded.get() || loading.get()
-                    || job.get().is_some_and(|job| job.state != JobState::Failed)>
+                    || job.get().is_some_and(|job| !matches!(job.state, JobState::Failed | JobState::Cancelled))>
                     "Generate Preserve vs Yadif preview"
                 </button>
                 <button type="button" on:click=move |_| refresh() disabled=move || loading.get()>
@@ -2634,12 +2824,13 @@ fn ComparisonPreview(probe_id: String, csrf: StoredValue<String>) -> impl IntoVi
                         JobState::Queued => MediaProgressState::Queued,
                         JobState::Running => MediaProgressState::Active,
                         JobState::Succeeded => MediaProgressState::Complete,
-                        JobState::Failed => MediaProgressState::Failed,
+                        JobState::Failed | JobState::Cancelled => MediaProgressState::Failed,
                     }/>
                     <p role="status">{match job.state {
                         JobState::Queued => "Comparison queued — waiting for worker.",
                         JobState::Running => "Generating and decoding both comparison clips...",
                         JobState::Succeeded => "Both clips decoded and ready. Nothing was published.",
+                        JobState::Cancelled => "Cancelled — retained files kept",
                         JobState::Failed => "Comparison failed. Partial files kept; nothing published.",
                     }}</p>
                     {job.error.map(|message| view! { <p role="alert" class="error">{message}</p> })}
@@ -2678,7 +2869,11 @@ fn ProbeConversion(
     let scope = admin_scope();
     let existing = move || {
         conversions.get().iter().any(|job| {
-            job.probe_job_id == probe_id.get_value() && job.state != ConversionState::Failed
+            job.probe_job_id == probe_id.get_value()
+                && !matches!(
+                    job.state,
+                    ConversionState::Failed | ConversionState::Cancelled
+                )
         })
     };
     let submit = move |event: web_sys::SubmitEvent| {
@@ -3245,6 +3440,7 @@ fn ConversionReview(
                     ConversionState::QueuedPublication => "Publication queued — waiting for worker",
                     ConversionState::Publishing => "Publishing to the local library",
                     ConversionState::Published => "Published to the local library",
+                    ConversionState::Cancelled => "Cancelled — retained files kept",
                     ConversionState::Failed => "Failed — ISO, original tracks, reports and logs retained",
                 };
                 view! {
@@ -3255,7 +3451,7 @@ fn ConversionReview(
                             ConversionState::NeedsReview => MediaProgressState::Review,
                             ConversionState::QueuedPublication => MediaProgressState::QueuedPublication,
                             ConversionState::Published => MediaProgressState::Complete,
-                            ConversionState::Failed => MediaProgressState::Failed,
+                            ConversionState::Failed | ConversionState::Cancelled => MediaProgressState::Failed,
                             _ => MediaProgressState::Active,
                         }/>
                     <p class="subtle">"Inspection job: "{job.probe_job_id}

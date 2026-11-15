@@ -113,6 +113,41 @@ impl PreviewRoot {
         PathBuf::from(format!("/proc/self/fd/{}", self.directory.as_raw_fd()))
     }
 
+    pub fn storage(&self) -> Result<(u64, u64)> {
+        Ok((
+            self.directory.metadata()?.dev(),
+            fs2::available_space(self.descriptor_path())?,
+        ))
+    }
+
+    pub fn output_bytes(&self, package: &str) -> Result<u64> {
+        ensure!(
+            uuid::Uuid::parse_str(package)?.to_string() == package,
+            "invalid output directory"
+        );
+        let Some(directory) = optional_at(&self.directory, package, true)? else {
+            return Ok(0);
+        };
+        let path = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
+        let mut bytes = 0u64;
+        for (index, entry) in std::fs::read_dir(path)?.enumerate() {
+            ensure!(index < 1000, "too many attempt outputs");
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_str().context("invalid output filename")?;
+            let file = open_at(&directory, name, false)?;
+            let metadata = file.metadata()?;
+            ensure!(
+                metadata.is_file() && metadata.nlink() == 1,
+                "unexpected or shared attempt output"
+            );
+            bytes = bytes
+                .checked_add(metadata.len())
+                .context("output size overflow")?;
+        }
+        Ok(bytes)
+    }
+
     pub fn try_clone(&self) -> Result<Self> {
         Ok(Self {
             directory: self.directory.try_clone()?,

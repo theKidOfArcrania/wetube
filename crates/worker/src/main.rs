@@ -166,68 +166,59 @@ async fn run(cli: Cli) -> Result<()> {
                     config.acquire_scratch_lock()
                 })
                 .transpose()?;
-            wetube_worker::recover(&pool).await?;
-            wetube_worker::imports::recover(&pool).await?;
-            wetube_worker::conversions::recover(&pool).await?;
-            wetube_worker::scans::recover(&pool).await?;
-            wetube_worker::comparisons::recover(&pool).await?;
-            let mut interval = tokio::time::interval(Duration::from_secs(2));
+            wetube_worker::coordinator::recover(&pool).await?;
+            let mut coordinator = wetube_worker::coordinator::Coordinator::new(
+                pool.clone(),
+                imports,
+                media.map(Arc::new),
+                limits,
+            );
+            let mut interval = tokio::time::interval(Duration::from_millis(250));
             let shutdown = shutdown();
             tokio::pin!(shutdown);
             let mut stopping = false;
             loop {
                 tokio::select! {
-                    _ = &mut shutdown => break,
+                    _ = &mut shutdown, if !stopping => {
+                        stopping = true;
+                        tracing::info!("finishing owned work before releasing worker ownership");
+                    },
                     _ = interval.tick() => {}
                 }
-                let work = async {
-                    wetube_worker::tick(&pool).await?;
-                    if let Some(config) = &imports {
-                        wetube_backend::simple_imports::advance(&pool).await?;
-                        wetube_worker::scans::tick(&pool, config.clone()).await?;
-                        wetube_backend::simple_imports::advance(&pool).await?;
-                        wetube_worker::imports::tick(&pool, config.clone()).await?;
-                        wetube_backend::simple_imports::advance(&pool).await?;
-                        let compared =
-                            wetube_worker::comparisons::tick(&pool, config.clone(), &limits)
-                                .await?;
-                        if !compared && let Some(media) = &media {
-                            wetube_worker::conversions::tick(&pool, config.clone(), media, &limits)
-                                .await?;
+                let result = {
+                    let work = coordinator.tick(!stopping);
+                    tokio::pin!(work);
+                    let mut heartbeat = tokio::time::interval_at(
+                        tokio::time::Instant::now() + Duration::from_secs(2),
+                        Duration::from_secs(2),
+                    );
+                    loop {
+                        tokio::select! {
+                            result=&mut work=>break result,
+                            _=&mut shutdown, if !stopping=>{
+                                stopping=true;
+                                tracing::info!("finishing owned work before releasing worker ownership");
+                            },
+                            _=heartbeat.tick()=>{
+                                if let Err(error)=wetube_worker::heartbeat(&pool).await {
+                                    tracing::warn!(%error,"unable to update worker heartbeat");
+                                }
+                                if let Err(error)=sqlx::query("DELETE FROM playback_leases WHERE expires_at<=?")
+                                    .bind(wetube_backend::now()).execute(&pool).await {
+                                    tracing::warn!(%error,"unable to prune expired playback activity");
+                                }
+                            },
                         }
                     }
-                    if let Some(media) = &media {
-                        let scratch = imports
-                            .as_ref()
-                            .map(|config| config.output_root())
-                            .transpose()?;
-                        wetube_worker::trash::tick(
-                            &pool,
-                            media,
-                            scratch.as_ref(),
-                            wetube_backend::now(),
-                        )
-                        .await?;
-                    }
-                    anyhow::Ok(())
                 };
-                tokio::pin!(work);
-                let mut heartbeat = tokio::time::interval(Duration::from_secs(2));
-                loop {
-                    tokio::select! {
-                        result = &mut work => { result?; break; },
-                        _ = &mut shutdown, if !stopping => {
-                            stopping = true;
-                            tracing::info!("finishing current work before releasing worker ownership");
-                        },
-                        _ = heartbeat.tick() => {
-                            if let Err(error) = wetube_worker::heartbeat(&pool).await {
-                                tracing::warn!(%error, "unable to update worker heartbeat");
-                            }
-                        }
+                if let Err(error) = result {
+                    stopping = true;
+                    tracing::error!(%error, "worker admission stopped; retaining ownership while owned work drains");
+                    if !coordinator.is_active() {
+                        return Err(error);
                     }
                 }
-                if once || stopping {
+                if (once || stopping) && !coordinator.is_active() {
                     break;
                 }
             }

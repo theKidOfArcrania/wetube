@@ -12,7 +12,7 @@ pub fn from_row(row: &SqliteRow) -> Result<ScanJob> {
             .transpose()?,
         id: row.try_get("id")?,
         name: row.try_get("name")?,
-        state: serde_json::from_value(row.try_get::<String, _>("state")?.into())?,
+        state: serde_json::from_value(super::queue::job_state(row)?.into())?,
         created_at: row.try_get("created_at")?,
         attempt_id: row.try_get("attempt_id")?,
         report: row
@@ -39,8 +39,10 @@ pub async fn enqueue(
 ) -> Result<Option<ScanJob>> {
     let row = sqlx::query(
         "INSERT INTO scan_jobs(id,requested_by,name,source_identity,state,created_at)
-         SELECT ?,?,?,?,'queued',? WHERE NOT EXISTS
-         (SELECT 1 FROM scan_jobs WHERE state IN ('queued','staging','scanning'))
+         SELECT ?,?,?,?,'queued',? WHERE
+         (SELECT COUNT(*) FROM processing_queue WHERE state='waiting')<100
+         AND NOT EXISTS
+         (SELECT 1 FROM scan_jobs WHERE state IN ('queued','staging','scanning') AND name=? AND source_identity=?)
          AND NOT EXISTS(SELECT 1 FROM scan_jobs WHERE name=? AND source_identity=?
                         AND simple_state IN ('scan','inspection','conversion'))
          RETURNING *",
@@ -50,6 +52,8 @@ pub async fn enqueue(
     .bind(&request.name)
     .bind(&request.identity)
     .bind(super::now())
+    .bind(&request.name)
+    .bind(&request.identity)
     .bind(&request.name)
     .bind(&request.identity)
     .fetch_optional(pool)
@@ -90,7 +94,7 @@ pub async fn inspect(
         "INSERT INTO probe_jobs(id,requested_by,name,source_identity,title,angle,state,created_at,attempt_id,scan_job_id,report)
          SELECT ?,?,name,source_identity,?,?,'queued',?,?,id,?
          FROM scan_jobs WHERE id=? AND state='needs_review'
-         AND NOT EXISTS(SELECT 1 FROM probe_jobs WHERE state IN ('queued','staging','probing'))
+         AND (SELECT COUNT(*) FROM processing_queue WHERE state='waiting')<100
          ON CONFLICT DO NOTHING RETURNING *"
     ).bind(uuid::Uuid::new_v4().to_string()).bind(user).bind(request.title).bind(request.angle).bind(super::now())
         .bind(job.attempt_id.as_ref().context("scan has no retained attempt")?)

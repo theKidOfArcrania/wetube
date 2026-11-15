@@ -2,7 +2,38 @@ use serde::{Deserialize, Serialize};
 use unicode_normalization::UnicodeNormalization;
 
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
-pub const SCHEMA_VERSION: i64 = 13;
+pub const SCHEMA_VERSION: i64 = 14;
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProcessingJob {
+    pub key: i64,
+    pub kind: String,
+    pub id: String,
+    pub name: String,
+    pub state: String,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProcessingQueue {
+    pub revision: i64,
+    pub paused: bool,
+    pub maximum: u8,
+    pub jobs: Vec<ProcessingJob>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct QueueSettings {
+    pub revision: i64,
+    pub paused: bool,
+    pub maximum: u8,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct QueueOrder {
+    pub revision: i64,
+    pub waiting: Vec<i64>,
+}
 pub const TMDB_SELECTION_EXPIRED: &str = "TMDB selection expired; search again before publication";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -368,6 +399,7 @@ pub enum JobState {
     Running,
     Succeeded,
     Failed,
+    Cancelled,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -411,6 +443,7 @@ pub enum ProbeState {
     Probing,
     NeedsReview,
     Failed,
+    Cancelled,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -460,6 +493,7 @@ pub enum ConversionState {
     Publishing,
     Published,
     Failed,
+    Cancelled,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -567,6 +601,7 @@ pub enum ScanState {
     Scanning,
     NeedsReview,
     Failed,
+    Cancelled,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

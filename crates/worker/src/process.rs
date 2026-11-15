@@ -47,6 +47,67 @@ impl Drop for ProcessGroup {
     }
 }
 
+fn subreaper() -> Result<()> {
+    static RESULT: std::sync::OnceLock<Result<(), i32>> = std::sync::OnceLock::new();
+    let result = RESULT.get_or_init(|| {
+        if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EINVAL))
+        }
+    });
+    match result {
+        Ok(()) => Ok(()),
+        Err(code) => Err(std::io::Error::from_raw_os_error(*code))
+            .context("isolate owned subprocess reaping"),
+    }
+}
+
+async fn exited_without_reaping(pid: u32) -> std::io::Result<()> {
+    loop {
+        let exited = {
+            let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+            let result = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    pid,
+                    &mut info,
+                    libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+                )
+            };
+            if result != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            (unsafe { info.si_pid() }) != 0
+        };
+        if exited {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+async fn reap_group(pid: u32) -> std::io::Result<()> {
+    loop {
+        let result = unsafe { libc::waitpid(-(pid as i32), std::ptr::null_mut(), libc::WNOHANG) };
+        if result > 0 {
+            continue;
+        }
+        if result < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ECHILD) {
+                return Ok(());
+            }
+            if error.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(error);
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
 pub(crate) async fn run(
     command: &mut Command,
     timeout: Duration,
@@ -160,6 +221,11 @@ async fn run_capture(
     stderr_log: Option<File>,
     capture: Capture<'_>,
 ) -> Result<Output> {
+    subreaper()?;
+    let cancel = super::coordinator::cancellation();
+    if let Some(cancel) = &cancel {
+        cancel.check()?;
+    }
     let mut child = command
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -168,26 +234,42 @@ async fn run_capture(
         .spawn()
         .context("start media tool")?;
     let group = ProcessGroup(child.id().context("missing child process ID")?);
+    let pid = group.0;
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
-    let outcome = tokio::time::timeout(timeout, async {
-        tokio::try_join!(
-            async {
-                match capture {
-                    Capture::Progress(progress) => {
-                        progress_output(stdout, output_limit, stdout_log, progress).await
+    let outcome = {
+        let running = tokio::time::timeout(timeout, async {
+            tokio::try_join!(
+                async {
+                    match capture {
+                        Capture::Progress(progress) => {
+                            progress_output(stdout, output_limit, stdout_log, progress).await
+                        }
+                        Capture::Bounded => limited_output(stdout, output_limit, stdout_log).await,
                     }
-                    Capture::Bounded => limited_output(stdout, output_limit, stdout_log).await,
+                },
+                limited_output(stderr, output_limit, stderr_log),
+                exited_without_reaping(pid)
+            )
+        });
+        tokio::pin!(running);
+        tokio::select! {
+            outcome = &mut running => Some(outcome),
+            _ = async {
+                match &cancel {
+                    Some(cancel)=>cancel.cancelled().await,
+                    None=>std::future::pending::<()>().await,
                 }
-            },
-            limited_output(stderr, output_limit, stderr_log),
-            child.wait()
-        )
-    })
-    .await;
+            } => None,
+        }
+    };
     match outcome {
-        Ok(Ok((stdout, stderr, status))) => {
-            std::mem::forget(group);
+        Some(Ok(Ok((stdout, stderr, ())))) => {
+            // Keep the leader unreaped until its private group has been stopped:
+            // its PID cannot be recycled into an unrelated process group.
+            drop(group);
+            let status = child.wait().await?;
+            reap_group(pid).await?;
             Ok(Output {
                 stdout,
                 stderr,
@@ -198,10 +280,14 @@ async fn run_capture(
             drop(group);
             let _ = child.kill().await;
             let _ = child.wait().await;
+            reap_group(pid).await?;
             match error {
-                Err(_) => anyhow::bail!("media tool timed out after {} seconds", timeout.as_secs()),
-                Ok(Err(error)) => Err(error).context("read media tool output"),
-                Ok(Ok(_)) => unreachable!(),
+                None => anyhow::bail!("Cancelled by administrator; owned media tool stopped"),
+                Some(Err(_)) => {
+                    anyhow::bail!("media tool timed out after {} seconds", timeout.as_secs())
+                }
+                Some(Ok(Err(error))) => Err(error).context("read media tool output"),
+                Some(Ok(Ok(_))) => unreachable!(),
             }
         }
     }

@@ -12,7 +12,11 @@ struct Current {
 }
 
 #[derive(Clone)]
-pub(crate) struct Progress(Arc<Mutex<Current>>, Option<(usize, [f64; 2])>);
+pub(crate) struct Progress(
+    Arc<Mutex<Current>>,
+    Option<(usize, [f64; 2])>,
+    Option<super::coordinator::Cancellation>,
+);
 
 pub(crate) struct Recording {
     pub progress: Progress,
@@ -21,6 +25,9 @@ pub(crate) struct Recording {
 }
 
 impl Progress {
+    pub fn check(&self) -> anyhow::Result<()> {
+        self.2.as_ref().map_or(Ok(()), |cancel| cancel.check())
+    }
     pub fn substep(&self, stage: usize, index: usize, count: usize) -> Self {
         Self(
             self.0.clone(),
@@ -31,6 +38,7 @@ impl Progress {
                     (index + 1) as f64 / count as f64,
                 ],
             )),
+            self.2.clone(),
         )
     }
 
@@ -108,6 +116,7 @@ impl Recording {
                 high_water: 0.0,
             })),
             None,
+            super::coordinator::cancellation(),
         );
         let (stop, mut stopped) = tokio::sync::oneshot::channel();
         let writer = progress.clone();
@@ -157,11 +166,10 @@ impl Recording {
             Ok(Ok(())) => {}
             Ok(Err(_)) => tracing::warn!("optional media progress task did not finish normally"),
             Err(_) => {
-                task.abort();
-                let _ = task.await;
                 tracing::warn!(
-                    "optional final media progress flush exceeded one second; snapshot omitted"
+                    "optional final media progress flush exceeded one second; draining before releasing processing ownership"
                 );
+                let _ = task.await;
             }
         }
     }

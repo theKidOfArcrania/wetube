@@ -99,6 +99,7 @@ test('Simple inspection and conversion controls offer only available actions', a
       version: '0.1.0', worker_last_seen: now, conversion_enabled: true, iso_deletion_enabled: false,
     } });
     if (path === '/api/v1/jobs' || path === '/api/v1/admin/trash') return route.fulfill({ json: [] });
+    if (path === '/api/v1/admin/queue') return route.fulfill({ json: { revision: 0, paused: false, maximum: 1, jobs: [] } });
     if (path === '/api/v1/admin/incoming') return route.fulfill({ json: { configured: true, files: [] } });
     if (path === '/api/v1/admin/metadata') return route.fulfill({ json: { configured: false } });
     if (path === '/api/v1/admin/imports') {
@@ -174,4 +175,104 @@ test('Simple inspection and conversion controls offer only available actions', a
   expect(conversionRequests).toBe(0);
   expect(publicationRequests).toBe(0);
   expect(pageErrors).toEqual([]);
+});
+
+test('Processing queue controls reconcile conflicts and require cancellation approval', async ({ page }) => {
+  const origin = 'http://wetube.test';
+  const csrf = 'isolated-queue-browser';
+  const queue = {
+    revision: 1, paused: false, maximum: 2,
+    jobs: [
+      { key: 1, kind: 'diagnostic', id: 'active', name: 'Tool diagnostics', state: 'running', reason: 'Processing' },
+      { key: 2, kind: 'scan', id: 'scan', name: 'Waiting scan.iso', state: 'waiting', reason: 'Waiting for worker' },
+      { key: 3, kind: 'publication', id: 'publication', name: 'Waiting publication.iso', state: 'waiting', reason: 'Waiting for worker' },
+    ],
+  };
+  let conflict = true;
+  let viewer = false;
+  let cancellations = 0;
+  const errors: string[] = [];
+  page.on('pageerror', error => errors.push(error.message));
+  await page.route('**/*', async route => {
+    const url = new URL(route.request().url());
+    if (url.origin !== origin) return route.abort();
+    if (!url.pathname.startsWith('/api/')) {
+      const name = url.pathname === '/' ? 'index.html' : url.pathname.slice(1);
+      if (name.includes('/') || name.includes('..')) return route.abort();
+      return route.fulfill({ body: readFileSync(join(frontend, name)), contentType:
+        name.endsWith('.wasm') ? 'application/wasm' : name.endsWith('.js') ? 'text/javascript'
+          : name.endsWith('.css') ? 'text/css' : 'text/html' });
+    }
+    const path = url.pathname;
+    if (path === '/api/v1/auth/me') return route.fulfill({ json: { user: { id: viewer ? 'viewer' : 'admin', username: viewer ? 'queue-viewer' : 'queue-admin', role: viewer ? 'viewer' : 'admin' }, csrf_token: csrf } });
+    if (path === '/api/v1/movies') return route.fulfill({ json: { movies: [] } });
+    if (path === '/api/v1/status') return route.fulfill({ json: { version: '0.1.0', worker_last_seen: null, conversion_enabled: false, iso_deletion_enabled: false } });
+    if (path === '/api/v1/jobs' || path === '/api/v1/admin/trash') return route.fulfill({ json: [] });
+    if (path === '/api/v1/admin/incoming') return route.fulfill({ json: { configured: false, files: [] } });
+    if (path === '/api/v1/admin/metadata') return route.fulfill({ json: { configured: false } });
+    if (path === '/api/v1/admin/imports') return route.fulfill({ json: { entries: [], total: 0, history_count: 0, next: null } });
+    if (path === '/api/v1/admin/queue') return route.fulfill({ json: queue });
+    expect(route.request().method()).toBe('POST');
+    expect(route.request().headers()['x-csrf-token']).toBe(csrf);
+    if (path === '/api/v1/admin/queue/settings') {
+      const body = route.request().postDataJSON();
+      expect(body.revision).toBe(queue.revision);
+      expect(body).not.toHaveProperty('threads');
+      queue.paused = body.paused;
+      queue.maximum = body.maximum;
+    } else if (path === '/api/v1/admin/queue/order') {
+      const body = route.request().postDataJSON();
+      expect(body.waiting).not.toContain(1);
+      if (conflict) {
+        conflict = false;
+        queue.revision++;
+        queue.jobs.push({ key: 4, kind: 'probe', id: 'new', name: 'New inspection.iso', state: 'waiting', reason: 'Waiting for worker' });
+        return route.fulfill({ status: 409, json: { error: 'Queue changed. Refresh and try again.' } });
+      }
+      expect(body.waiting).toHaveLength(3);
+      expect(body.revision).toBe(queue.revision);
+      queue.jobs.sort((a, b) => a.state === 'running' ? -1 : b.state === 'running' ? 1 : body.waiting.indexOf(a.key) - body.waiting.indexOf(b.key));
+    } else if (path.endsWith('/cancel')) {
+      cancellations++;
+      const key = Number(path.split('/').at(-2));
+      const job = queue.jobs.find(job => job.key === key)!;
+      job.state = job.state === 'running' ? 'cancelling' : 'cancelled';
+      job.reason = job.state === 'cancelling' ? 'Cancelling; waiting for owned work to stop' : 'Cancelled; retained outputs unchanged';
+    } else return route.fulfill({ status: 404, json: { error: 'Unexpected request' } });
+    queue.revision++;
+    return route.fulfill({ json: queue });
+  });
+  await page.goto(origin);
+  const panel = page.getByRole('region', { name: 'Processing queue', exact: true });
+  await expect(panel).toBeVisible();
+  await panel.getByRole('button', { name: 'Pause new starts', exact: true }).click();
+  await expect(panel.getByRole('button', { name: 'Resume new starts', exact: true })).toBeVisible();
+  await panel.getByRole('spinbutton', { name: 'Simultaneous jobs', exact: true }).fill('1');
+  await panel.getByRole('button', { name: 'Apply job limit', exact: true }).click();
+  await expect(panel.getByRole('status')).toContainText('limit 1 · 1 active');
+  const publication = panel.locator('li').filter({ hasText: 'Waiting publication.iso' });
+  await publication.getByRole('button', { name: 'Move waiting job earlier', exact: true }).click();
+  await expect(panel.getByRole('alert')).toHaveText('Queue changed. Refresh and try again.');
+  await expect(panel.getByText('New inspection.iso', { exact: true })).toBeVisible();
+  await publication.getByRole('button', { name: 'Move waiting job earlier', exact: true }).click();
+  await expect(panel.locator('li').nth(1)).toContainText('Waiting publication.iso');
+  await panel.getByRole('button', { name: 'Resume new starts', exact: true }).click();
+  await expect(panel.getByRole('button', { name: 'Pause new starts', exact: true })).toBeVisible();
+  await panel.getByRole('button', { name: 'Cancel active job', exact: true }).click();
+  expect(cancellations).toBe(0);
+  await panel.getByRole('button', { name: 'Keep job', exact: true }).click();
+  await panel.getByRole('button', { name: 'Cancel active job', exact: true }).click();
+  await panel.getByRole('button', { name: 'Confirm cancellation', exact: true }).click();
+  await expect(panel.getByText('Cancelling; waiting for owned work to stop', { exact: true })).toBeVisible();
+  expect(cancellations).toBe(1);
+  await publication.getByRole('button', { name: 'Cancel waiting job', exact: true }).click();
+  await publication.getByRole('button', { name: 'Confirm cancellation', exact: true }).click();
+  await expect(panel.getByText('Cancelled; retained outputs unchanged', { exact: true })).toBeVisible();
+  expect(cancellations).toBe(2);
+  viewer = true;
+  await page.reload();
+  await expect(page.getByText('Signed in as queue-viewer', { exact: true })).toBeVisible();
+  await expect(page.getByRole('region', { name: 'Processing queue', exact: true })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Pause new starts', exact: true })).toHaveCount(0);
+  expect(errors).toEqual([]);
 });

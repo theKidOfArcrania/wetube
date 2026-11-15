@@ -46,7 +46,7 @@ pub async fn initialize(state_dir: &Path) -> Result<()> {
             // This additive migration does not modify registered media. Snapshot
             // SQLite first; operators must retain the separate media/attempt roots.
             anyhow::ensure!(
-                matches!(version.0, 1..=12),
+                matches!(version.0, 1..=13),
                 "unsupported upgrade; requires a complete asset-aware backup"
             );
             let backup = state_dir.join(format!("pre-upgrade-{}", uuid::Uuid::new_v4()));
@@ -93,6 +93,59 @@ pub async fn check_version(pool: &SqlitePool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn processing_queue_upgrade_thirteen_snapshots_and_preserves_interrupted_attempts()
+    -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let pool = open(directory.path(), true).await?;
+        let mut migrations = sqlx::migrate!("./migrations");
+        migrations.migrations = std::borrow::Cow::Owned(
+            migrations
+                .iter()
+                .filter(|migration| migration.version <= 13)
+                .cloned()
+                .collect(),
+        );
+        migrations.run(&pool).await?;
+        sqlx::query("INSERT INTO users VALUES('admin','admin','hash','admin')")
+            .execute(&pool)
+            .await?;
+        sqlx::query("INSERT INTO scan_jobs(id,requested_by,name,source_identity,state,created_at,attempt_id,report) VALUES('active','admin','retained.iso','bound','scanning',1,'retained-attempt','{}'),('waiting','admin','waiting.iso','bound','queued',2,NULL,NULL)").execute(&pool).await?;
+        pool.close().await;
+        initialize(directory.path()).await?;
+        initialize(directory.path()).await?;
+        let pool = connect(directory.path()).await?;
+        check_version(&pool).await?;
+        let queue = crate::queue::snapshot(&pool).await?;
+        assert_eq!(queue.maximum, 1);
+        assert!(!queue.paused);
+        assert_eq!(
+            queue
+                .jobs
+                .iter()
+                .map(|job| (job.id.as_str(), job.state.as_str()))
+                .collect::<Vec<_>>(),
+            [("active", "running"), ("waiting", "waiting")]
+        );
+        let attempt: (String, String) =
+            sqlx::query_as("SELECT attempt_id,report FROM scan_jobs WHERE id='active'")
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(attempt, ("retained-attempt".into(), "{}".into()));
+        assert_eq!(
+            std::fs::read_dir(directory.path())?
+                .filter_map(Result::ok)
+                .filter(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("pre-upgrade-"))
+                .count(),
+            1
+        );
+        pool.close().await;
+        Ok(())
+    }
 
     #[tokio::test]
     async fn simple_import_upgrades_twelve_without_restarting_existing_manual_jobs() -> Result<()> {

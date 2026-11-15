@@ -150,13 +150,60 @@ remain unchanged. Inspection metadata, selected program, duration and staged
 digest/size/attempt must match the scan before automatic conversion; the worker
 rechecks policy and current administrator authorization at the conversion claim.
 Progress retains the existing separate measured stages, percentages and phase ETA.
-Concurrency remains one with the existing default two codec threads.
+The default remains one simultaneous job and two codec threads; schema 14 adds
+the manually controlled global queue described below.
 
 Publication is a separate administrator action bound to the validated output
 digest, with reviewed title, year, and description. The worker independently
 checks and durably registers the package before library eligibility. Preserve
 the original audio/subtitle sidecar and all source ISOs. Failures and
 interruptions retain attempts and never expose unvalidated media.
+
+Schema 14 persists one processing queue for diagnostics, scans, inspections,
+comparisons, conversions and explicit publication. SQLx/Rust performs the additive
+upgrade, including a synced SQLite snapshot for supported older schemas. Each
+enqueue transaction appends a durable FIFO key, including Simple continuations.
+One lock-owning coordinator atomically claims stages under a global 1–16 job
+maximum (default 1). Individual tool invocations are not separate jobs.
+Administrator settings/order require the observed revision; stale or incomplete
+reorders conflict without dropping concurrent enqueues or moving active work.
+Pause only stops admission; lowering the cap drains active jobs naturally.
+The compatible worker `--threads` option remains default 2, with no per-job UI
+override and no automatic resource tuning.
+
+The coordinator holds conservative scratch/media byte reservations and excludes
+simultaneous access to the same source or retained attempt. Existing quotas,
+hard output bounds, provenance, identity/ctime checks and state/scratch ownership
+locks remain in force. Scratch quota includes retained usage plus outstanding
+reservations, subtracting bytes already written to each owned attempt. Free-space
+checks apply only to the filesystem receiving new writes; scratch and media
+demands combine only when their pinned roots share a device. Publication reserves
+the identity-validated movie/sidecar sizes plus 16 MiB for metadata, not two maximum
+codec outputs. Each affected filesystem retains 1 GiB free headroom; external
+writers still require dataset quotas. Invalid confirmed sources fail durably
+without processing, while capacity shortfalls stay waiting.
+
+Due maintenance never freezes admission or Simple advancement. Heavy Trash work
+starts opportunistically without active leases or runnable waiting work (paused
+waiting work does not prevent it), runs outside the coordinator polling loop, and
+retains owner locks until completion. Its durable purge claim and transactional
+per-output job/shared ownership and playback protections also guard jobs arriving
+after it starts. Expiry and playback-lease cleanup continue while paused or processing.
+Startup restores committed deferred stage results before interrupted-stage
+recovery; cancellation still wins, and committed publication is never repeated.
+
+Cancellation is a separately confirmed admin/Origin/CSRF action. Waiting
+cancellation prevents claim; active cancellation remains `cancelling` until every
+owned tool, blocking copy/hash and progress writer drains. Private tool process
+groups keep the leader unreaped until group termination; Linux subreaper adoption
+allows exact-group descendant reaping without touching unrelated processes.
+Blocking filesystem calls are cooperative between chunks and can delay acknowledgement.
+Finalized cancellation is durable and serialized as `cancelled` in job APIs
+(underlying legacy job states use failed plus a cancellation marker).
+Attempts, logs and originals remain; Simple is stopped transactionally and cannot
+enqueue an automatic child. Publication registration and cancellation serialize
+with an immediate SQLite transaction: cancellation wins before registration;
+an already committed publication conflicts honestly and is never removed.
 
 Live media progress is persisted as observational snapshots on scan, inspection,
 and conversion jobs, coalesced to about one write per second plus a final flush.
@@ -182,7 +229,8 @@ Review waits, queued jobs and failed or
 interrupted attempts never masquerade as running work or library readiness.
 Snapshot writes are best-effort: failures retry on later ticks with rate-limited
 warnings, never override authoritative job results, and
-the optional final flush has a one-second deadline after result persistence.
+the optional final flush warns after one second and drains before processing
+ownership is released, so cancellation cannot leave a telemetry write outstanding.
 FFmpeg progress is drained continuously with bounded line buffers, a bounded
 in-memory tail for final validation, and capped progress logs; stderr retains
 its existing strict quota/error checks. Progress never substitutes for source
@@ -212,7 +260,7 @@ not publication evidence.
 
 Schema 7 additionally provides private administrator treatment comparisons on a
 reviewed probe, without changing its state or conversion/publication eligibility.
-The existing serialized worker rehashes and pins the same staged input, extracts
+The owning coordinator rehashes and pins the same staged input, extracts
 one approximately centered window of up to ten seconds, then sequentially encodes
 Preserve (no interlace filter) and the exact full-pipeline Yadif filter. A bounded,
 retained FFV1/PCM intermediate makes both source windows identical; audio timestamps
@@ -224,8 +272,8 @@ Version-dependent seek incompatibility is a retained failure, not a reason to
 relax integrity checks.
 
 Comparison jobs bind the exact inspection report/title/angle. Active duplicates,
-duplicate unchanged successful results, and queues over four active jobs are
-rejected. They run before the next full conversion, without preemption or another
+duplicate unchanged successful results, and queues over the shared waiting bound are
+rejected. They join the shared durable order, without preemption or another
 heavy worker. Hard per-file limits (256 MiB sample; at most 32 MiB per clip),
 scratch capacity checks, bounded capture/logs, pinned descriptors, per-tool
 deadlines of at most 180 seconds, full clip decodes, hashes and ready fingerprints
@@ -756,7 +804,8 @@ Once established, provably absent optional files do not block cleanup. There is 
 silent root rebinding after remounts/path changes. Recorded locations are compared, never
 opened. At the same managed location, root replacement remains an error, and root,
 directory, file and checksum guards still apply before treating an owned path as
-absent or deleting it. Queued work takes priority; real failures back off exponentially
+absent or deleting it. Periodic quiescent maintenance does not starve behind
+unrelated waiting jobs; per-output claims remain protected. Real failures back off exponentially
 from one minute to a maximum of one hour.
 Shared private poster BLOBs are removed only when unreferenced or expired.
 Trash restoration does not extend the independent 150-day metadata/poster expiry.

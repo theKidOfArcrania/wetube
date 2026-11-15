@@ -8,6 +8,7 @@ use wetube_core::{DiagnosticReport, ToolCheck};
 pub mod admission;
 pub mod comparisons;
 pub mod conversions;
+pub mod coordinator;
 pub mod dvdnav;
 pub mod experimental;
 pub mod imports;
@@ -124,7 +125,8 @@ pub async fn diagnose() -> DiagnosticReport {
 pub async fn recover(pool: &SqlitePool) -> Result<()> {
     sqlx::query(
         "UPDATE diagnostic_jobs SET state = 'queued', started_at = NULL
-         WHERE state = 'running'",
+         WHERE state = 'running'
+         AND NOT EXISTS(SELECT 1 FROM processing_queue WHERE job_id=diagnostic_jobs.id AND kind='diagnostic' AND state IN ('running','cancelling') AND finish_state IS NOT NULL)",
     )
     .execute(pool)
     .await?;
@@ -133,33 +135,46 @@ pub async fn recover(pool: &SqlitePool) -> Result<()> {
 
 pub async fn tick(pool: &SqlitePool) -> Result<bool> {
     heartbeat(pool).await?;
-    let id: Option<String> = sqlx::query_scalar(
-        "UPDATE diagnostic_jobs SET state = 'running', started_at = ?, error = NULL
-         WHERE id = (SELECT id FROM diagnostic_jobs WHERE state = 'queued'
-         ORDER BY created_at, rowid LIMIT 1) RETURNING id",
-    )
-    .bind(now())
-    .fetch_optional(pool)
-    .await?;
-    let Some(id) = id else {
+    let Some(claim) = wetube_backend::queue::next(pool, "diagnostic").await? else {
         return Ok(false);
     };
+    let key = claim.key;
+    let result = run_diagnostic(pool, claim.row).await;
+    wetube_backend::queue::finish(pool, key).await?;
+    result
+}
+
+pub(crate) async fn run_diagnostic(
+    pool: &SqlitePool,
+    row: sqlx::sqlite::SqliteRow,
+) -> Result<bool> {
+    use sqlx::Row;
+    let id: String = row.try_get("id")?;
     let report = diagnose().await;
     let healthy = report.required_tools_available();
+    sqlx::query("UPDATE diagnostic_jobs SET report=? WHERE id=? AND state='running'")
+        .bind(serde_json::to_string(&report)?)
+        .bind(&id)
+        .execute(pool)
+        .await?;
     sqlx::query(
-        "UPDATE diagnostic_jobs SET state = ?, finished_at = ?, report = ?, error = ?
+        "UPDATE diagnostic_jobs SET error = ?
          WHERE id = ? AND state = 'running'",
     )
-    .bind(if healthy { "succeeded" } else { "failed" })
-    .bind(now())
-    .bind(serde_json::to_string(&report)?)
     .bind(
         (!healthy).then_some(
             "One or more required scan/conversion tools are unavailable; OCR is optional",
         ),
     )
-    .bind(id)
+    .bind(&id)
     .execute(pool)
+    .await?;
+    wetube_backend::queue::defer_finish(
+        pool,
+        "diagnostic",
+        &id,
+        if healthy { "succeeded" } else { "failed" },
+    )
     .await?;
     heartbeat(pool).await?;
     Ok(true)

@@ -10,7 +10,7 @@ pub fn from_row(row: &SqliteRow) -> Result<ConversionJob> {
             .transpose()?,
         id: row.try_get("id")?,
         probe_job_id: row.try_get("probe_job_id")?,
-        state: serde_json::from_value(row.try_get::<String, _>("state")?.into())?,
+        state: serde_json::from_value(super::queue::job_state(row)?.into())?,
         created_at: row.try_get("created_at")?,
         attempt_id: row.try_get("attempt_id")?,
         video_treatment: serde_json::from_value(
@@ -47,6 +47,7 @@ pub async fn enqueue(
         "INSERT INTO conversion_jobs (id,probe_job_id,requested_by,state,created_at,video_treatment)
          SELECT ?,id,?,'queued',?,? FROM probe_jobs
          WHERE id=? AND state='needs_review' AND attempt_id IS NOT NULL AND report IS NOT NULL
+         AND (SELECT COUNT(*) FROM processing_queue WHERE state='waiting')<100
          AND NOT EXISTS (SELECT 1 FROM scan_jobs s WHERE s.id=probe_jobs.scan_job_id
                          AND s.simple_state IN ('scan','inspection','conversion'))
          AND NOT EXISTS (SELECT 1 FROM conversion_jobs WHERE probe_job_id=? AND state!='failed')
@@ -87,7 +88,8 @@ pub async fn publish(
     }
     let row = sqlx::query(
         "UPDATE conversion_jobs SET state='queued_publication',phase='queued_publication',publication=?
-         WHERE id=? AND state='needs_review' AND movie_sha256=? RETURNING *"
+         WHERE id=? AND state='needs_review' AND movie_sha256=?
+         AND (SELECT COUNT(*) FROM processing_queue WHERE state='waiting')<100 RETURNING *"
     ).bind(serde_json::to_string(request)?).bind(id).bind(&request.movie_sha256)
         .fetch_optional(pool).await?;
     row.as_ref().map(from_row).transpose()

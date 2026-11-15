@@ -62,7 +62,7 @@ Unlinked movies do not offer genre lookup; first select TMDB metadata during
 publication review.
 
 Schema 10 adds a shared label catalog and cascading movie assignments. Offline
-`init` upgrades schemas 1–11 after a SQLite-only snapshot; stop both services and
+`init` upgrades schemas 1–13 after a SQLite-only snapshot; stop both services and
 retain their separate media/attempt roots. No media or existing movie metadata
 is changed by this migration.
 
@@ -97,7 +97,7 @@ Shared posters remain cached while another movie references them (or until expir
 Unshared poster cache entries are dropped on purge. Live jobs and other movies
 retain their outputs. Unsafe/ambiguous ownership, changed identities, hardlinks or
 storage failures retain an auditable pending purge with an error and safe automatic
-retry, backing off from one minute to at most one hour per movie. Queued work
+retry, backing off from one minute to at most one hour per movie. Active work
 takes priority over purge. These failures never report successful removal.
 Keep the original media root available. Recorded scratch locations distinguish a
 different worker configuration from replacement at the same managed location;
@@ -262,10 +262,10 @@ hashes, syncing and finalization are indeterminate. Phase estimates are not a
 total-workflow ETA; failed/interrupted jobs show only the last recorded observation.
 Optional telemetry never authorizes readiness or fails a comparison.
 
-Comparisons share the existing single serialized worker, with sequential treatment
-encodes. They are considered before the next queued full conversion, never
-preempting work already running. There is at most one active comparison per probe,
-four queued/running comparisons globally, and no duplicate successful comparison
+Comparisons share the global processing queue, with sequential treatment
+encodes inside each comparison. They never preempt work already running.
+There is at most one active comparison per probe,
+one shared 100-job waiting bound, and no duplicate successful comparison
 for an unchanged inspection. Each media invocation has a 180-second ceiling
 (or the configured smaller tool timeout); the shared sample has a hard 256 MiB
 cap and each clip a 32 MiB cap (or the configured smaller output limit).
@@ -396,7 +396,7 @@ state is separate.
    the library.
 
 Listing is limited to 1,000 candidate ISOs / 10,000 directory entries; split
-larger batches. Jobs are serialized by the worker. Missing worker staging
+larger batches. Jobs share the worker's global processing queue. Missing worker staging
 configuration leaves jobs queued; diagnostics still work.
 
 The worker checks the confirmed source identity, persists a unique attempt ID,
@@ -448,15 +448,64 @@ and `accept_preserve`; all existing admin, origin and CSRF checks apply.
 `POST /api/v1/admin/scans/{id}/advanced` hands an active scan/inspection to manual
 review before a conversion has been queued.
 
-SIGTERM/Ctrl-C drains the worker's current work before releasing ownership,
+SIGTERM/Ctrl-C stops new starts and drains all owned work before releasing ownership,
 including blocking copy I/O; allow time for staging and inspection to finish.
 The worker heartbeat continues during active jobs. Force-killed jobs retain
 their inputs; children retain the ownership lock until they exit.
 
+### Administrator processing queue
+
+**Processing queue** shows scans, inspections, tool diagnostics, comparisons,
+conversions and publication in one durable order. Move waiting jobs earlier/later;
+active jobs are not reordered. New jobs and Simple continuations append FIFO.
+At most 100 jobs wait for admission. Conflicting edits return **Queue changed**;
+refresh and retry. There are no separate simultaneous limits by job kind.
+
+**Pause new starts** leaves active work alone. **Resume new starts** processes the
+retained queue. **Simultaneous jobs** is a manually chosen global limit of 1–16,
+default **1**; lowering it drains naturally. There is no automatic resource tuning.
+Codec threads remain the worker's `--threads` setting, default **2**, compatible
+with the existing 1–16 range; there is no per-job thread control.
+`run --once` drains currently runnable work, including Simple continuations,
+then exits when no owned job remains; paused or resource-blocked jobs stay queued.
+
+Storage reservations, hard output limits, state/scratch ownership locks and
+same-source/attempt exclusion can admit fewer jobs than the chosen maximum.
+Scratch quota includes retained bytes plus reserved bytes not yet written.
+Scratch-only jobs do not require space on a separate media filesystem, nor does
+publication require free scratch space; demands combine when both roots share a
+filesystem. Publication reserves the validated output sizes plus 16 MiB metadata
+allowance rather than maximum codec-output sizes. Affected filesystems retain
+1 GiB free headroom. Reservations are not a guarantee against external writers.
+Missing, replaced or oversized confirmed sources fail rather than wait for space.
+Startup preserves durably completed results and interrupted attempts.
+
+Due Trash maintenance does not stop new starts or Simple continuation. Heavy purge
+starts opportunistically when no processing lease or runnable queued job needs
+the worker, and runs outside queue polling with existing ownership/live-output
+guards. Pausing does not disable expiry, authorization-lease cleanup, heartbeat
+or ownership-checked purge.
+
+Cancel a waiting or active job separately and confirm the action. Active
+cancellation first displays **Cancelling**; **Cancelled** appears only after owned
+tools, adopted subprocesses, blocking work and progress writers drain. Cancellation
+stops Simple continuation and retains partial attempts, reports and logs.
+Filesystem cancellation is cooperative between bounded copy/hash chunks; a
+kernel-blocked filesystem call can delay acknowledgement. Tool process groups are
+private to each invocation and reaped without signalling unrelated processes.
+Cancellation and publication registration are serialized in SQLite: cancellation
+winning prevents registration; an already committed movie returns a conflict and
+is never deleted. Source ISOs remain unchanged.
+
+The administrator-only API is `GET /api/v1/admin/queue`, with CSRF- and
+Origin-protected `POST` routes `/settings`, `/order`, and `/{key}/cancel`.
+Settings and order carry the last queue `revision`; order carries the complete
+`waiting` key list. Cancellation uses the durable queue key, not a process ID.
+
 ## Upgrade local state
 
 Stop both services before running `wetube-server init` with this release.
-Initialization upgrades supported older schemas (1–12) to schema 13 only after a consistent `VACUUM INTO`
+Initialization upgrades supported older schemas (1–13) to schema 14 only after a consistent `VACUUM INTO`
 snapshot is written and synced in a private `pre-upgrade-UUID` directory under
 the state root. Newer/unknown versions fail closed. Repeating initialization
 does not create another snapshot once the upgrade succeeds.
@@ -467,6 +516,9 @@ schema 9 adds expiring TMDB overlays, schema 10 adds movie labels, and schema 11
 adds the bounded private poster cache. Schema 12 adds recoverable movie Trash,
 login-bound playback leases, fixed-file ownership and purge audit history.
 Schema 13 adds durable Simple DVD import continuation; existing jobs remain manual.
+Schema 14 adds the shared queue, durable administrator settings and cancellation
+markers. Existing waiting stages are imported deterministically by creation time,
+stage and job ID; interrupted attempts remain bound for exclusive worker recovery.
 Existing jobs, reports, media, attempts and earlier progress snapshots are retained.
 Stop **both** services, retain the state/media/attempt roots, run the matching
 `wetube-server --state-dir <state-root> init`, then restart the matching server
@@ -752,6 +804,39 @@ cargo clippy --package wetube-web --target wasm32-unknown-unknown --locked -- -D
 The workspace separates portable API contracts (crates/core), backend
 persistence/authentication/locking (crates/backend), HTTP/administration
 (crates/server), diagnostics (crates/worker), and browser UI (crates/web).
+
+### Processing queue validation
+
+Durable order/settings, cross-stage claims, allocation, invalid-source failure,
+cancellation, publication races, deferred-result recovery and nonblocking
+maintenance use the existing Rust suites:
+
+```sh
+cargo test --workspace processing_queue --locked --config 'env.TMPDIR="/mnt/c/TempPrivate"'
+```
+
+Owned helper subprocesses verify termination/reaping and retained output; they
+never signal existing services. Three ignored helper entries are invoked by the
+cancellation regression, not standalone acceptance tests.
+Independent-volume allocation uses explicit device/free-space inputs; pinned-root
+and output-growth accounting use real coordinator fixtures on the single C-backed
+filesystem, without creating mounts. Source-backed coordinator fixtures can also
+fail on ctime-only identity drift after confirmation. They retain the original
+bindings and fail rather than rebaseline the identity guard; the cause remains
+unresolved.
+
+The compiled-WASM control test uses browser-local API routes, with no server,
+worker, database or media fixture:
+
+```sh
+WETUBE_E2E_ARTIFACTS_DIR=/mnt/c/TempPrivate TMPDIR=/mnt/c/TempPrivate \
+  npm --prefix tests/e2e test -- --grep 'Processing queue controls' \
+  --output=/mnt/c/TempPrivate/wetube-queue-browser-results
+```
+
+These checks do not establish full DVD/Trash filesystem acceptance or deployment
+readiness. Docker/NAS integration and the existing C-backed identity blockers
+remain separate gates; integrity checks have not been relaxed.
 
 ### Simple DVD import validation
 
