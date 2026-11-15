@@ -236,6 +236,233 @@ mandatory `lsdvd` subprocess. Tesseract with `eng` trained data is optional and
 does not determine conversion readiness; caption OCR itself is not implemented.
 Installed tools alone do not prove that a particular ISO can be imported.
 
+## Docker packaging
+
+`Dockerfile` builds the locked server/worker and Leptos/WASM frontend in a
+Rust **1.94.0** / Trunk **0.22.1** builder. Both native build and runtime use
+Debian bookworm (glibc 2.36), targeting Linux amd64 with a generic x86-64 CPU
+baseline, not the build host's instruction set. The runtime contains the approved
+local TMDB logo, CA certificates, native `libdvdnav4`/`libdvdread8`, Tesseract
+with English data, and checksum-pinned **FFmpeg 8.0.3**, built with DVD-Video,
+libx264, AAC, FFV1, PCM, Matroska and MP4 support. DVD extraction and original
+track retention use FFmpeg directly; `mkvextract` and `lsdvd` are not required.
+No CSS decryption library is bundled; encrypted-disc compatibility is not promised.
+OCR tooling is present, but caption OCR remains unimplemented.
+
+### Image maintainers
+
+Build the image on a Linux amd64-capable build host:
+
+```sh
+docker build --platform linux/amd64 --build-arg BUILD_JOBS=2 -t thekidofarcrania/wetube:latest .
+docker run --rm --network none thekidofarcrania/wetube:latest server --version
+docker run --rm --network none thekidofarcrania/wetube:latest worker doctor
+docker run --rm --network none --entrypoint cat thekidofarcrania/wetube:latest /usr/share/wetube/build-manifest.txt
+```
+
+The Dockerfile is configured to check DVD demuxers in **both** FFmpeg and ffprobe, required codecs,
+muxers, Yadif and English data, then runs `doctor` as non-root without a database
+or ISO. After a successful build, these checks establish installed capabilities,
+not successful real-disc conversion.
+Validate representative completed, disposable ISOs separately before production.
+The build manifest records application build-tool versions, FFmpeg source/hash,
+FFmpeg configuration, every installed Debian package version and English-data
+checksum. Cargo is locked and FFmpeg is checksum-pinned; Debian base tags and
+security packages are intentionally updated on rebuild, so builds are not
+bit-for-bit reproducible. Keep the resulting image ID/digest for upgrades and
+rollback; do not substitute an unrelated image behind a mutable tag.
+
+The deny-by-default `.dockerignore` admits only manifests, Rust sources,
+SQL migrations, frontend inputs and runtime scripts. Local targets, test
+fixtures, media/ISOs, databases, state, attachments, `.env`, credentials and
+private token files do not enter the build context. Never add credentials as a
+build argument, environment variable or source file.
+
+For a local preflight without Docker, build the native binaries as above and
+run `sh docker/test-entrypoint.sh target/debug`. It tests CLI passthrough and
+fail-closed root/role handling without initializing a database or starting a
+service. This is not an image-build substitute.
+
+### Persistent roots and Compose
+
+Copy `compose.yaml` to a private operations directory on TrueNAS. No source
+checkout, Dockerfile, frontend build or `.env` file is needed there: both
+services use the published **Linux amd64** image
+`thekidofarcrania/wetube:latest`. Use the installed `docker-compose` **2.26.1-4** for the
+commands below. Authenticate to the registry separately if required; never put
+registry credentials in Compose or the image.
+
+The supplied configuration has these literal settings:
+
+| Setting | Value |
+| --- | --- |
+| Image and Compose UID/GID | `568:568` (TrueNAS apps identity) |
+| Published HTTP port / browser origin | `8080` / `http://192.168.1.15:8080` |
+| Incoming, read-only | `/mnt/Main/Documents/staging` → `/data/incoming` |
+| Private state | `/mnt/Main/WeTube/state` → `/data/state` |
+| Private persistent scratch | `/mnt/Main/WeTube/scratch` → `/data/scratch` |
+| Published media | `/mnt/Main/WeTube/media` → `/data/media` |
+
+Provision these **existing, distinct persistent directories** before startup.
+Confirm UID/GID 568 can read/traverse incoming and read/write/traverse state,
+scratch and media through inherited dataset ACLs. The files do not create
+missing host paths, change ownership or recursively `chown` NAS datasets.
+Do not use parent/child roots, replace managed directories, or change their
+identities during upgrades. SQLite state must have reliable local locking,
+not an SMB/NFS database mount. `/dev/shm` is **test-only**, never production
+state or persistent media storage.
+
+`compose.yaml` runs **one server and one worker from the same image**, sharing
+the same canonical `/data/*` paths and underlying roots. Provenance and purge
+guards depend on that stability. Sources are read-only in both services;
+scratch/media/state are writable. Root filesystem is read-only, with a bounded,
+non-executable 64 MiB `/tmp`. There is no privileged mode, Docker socket,
+host PID namespace, device access, automatic migration or account provisioning.
+Tini forwards shutdown and reaps orphaned children; the worker owns/drains its
+tool process groups and holds shared state/scratch locks. Do not add `tini -g`,
+delete live lock files or scale the worker service. The persisted global
+processing maximum starts at **1**; codec threads remain **2**.
+
+The supplied server explicitly sets `WETUBE_ALLOW_ANY_HOST=true`, as chosen for
+this LAN deployment. Only the Host-authority check is disabled; login,
+authorization, configured Origin and CSRF checks remain enforced. The expected
+Origin stays `http://192.168.1.15:8080`, never derived from Host or forwarded
+headers. Other URLs may serve GET requests, but browser state changes must use
+that exact origin. Outside this Compose configuration the default remains
+strict; omit the option or set it to `false` to reject unconfigured Host headers.
+The readiness probe sends the configured Host even with that stricter setting.
+If you change the LAN address/port, update the literal Origin, published port
+and healthcheck Host coherently. Use HTTP only on the intended trusted LAN/VPN.
+
+UID 568 is a shared TrueNAS apps identity, not a dedicated host security
+principal. A host process or another container with the same UID **and access
+to these paths** can read private state/token files; mount namespaces do not
+automatically grant other containers those paths. “Server-only token” below
+means only the WeTube server receives its token mount.
+
+For first initialization, keep both services stopped. Pull explicitly, then
+initialize and create the administrator. The account command prompts privately;
+never put passwords in Compose, arguments, shell history or build layers:
+
+```sh
+docker-compose version
+docker-compose config --quiet
+docker-compose pull --policy always
+docker-compose run --rm --no-deps server server init
+docker-compose run --rm --no-deps server server add-user --username admin --admin
+docker-compose up -d --no-build --pull never
+docker-compose ps
+curl --fail http://192.168.1.15:8080/health/ready
+```
+
+Maintenance runs never start dependencies. Installed Compose 2.26.1-4 has
+neither `run --pull` nor `run --no-build`; the shared `pull_policy: never`
+prevents implicit pulls, including for `latest`. Explicit `pull --policy always`
+overrides that policy at the operator-controlled pull step. This configuration
+contains no build context. The worker starts
+after server readiness succeeds. Readiness checks schema/database availability,
+not worker liveness or DVD acceptance. After login, queue Media readiness and
+verify worker heartbeats/results. To inspect installed tools without touching
+the live database or any ISO:
+
+```sh
+docker-compose run --rm --no-deps worker worker doctor
+```
+
+Keep both services stopped for account maintenance and schema changes.
+
+### Upgrades and rollback
+
+`latest` is mutable: record the current image ID/RepoDigest before replacing it.
+Pause admission in the queue panel, finish or explicitly cancel active work,
+verify the worker is idle, then stop **both** services and confirm their owned
+tools stopped. The configured 24-hour stop grace allows owned work to drain;
+a timeout, forced kill or host restart can leave retained attempts for recovery.
+Back up stopped state and separately retain matching scratch/media, honoring
+provider-retention rules. **Only then pull** the new image and migrate offline;
+never start or auto-pull services before successful initialization:
+
+```sh
+docker image inspect thekidofarcrania/wetube:latest --format '{{.Id}} {{json .RepoDigests}}'
+docker-compose stop
+docker-compose ps --all
+# Verify stopped services; back up state and retain matching scratch/media roots.
+docker-compose pull --policy always
+docker-compose run --rm --no-deps server server init
+docker-compose up -d --no-build --pull never
+```
+
+`init` uses the existing Rust/SQLx schema-14 migrations and SQLite-only
+pre-upgrade snapshot when required; no Python is involved and it does not erase
+an existing database. Starting services never runs `init`. A mutable tag alone
+cannot provide rollback: retain the old image/digest, matching stopped-state
+backup and asset roots. An older image cannot undo a newer database schema.
+For immutable deployment, manually replace the shared literal `image:` value
+with the release's recorded registry digest; do not rely on `latest` staying
+unchanged. These operator commands pull/run images, not build or publish them.
+
+### Optional TMDB
+
+Disabled unless `compose.tmdb.yaml` is also copied and deliberately selected.
+Before enabling, accept the current terms, attribution and retention duties
+described above. Provision `/mnt/Main/WeTube/tmdb_token` privately, outside this
+repository/build context. It must be a regular file owned by UID **568**, mode
+**0600**, with no additional ACL grants. Check metadata without printing its
+contents:
+
+```sh
+stat -c 'uid=%u mode=%a type=%F' /mnt/Main/WeTube/tmdb_token
+```
+
+Expect UID `568`, mode `600`, and `regular file`; also inspect the file's ACL
+using TrueNAS permissions tools. Bind-file mounts do not enforce ownership,
+mode or ACLs. The server's token guard rejects group/other permissions; ACL-only
+read access is not a substitute for owner-only mode. Do not mount or store the
+token in the worker, Compose environment, registry or image.
+
+The optional override mounts only this file read-only in the WeTube server at
+`/run/secrets/tmdb-token` and sets explicit terms acceptance. Use **both** `-f`
+arguments for every operation while enabled. First initialization:
+
+```sh
+docker-compose -f compose.yaml -f compose.tmdb.yaml config --quiet
+docker-compose -f compose.yaml -f compose.tmdb.yaml pull --policy always
+docker-compose -f compose.yaml -f compose.tmdb.yaml run --rm --no-deps server server init
+docker-compose -f compose.yaml -f compose.tmdb.yaml run --rm --no-deps server server add-user --username admin --admin
+docker-compose -f compose.yaml -f compose.tmdb.yaml up -d --no-build --pull never
+```
+
+For an upgrade, follow the same idle/stopped/backup protocol **before** pulling:
+
+```sh
+docker image inspect thekidofarcrania/wetube:latest --format '{{.Id}} {{json .RepoDigests}}'
+docker-compose -f compose.yaml -f compose.tmdb.yaml stop
+docker-compose -f compose.yaml -f compose.tmdb.yaml ps --all
+# Verify stopped services; back up state and retain matching scratch/media roots.
+docker-compose -f compose.yaml -f compose.tmdb.yaml pull --policy always
+docker-compose -f compose.yaml -f compose.tmdb.yaml run --rm --no-deps server server init
+docker-compose -f compose.yaml -f compose.tmdb.yaml up -d --no-build --pull never
+```
+
+After token rotation, restart only the server using
+`docker-compose -f compose.yaml -f compose.tmdb.yaml restart server`.
+
+For image maintainers with a source checkout, the native healthcheck regression
+can run without Docker using a previously built server/frontend and an existing
+writable **disposable metadata-only test parent**, never a live state directory
+or NAS dataset. It creates a private, exclusively owned child for SQLite/logs;
+no ISO or video is generated. It exercises the exact
+supplied health probe with strict Host validation, then the native Host-only
+opt-in and HTTP/HTTPS origin normalization:
+
+```sh
+sh docker/test-healthcheck.sh target/debug/wetube-server dist target http://192.168.1.15:8080 curl --noproxy '*' --fail --silent --show-error --max-time 3 --header 'Host: 192.168.1.15:8080' http://127.0.0.1:8080/health/ready
+```
+
+Port 8080 must be free. The harness removes only its owned test state and
+listeners; it never accesses NAS datasets or needs a media fixture.
+Compose-only operators do not need this runner or a source checkout.
+
 ### Short treatment comparisons
 
 After inspecting a title/angle, expand its review and choose **Generate Preserve
@@ -583,7 +810,8 @@ Do not roll an old binary forward onto the upgraded live state.
 | --- | --- | --- |
 | `WETUBE_STATE_DIR` | `.wetube` | Persistent database and maintenance lock; use the same path for both processes. |
 | `WETUBE_BIND` | `127.0.0.1:8080` | Server listening address. |
-| `WETUBE_ORIGIN` | `http://localhost:8080` | Exact browser origin and accepted Host authority. |
+| `WETUBE_ORIGIN` | `http://localhost:8080` | Exact browser origin; accepted Host authority when strict Host checks are enabled. |
+| `WETUBE_ALLOW_ANY_HOST` | `false` | Server-only opt-in to skip Host-authority checking, never Origin/authentication/CSRF checks. Supplied NAS Compose enables it. |
 | `WETUBE_STATIC_DIR` | `dist` | Built frontend directory. |
 | `WETUBE_INCOMING_DIR` | Disabled | Finished-copy root for server and worker; same directory on both. |
 | `WETUBE_SCRATCH_DIR` | Disabled | Private staging root; configure the same root for server and worker. |

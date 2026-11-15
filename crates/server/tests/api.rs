@@ -2227,6 +2227,131 @@ impl Fixture {
 }
 
 #[tokio::test]
+async fn host_policy_opt_in_preserves_origin_auth_csrf_and_admin() {
+    let mut fixture = Fixture::new().await;
+    let (admin, session) = fixture.login("admin").await;
+    let (viewer, viewer_session) = fixture.login("viewer").await;
+    let health = || {
+        Request::builder()
+            .uri("/health/ready")
+            .header(header::HOST, "arbitrary.test:9876")
+            .body(Body::empty())
+            .unwrap()
+    };
+    assert_eq!(
+        fixture
+            .app
+            .clone()
+            .oneshot(health())
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::MISDIRECTED_REQUEST
+    );
+    fixture.app = wetube_server::router_with_host_policy(
+        fixture.pool.clone(),
+        ORIGIN,
+        fixture._directory.path(),
+        None,
+        None,
+        None,
+        true,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        fixture
+            .app
+            .clone()
+            .oneshot(health())
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    let private = Request::builder()
+        .uri("/api/v1/movies")
+        .header(header::HOST, "arbitrary.test:9876")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        fixture.app.clone().oneshot(private).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let snapshot = wetube_backend::queue::snapshot(&fixture.pool)
+        .await
+        .unwrap();
+    let body = serde_json::json!({
+        "revision": snapshot.revision, "paused": true, "maximum": 1
+    })
+    .to_string();
+    for (origin, cookie, csrf, expected) in [
+        (
+            None,
+            Some(&admin),
+            Some(session.csrf_token.as_str()),
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            Some("http://evil.test"),
+            Some(&admin),
+            Some(session.csrf_token.as_str()),
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            Some("http://arbitrary.test:9876"),
+            Some(&admin),
+            Some(session.csrf_token.as_str()),
+            StatusCode::FORBIDDEN,
+        ),
+        (Some(ORIGIN), None, None, StatusCode::UNAUTHORIZED),
+        (Some(ORIGIN), Some(&admin), None, StatusCode::FORBIDDEN),
+        (
+            Some(ORIGIN),
+            Some(&admin),
+            Some("wrong"),
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            Some(ORIGIN),
+            Some(&viewer),
+            Some(viewer_session.csrf_token.as_str()),
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            Some(ORIGIN),
+            Some(&admin),
+            Some(session.csrf_token.as_str()),
+            StatusCode::OK,
+        ),
+    ] {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/api/v1/admin/queue/settings")
+            .header(header::HOST, "arbitrary.test:9876")
+            .header("forwarded", "host=arbitrary.test:9876;proto=http")
+            .header("x-forwarded-host", "arbitrary.test:9876")
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(origin) = origin {
+            request = request.header(header::ORIGIN, origin);
+        }
+        if let Some(cookie) = cookie {
+            request = request.header(header::COOKIE, cookie);
+        }
+        if let Some(csrf) = csrf {
+            request = request.header("x-csrf-token", csrf);
+        }
+        let response = fixture
+            .app
+            .clone()
+            .oneshot(request.body(Body::from(body.clone())).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected);
+    }
+}
+
+#[tokio::test]
 async fn host_and_origin_checks_apply_before_login() {
     let fixture = Fixture::new().await;
     for (host, origin, expected) in [

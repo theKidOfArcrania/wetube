@@ -437,6 +437,15 @@ Verify that the selected DVD tools can operate directly on ISO files.
 
 ### Container build and delivery
 
+The checked-in `Dockerfile` and `compose.yaml` implement the initial packaging:
+locked native/WASM builds, one non-root image with explicit server/worker roles,
+read-only source mounts, stable shared root paths, offline maintenance commands,
+and a checksum-pinned FFmpeg build with the native DVD demuxer. Optional TMDB
+file mounting is isolated in `compose.tmdb.yaml`. See README for build, dataset
+ACL, initialization and upgrade commands. Image-build capability checks and
+`worker doctor` do not replace representative-disc or container shutdown tests;
+full container validation still requires an available local Docker daemon.
+
 Use a multi-stage Dockerfile with a builder stage and a slim runtime stage.
 The builder has the Rust/native and WASM toolchains, frontend bundling tools,
 headers, and other build-only dependencies. Build the server/worker executables,
@@ -457,8 +466,8 @@ identity with each prepared package.
 Do not include Rust compilers, Cargo/Node tooling, source trees, headers, test
 fixtures, build caches, credentials, or development-only packages in the final
 image. Prefer a maintained slim distribution base over `scratch` while native
-media/OCR tools need operating-system libraries. Run as a dedicated non-root
-UID/GID, with writable paths restricted to the configured datasets and bounded
+media/OCR tools need operating-system libraries. Run as an operator-configured
+non-root UID/GID, with writable paths restricted to the configured datasets and bounded
 temporary storage.
 
 Only the runtime image is pushed to the registry and pulled by TrueNAS.
@@ -585,7 +594,9 @@ bits. Capacity planning must include
 the incoming ISO, staged ISO, intermediate files, and prepared output at once.
 The staged ISO is temporary, not another permanent archive.
 
-Use explicit host-path mounts with dedicated UID/GID and narrowly scoped ACLs.
+Use explicit host-path mounts with non-root UID/GID and narrowly scoped ACLs.
+The supplied NAS uses the operator-selected shared TrueNAS apps identity
+568:568; it is not a dedicated host security principal.
 An incoming SMB share must not expose app state or published media through
 unauthorized paths.
 
@@ -834,6 +845,10 @@ Network policy:
   Domain attribute; cookies are not isolated by TCP port. Reject unconfigured
   Host headers and cross-origin state-changing requests, in addition to CSRF
   tokens. Do not share the WeTube hostname with other NAS web applications.
+  Strict Host checking remains the application default. The supplied TrueNAS
+  configuration deliberately opts into `WETUBE_ALLOW_ANY_HOST=true`, disabling
+  only the Host check while keeping its fixed configured Origin, session,
+  authorization and CSRF protections. Host/forwarded headers never define Origin.
 
 HTTP leaves passwords, session cookies, and media unencrypted on local network
 segments. A VPN protects its tunnel, not every LAN hop after termination.

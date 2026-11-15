@@ -1,0 +1,19 @@
+# Deny by default: only build inputs may enter the Docker context.
+**
+!Dockerfile
+!Cargo.toml
+!Cargo.lock
+!crates/
+!crates/*/
+!crates/*/Cargo.toml
+!crates/*/src/
+!crates/*/src/**/*.rs
+!crates/backend/migrations/
+!crates/backend/migrations/*.sql
+!crates/web/Trunk.toml
+!crates/web/index.html
+!crates/web/style.css
+!crates/web/tmdb.svg
+!docker/
+!docker/entrypoint.sh
+!docker/check-media.sh

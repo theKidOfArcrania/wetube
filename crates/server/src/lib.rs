@@ -47,6 +47,7 @@ struct AppState {
     pool: SqlitePool,
     origin: String,
     authority: String,
+    allow_any_host: bool,
     secure_cookie: bool,
     dummy_hash: Arc<String>,
     login_window: Arc<Mutex<(Instant, usize)>>,
@@ -87,6 +88,27 @@ pub async fn router_with_conversions(
     incoming: Option<IncomingRoot>,
     media: Option<PreviewRoot>,
     scratch_dir: Option<&Path>,
+) -> anyhow::Result<Router> {
+    router_with_host_policy(
+        pool,
+        origin,
+        static_dir,
+        incoming,
+        media,
+        scratch_dir,
+        false,
+    )
+    .await
+}
+
+pub async fn router_with_host_policy(
+    pool: SqlitePool,
+    origin: &str,
+    static_dir: &Path,
+    incoming: Option<IncomingRoot>,
+    media: Option<PreviewRoot>,
+    scratch_dir: Option<&Path>,
+    allow_any_host: bool,
 ) -> anyhow::Result<Router> {
     db::check_version(&pool).await?;
     let scratch = scratch_dir
@@ -156,6 +178,7 @@ pub async fn router_with_conversions(
         pool,
         origin,
         authority,
+        allow_any_host,
         secure_cookie: url.scheme() == "https",
         dummy_hash: Arc::new(dummy_hash),
         login_window: Arc::new(Mutex::new((Instant::now(), 0))),
@@ -265,7 +288,9 @@ async fn boundary(
         .headers()
         .get(header::HOST)
         .and_then(|value| value.to_str().ok());
-    if !host.is_some_and(|host| host.eq_ignore_ascii_case(&state.authority)) {
+    if !state.allow_any_host
+        && !host.is_some_and(|host| host.eq_ignore_ascii_case(&state.authority))
+    {
         return Err(HttpError(
             StatusCode::MISDIRECTED_REQUEST,
             "Unrecognized host".into(),

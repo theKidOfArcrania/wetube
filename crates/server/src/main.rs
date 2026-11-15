@@ -51,6 +51,9 @@ enum Command {
         bind: SocketAddr,
         #[arg(long, env = "WETUBE_ORIGIN", default_value = "http://localhost:8080")]
         origin: String,
+        /// Accept any Host header; configured Origin, authentication and CSRF checks stay enforced.
+        #[arg(long, env = "WETUBE_ALLOW_ANY_HOST")]
+        allow_any_host: bool,
         #[arg(long, env = "WETUBE_STATIC_DIR", default_value = "dist")]
         static_dir: PathBuf,
         #[arg(long, env = "WETUBE_INCOMING_DIR")]
@@ -159,6 +162,7 @@ async fn main() -> Result<()> {
         Command::Serve {
             bind,
             origin,
+            allow_any_host,
             static_dir,
             incoming_dir,
             media_dir,
@@ -184,13 +188,14 @@ async fn main() -> Result<()> {
                 .as_deref()
                 .map(wetube_backend::preview::PreviewRoot::open)
                 .transpose()?;
-            let mut app = wetube_server::router_with_conversions(
+            let mut app = wetube_server::router_with_host_policy(
                 pool.clone(),
                 &origin,
                 &static_dir,
                 incoming,
                 media,
                 scratch_dir.as_deref(),
+                allow_any_host,
             )
             .await?;
             if let Some(path) = tmdb_token_file {
